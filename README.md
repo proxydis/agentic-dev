@@ -168,3 +168,7 @@ bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositor
 
 Neither calls a real service: fake `gh`, `openclaw`, `systemctl` and `claude` commands and a fake Trello API share a
 JSON world.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

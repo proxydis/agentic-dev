@@ -168,3 +168,7 @@ bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts 
 
 Aucun des deux n'appelle un vrai service : de faux `gh`, `openclaw`, `systemctl`, `claude` et une fausse API Trello
 tiennent un monde en JSON.
+
+## Licence
+
+MIT, voir [LICENSE](LICENSE).
