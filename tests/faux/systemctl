@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Faux `systemctl --user list-units <motif>` : les units actives du monde JSON."""
+import fnmatch
+import json
+import os
+import sys
+
+m = json.load(open(os.environ["MONDE"]))
+motif = next((x for x in sys.argv[1:] if not x.startswith("-") and x != "list-units"), "*")
+for u in m.get("units", []):
+    if fnmatch.fnmatch(u, motif):
+        print(f"{u} loaded active running test")

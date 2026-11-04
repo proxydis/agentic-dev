@@ -1,0 +1,1580 @@
+#!/usr/bin/env python3
+"""cycle-lot : cycle de développement d'un lot, de « lance le lot » à la validation en production, entre deux
+agents OpenClaw, un développeur et un relecteur, sans intervention humaine au milieu du cycle.
+
+Mode d'emploi : README.md. Configuration : cycle-lot.json à côté de ce script (modèle : cycle-lot.example.json), ou
+le fichier désigné par CYCLE_LOT_CONFIG.
+
+Un lot a UN état, cycles/<version>/etat.json : l'étape, qui a la main, les PR, les aller-retours. Les deux agents ne
+se passent la main que par ce script. Chaque fin d'étape est une commande : elle vérifie la transition, met l'état
+à jour et planifie le réveil de l'agent suivant. Le réveil lui-même part du relais (RPC gateway `agent` dans le fil
+Slack du lot) : le gateway OpenClaw refuse qu'un agent réveille une autre session depuis son exec.
+
+Aucun agent n'attend l'autre. Toutes les attentes (CI, déploiements) sont tenues par `cycle-lot veille`, qu'un timer
+systemd lance toutes les 2 min. La veille relance aussi un agent dont le tour est mort et prévient l'humain s'il ne
+répond toujours pas. Deux agents qui écrivent chacun un script qui attend l'autre finissent par s'attendre
+mutuellement : ici, le seul veilleur ne dépend que de GitHub, et cet interblocage ne peut pas se produire.
+
+  cycle-lot debut <v> --session-key <clé du dev>        le dev, sur demande de l'humain : crée le cycle, cartes en WIP
+  cycle-lot passe <v> --vers <relecteur> [--message …]  le dev : fin du dev ou d'une correction, CI verte exigée
+  cycle-lot verdict <v> --merger|--a-reprendre …        le relecteur : fin de revue, cartes Finished ou WIP
+  cycle-lot merge <v> --pr back#N                       le relecteur : merge gardé (tête revue, CI verte, back d'abord)
+  cycle-lot ouvrir-livraison <v>                        le dev : les 4 PR release -> develop/master
+  cycle-lot passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>   le dev : validations en prod
+  cycle-lot carte-bug <v> --titre … --appli … --gravite … --description-fichier …   le relecteur : bug vu en prod
+  cycle-lot fin <v> --rapport <fichier>                 le relecteur : lot livré et validé
+  cycle-lot arret <v> --motif … --message …             l'un ou l'autre : arbitrage bloquant, intervention humaine
+  cycle-lot reprise <v> --decision …                    après la réponse de l'humain
+  cycle-lot etat [<v>] [--json]                         lecture seule
+  cycle-lot veille                                      le timer, toutes les 2 min
+"""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+ICI = Path(__file__).resolve().parent
+BASE = Path(os.environ.get("CYCLE_LOT_BASE") or ICI)
+CYCLES = BASE / "cycles"
+CHEMIN_CONF = Path(os.environ.get("CYCLE_LOT_CONFIG") or ICI / "cycle-lot.json")
+GH = os.environ.get("CYCLE_LOT_GH") or "gh"
+SYSTEMCTL = os.environ.get("CYCLE_LOT_SYSTEMCTL") or "systemctl"
+TRELLO_API = os.environ.get("CYCLE_LOT_TRELLO_API") or "https://api.trello.com/1"
+CONFIG = Path(os.environ.get("CYCLE_LOT_OPENCLAW_CONFIG") or Path.home() / ".openclaw/openclaw.json")
+
+
+def charger_conf():
+    try:
+        return json.loads(CHEMIN_CONF.read_text())
+    except FileNotFoundError:
+        sys.exit(f"cycle-lot : configuration absente ({CHEMIN_CONF}). Copie cycle-lot.example.json en cycle-lot.json "
+                 f"et remplis-le, ou désigne un autre fichier avec CYCLE_LOT_CONFIG.")
+    except ValueError as e:
+        sys.exit(f"cycle-lot : configuration illisible ({CHEMIN_CONF}) : {e}")
+
+
+CONF = charger_conf()
+# Agents OpenClaw : leur identifiant est aussi leur compte Slack, le préfixe de leurs units systemd et le suffixe de
+# leur dossier workspace-<id>. « veille » et « humain » sont réservés (main au relais, main à l'humain).
+DEV = CONF["agents"]["dev"]["id"]
+REV = CONF["agents"]["relecteur"]["id"]
+RELAIS = CONF["agents"]["relais"]["id"]  # compte qui poste les avis du relais ; il peut aussi forcer une commande
+NOMS = {DEV: CONF["agents"]["dev"].get("nom", DEV), REV: CONF["agents"]["relecteur"].get("nom", REV),
+        RELAIS: CONF["agents"]["relais"].get("nom", RELAIS)}
+N_DEV, N_REV = NOMS[DEV], NOMS[REV]
+HUMAIN = CONF["humain"].get("nom", "l'humain")  # qui lance les lots et tranche les arrêts
+HUMAIN_SLACK = CONF["humain"]["slack_id"]
+OPENCLAW = os.environ.get("OPENCLAW_BIN") or CONF.get("openclaw_bin") or "openclaw"
+
+DEPOTS = {app: d["github"] for app, d in CONF["depots"].items()}  # applications « back » et « front »
+WORKFLOW = {app: d["workflow"] for app, d in CONF["depots"].items()}
+# Jobs qui doivent être verts (pas sautés) : PR de lot vers release/*, PR de livraison vers master, push.
+REQUIS_LOT = {app: tuple(d.get("jobs_requis_lot", ())) for app, d in CONF["depots"].items()}
+REQUIS_MASTER = {app: tuple(d.get("jobs_requis_master", ())) for app, d in CONF["depots"].items()}
+REQUIS_PUSH = tuple(CONF.get("jobs_requis_push") or ("quality", "deploy"))
+PAUSE = CONF.get("etiquette_pause", "ci-en-pause")
+URL_PROD = CONF["urls"]["production"]
+URL_PREVIEW = CONF["urls"]["preview"]
+# Back du lot déployé sur la preview avant la revue (workflow_dispatch sur la branche du lot) ; absent : pas de
+# déploiement de revue, le relecteur est réveillé dès le passage de main.
+PREVIEW = CONF.get("deploiement_preview") or None
+# Rouge sans rapport avec le code (tâche Sonar tombée côté serveur, coupure réseau), relancé une fois.
+RE_NON_CODE = re.compile("|".join(CONF.get("motifs_rouge_sans_rapport") or (
+    r"CE Task finished abnormally", r"ECONNRESET", r"ETIMEDOUT", r"EAI_AGAIN", r"ENOTFOUND", r"ERR_PNPM_META_FETCH_FAIL",
+    r"ERR_PNPM_FETCH_", r"ERR_SOCKET_TIMEOUT", r"UND_ERR_CONNECT_TIMEOUT", r"socket hang up",
+    r"self-installer exits with code", r"HttpClient\.Timeout")))
+DOC_PROCEDURE = CONF.get("doc_procedure", "AGENTS.md, section « Cycle de lot »")
+GRILLE = Path(CONF.get("grille_revue") or "GRILLE-REVUE.md").expanduser()
+GRILLE = str(GRILLE if GRILLE.is_absolute() else ICI / GRILLE)  # chemin relatif : à côté de ce script
+
+TRELLO_BOARD = CONF["trello"]["tableau"]
+LISTES = CONF["trello"]["listes"]
+NOM_LISTE = {"not_ready": "Not Ready", "standby": "Standby", "wip": "Work in progress", "waiting": "Waiting for review",
+             "review": "Under review", "finished": "Finished", "blocked": "Blocked", "archived": "Archived",
+             "canceled": "Canceled"}
+NOM_LISTE.update(CONF["trello"].get("noms") or {})
+LISTE_DE_ID = {v: k for k, v in LISTES.items()}
+GRAVITES = CONF["trello"]["etiquettes_gravite"]
+RE_CARTE = re.compile(r"^\[V(?P<ver>\d+(?:\.\d+)+)-(?P<type>[^\]]+)\]\s*(?P<num>\d+)\s*\.")
+RE_SESSION = re.compile(r"^agent:(?P<agent>[a-z0-9_-]+):slack:channel:(?P<canal>[a-z0-9]+):thread:(?P<ts>[0-9.]+)$")
+RE_VERSION = re.compile(r"^\d+(\.\d+){2,3}$")
+
+# étape : (qui a la main, plafond en heures, libellé). « veille » = le relais attend GitHub ; personne n'agit.
+ETAPES = {
+    "dev": (DEV, 16, "développement du lot"),
+    "deploiement-revue": ("veille", 2, "déploiement du back du lot sur la preview, avant la revue"),
+    "revue": (REV, 6, "revue du lot"),
+    "merge-lot": (REV, 2, "merge des PR du lot dans la release"),
+    "ci-release": ("veille", 3, "CI du push sur la release après le merge"),
+    "correction": (DEV, 10, "correction des retours"),
+    "livraison": (DEV, 2, "ouverture des PR de livraison"),
+    "ci-livraison": ("veille", 3, "CI des PR de livraison"),
+    "revue-livraison": (REV, 4, "revue et merge des PR de livraison"),
+    "deploiement": ("veille", 4, "CI de develop et de master, mise en production"),
+    "liste-validation": (DEV, 3, "liste des validations visuelles en production"),
+    "validation-prod": (REV, 8, "validations visuelles en production"),
+    "arret": ("humain", None, f"arrêt : décision de {HUMAIN} attendue"),
+    "livre": (None, None, "lot livré et validé en production"),
+}
+INACTIF_MIN = 45          # sans job, sans tour en cours et sans changement d'étape : relance
+NB_RELANCES = 2           # puis alerte à l'humain
+ATTENTE_PREVIEW_MIN = int((PREVIEW or {}).get("delai_min", 10))  # après le déploiement vert, le temps que la preview bascule
+MAX_ALLER_RETOURS = int(CONF.get("max_aller_retours", 3))  # 3e verdict À REPRENDRE : arrêt
+MAX_CI_ROUGES = 3         # CI de release ou de livraison rouge sur du code, 3 fois de suite : arrêt
+INTERVALLE_GH_MIN = float(os.environ.get("CYCLE_LOT_INTERVALLE_GH_MIN", "4"))  # attentes GitHub : 1 lecture / 4 min
+
+
+class Refus(Exception):
+    """Commande refusée : le message dit à l'agent quoi faire. Code de sortie 2."""
+
+
+# ---------------------------------------------------------------- utilitaires
+
+def maintenant():
+    return dt.datetime.now().astimezone()
+
+
+def iso(t=None):
+    return (t or maintenant()).isoformat(timespec="seconds")
+
+
+def date(s):
+    return dt.datetime.fromisoformat(s)
+
+
+def minutes_depuis(s):
+    return (maintenant() - date(s)).total_seconds() / 60
+
+
+def hm(s):
+    return date(s).astimezone().strftime("%d/%m %H:%M")
+
+
+def env_openclaw():
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(OPENCLAW) + ":" + env.get("PATH", "/usr/bin:/bin")
+    return env
+
+
+def lancer(cmd, timeout=180, env=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"délai dépassé ({timeout} s) : {' '.join(cmd[:4])}"
+    except OSError as e:
+        return 127, "", str(e)
+
+
+def json_dans(texte):
+    i = texte.find("{")
+    try:
+        return json.loads(texte[i:]) if i >= 0 else {}
+    except ValueError:
+        return {}
+
+
+def gh_json(*args, timeout=120, essais=3):
+    """`gh … --json`, réessayé : un réseau instable coupe parfois un appel."""
+    dernier = ""
+    for i in range(essais):
+        rc, out, err = lancer([GH, *args], timeout=timeout)
+        if rc == 0:
+            try:
+                return json.loads(out or "null")
+            except ValueError:
+                dernier = out[-300:]
+        else:
+            dernier = (err or out)[-300:]
+        if i < essais - 1:
+            time.sleep(3 * (i + 1))
+    raise RuntimeError(f"gh {' '.join(args[:3])} : {dernier.strip()}")
+
+
+def gh_cmd(*args, timeout=180):
+    rc, out, err = lancer([GH, *args], timeout=timeout)
+    return rc, (out + err).strip()
+
+
+# ---------------------------------------------------------------- état
+
+def dossier(version):
+    return CYCLES / version
+
+
+def chemin_etat(version):
+    return dossier(version) / "etat.json"
+
+
+def lire(version):
+    p = chemin_etat(version)
+    if not p.exists():
+        raise Refus(f"aucun cycle pour le lot {version} : il commence par `cycle-lot debut {version} …`, "
+                    f"lancé par {N_DEV} sur demande de {HUMAIN}")
+    return json.loads(p.read_text())
+
+
+def ecrire(etat):
+    p = chemin_etat(etat["version"])
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(etat, ensure_ascii=False, indent=2))
+    os.replace(tmp, p)
+
+
+@contextmanager
+def verrou(version, creer=False):
+    """Verrou d'un lot. Seul `debut` crée le dossier : une commande refusée ne laisse pas de cycle vide derrière elle."""
+    if not RE_VERSION.match(version):
+        raise Refus(f"version « {version} » illisible (ex. 1.0.0 ou 1.2.3.4)")
+    if not creer:
+        lire(version)
+    dossier(version).mkdir(parents=True, exist_ok=True)
+    with open(dossier(version) / ".verrou", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def journal(version, texte):
+    dossier(version).mkdir(parents=True, exist_ok=True)
+    with open(dossier(version) / "journal.log", "a") as f:
+        f.write(f"{iso()} {texte}\n")
+
+
+def changer_etape(etat, etape, par, message="", attente=None):
+    tour = ETAPES[etape][0]
+    etat["historique"].append({"heure": iso(), "de": etat.get("etape"), "vers": etape, "par": par,
+                               "message": (message or "")[:3000]})
+    etat.update(etape=etape, tour=tour, depuis=iso(), seq=etat["seq"] + 1, attente=attente)
+    etat["relances"] = {"nb": 0, "derniere": None, "alerte": False, "alerte_plafond": False, "vu_actif": None}
+    if message:
+        etat["dernier_message"] = {"de": par, "heure": iso(), "texte": message[:3000]}
+    journal(etat["version"], f"étape {etape} (main : {tour}) par {par}" + (f" : {message[:300]}" if message else ""))
+
+
+def appelant(args):
+    if getattr(args, "par", None):
+        return args.par
+    cwd = os.getcwd()
+    for agent in (DEV, REV, RELAIS):
+        if f"/workspace-{agent}" in cwd:
+            return agent
+    raise Refus(f"agent appelant inconnu : ajoute --par {DEV} ou --par {REV}")
+
+
+def exiger(etat, agent, etapes):
+    if etat["etape"] not in etapes:
+        raise Refus(f"le lot {etat['version']} est à l'étape « {etat['etape']} » (main : {etat['tour']}) ; "
+                    f"cette commande vaut pour : {', '.join(etapes)}. `cycle-lot etat {etat['version']}` pour le détail.")
+    if agent != RELAIS and etat["tour"] not in (agent, "veille"):
+        raise Refus(f"la main est à {etat['tour']} sur l'étape « {etat['etape']} », pas à {agent}")
+
+
+def num_pr(texte):
+    m = re.fullmatch(r"(back|front)#?(\d+)", texte.strip())
+    if not m:
+        raise Refus(f"PR « {texte} » : écris back#277 ou front#296")
+    return m.group(1), int(m.group(2))
+
+
+def liste_nums(texte):
+    if not texte:
+        return set()
+    try:
+        return {int(x) for x in re.split(r"[,\s]+", texte.strip()) if x}
+    except ValueError:
+        raise Refus(f"numéros de cartes illisibles : « {texte} » (ex. 1,3,5)")
+
+
+# ---------------------------------------------------------------- Slack : réveil et avis
+
+def cle_session(etat, agent):
+    return f"agent:{agent}:slack:channel:{etat['fil']['canal'].lower()}:thread:{etat['fil']['ts']}"
+
+
+def planifier_reveil(etat, agent, motif, texte=None, extra="", prefixe=""):
+    """Les commandes des agents ne réveillent personne elles-mêmes : le gateway refuse, depuis l'exec d'un agent,
+    un tour lancé dans une autre session (« would lose inter-session attribution »). C'est le service du relais
+    (systemd, toutes les 2 min, hors de l'exec d'un agent) qui réveille, à partir de l'état. La consigne est écrite
+    au moment du réveil, sur l'état à jour."""
+    etat["a_reveiller"] = {"agent": agent, "motif": motif, "texte": texte, "extra": extra, "prefixe": prefixe,
+                           "seq": etat["seq"], "demande": iso(), "essais": 0, "signale": False}
+
+
+def planifier_avis(etat, texte):
+    etat.setdefault("avis_en_attente", []).append({"texte": texte, "essais": 0})
+
+
+def executer_en_attente(etat):
+    """Service du relais seulement : avis à poster, puis réveil planifié (4 essais, puis avis à l'humain)."""
+    restants = []
+    for avis in etat.pop("avis_en_attente", None) or []:
+        if not poster(etat, avis["texte"]) and avis["essais"] < 3:
+            restants.append({"texte": avis["texte"], "essais": avis["essais"] + 1})
+    if restants:
+        etat["avis_en_attente"] = restants
+    r = etat.get("a_reveiller")
+    if not r:
+        return
+    if r["seq"] != etat["seq"]:
+        journal(etat["version"], f"réveil de {r['agent']} ({r['motif']}) abandonné : l'étape a changé depuis")
+        etat["a_reveiller"] = None
+        return
+    if r["essais"] >= 4:
+        if not r["signale"]:
+            r["signale"] = True
+            poster(etat, f"impossible de réveiller {NOMS.get(r['agent'], r['agent'])} pour l'étape « {etat['etape']} » "
+                         f"({r['essais']} essais). <@{HUMAIN_SLACK}> le gateway a peut-être un problème ; une mention de "
+                         f"l'agent dans ce fil le relance.")
+        return
+    r["essais"] += 1
+    texte = r["texte"] or (r.get("prefixe") or "") + consigne(etat, r.get("extra") or "", agent=r["agent"])
+    if reveiller(etat, r["agent"], texte, r["motif"] + (f" (essai {r['essais']})" if r["essais"] > 1 else "")):
+        etat["a_reveiller"] = None
+
+
+def reveiller(etat, agent, texte, motif):
+    """Lance un tour de l'agent dans SA session du fil du lot ; sa réponse y est postée. Routage explicite :
+    la session du relecteur n'existe pas encore quand le relais le réveille la première fois dans un fil neuf.
+    Appelé par le service du relais seulement (voir planifier_reveil)."""
+    n = etat.get("n_reveil", 0) + 1
+    etat["n_reveil"] = n
+    params = {"sessionKey": cle_session(etat, agent), "message": texte, "deliver": True, "channel": "slack",
+              "accountId": agent, "to": f"channel:{etat['fil']['canal']}", "threadId": etat["fil"]["ts"],
+              "idempotencyKey": f"relais-{etat['prefixe']}-{etat['seq']}-{agent}-{n}"}
+    rc, out, err = lancer([OPENCLAW, "gateway", "call", "agent", "--json", "--timeout", "90000",
+                           "--params", json.dumps(params, ensure_ascii=False)], timeout=150, env=env_openclaw())
+    rep = json_dans(out)
+    ok = rep.get("status") in ("accepted", "ok", "in_flight")
+    etat["reveils"].append({"n": n, "heure": iso(), "agent": agent, "motif": motif, "seq": etat["seq"], "ok": ok,
+                            "runId": rep.get("runId"), "erreur": None if ok else (err or out).strip()[-300:]})
+    del etat["reveils"][:-50]
+    journal(etat["version"], f"réveil de {agent} ({motif}) : {'accepté, run ' + str(rep.get('runId')) if ok else 'ÉCHEC ' + (err or out).strip()[-200:]}")
+    return ok
+
+
+def slack_direct(compte, canal, ts, texte):
+    """Dernier filet quand le gateway ne répond pas : API Slack avec le jeton du compte, lu dans la config OpenClaw."""
+    try:
+        tok = json.loads(CONFIG.read_text())["channels"]["slack"]["accounts"][compte].get("botToken")
+        if not isinstance(tok, str):
+            return False
+        req = urllib.request.Request("https://slack.com/api/chat.postMessage",
+                                     data=json.dumps({"channel": canal, "thread_ts": ts, "text": texte}).encode(),
+                                     headers={"Authorization": "Bearer " + tok,
+                                              "Content-Type": "application/json; charset=utf-8"})
+        return bool(json.load(urllib.request.urlopen(req, timeout=20)).get("ok"))
+    except Exception:  # noqa: BLE001 — filet de secours, ne doit jamais lever
+        return False
+
+
+def poster(etat, texte):
+    """Avis du relais dans le fil du lot, au nom du compte du relais : jamais une mention d'agent."""
+    texte = f"⚙️ Relais du lot {etat['version']} : {texte}"
+    rc, out, err = lancer([OPENCLAW, "message", "send", "--channel", "slack", "--account", RELAIS,
+                           "--target", f"channel:{etat['fil']['canal']}", "--thread-id", etat["fil"]["ts"],
+                           "--message", texte, "--json"], timeout=120, env=env_openclaw())
+    ok = rc == 0 or slack_direct(RELAIS, etat["fil"]["canal"], etat["fil"]["ts"], texte)
+    journal(etat["version"], f"avis posté ({'ok' if ok else 'ÉCHEC'}) : {texte[:200]}")
+    return ok
+
+
+# ---------------------------------------------------------------- Trello
+
+def trello_cles():
+    k, t = os.environ.get("TRELLO_API_KEY"), os.environ.get("TRELLO_TOKEN")
+    if k and t:
+        return k, t
+    try:
+        env = json.loads(CONFIG.read_text())["skills"]["entries"]["trello"]["env"]
+        return env["TRELLO_API_KEY"], env["TRELLO_TOKEN"]
+    except Exception:  # noqa: BLE001
+        raise RuntimeError("clés Trello introuvables (TRELLO_API_KEY / TRELLO_TOKEN)")
+
+
+def trello(methode, chemin, **params):
+    k, t = trello_cles()
+    auth = urllib.parse.urlencode({"key": k, "token": t})
+    corps = None
+    if methode == "POST":  # description longue : dans le corps
+        url = f"{TRELLO_API}{chemin}?{auth}"
+        corps = urllib.parse.urlencode(params).encode()
+    else:  # GET, PUT : paramètres dans l'URL, comme run-lot.sh
+        url = f"{TRELLO_API}{chemin}?{urllib.parse.urlencode(params)}&{auth}"
+    dernier = None
+    for i in range(3):
+        try:
+            req = urllib.request.Request(url, data=corps, method=methode)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                texte = r.read().decode()
+                return json.loads(texte) if texte else {}
+        except Exception as e:  # noqa: BLE001
+            dernier = e
+            time.sleep(3 * (i + 1))
+    raise RuntimeError(f"Trello {methode} {chemin} : {dernier}")
+
+
+def cartes_du_tableau():
+    return trello("GET", f"/boards/{TRELLO_BOARD}/cards/open", fields="name,idList,shortUrl")
+
+
+def cartes_de_version(version, toutes=None):
+    res = []
+    for c in toutes if toutes is not None else cartes_du_tableau():
+        m = RE_CARTE.match(c["name"])
+        if m and m.group("ver") == version and c["idList"] not in (LISTES["canceled"], LISTES["archived"]):
+            res.append({"id": c["id"], "num": int(m.group("num")), "nom": c["name"], "liste": c["idList"],
+                        "url": c.get("shortUrl")})
+    return sorted(res, key=lambda c: c["num"])
+
+
+def ou_sont(etat):
+    """Liste actuelle de chaque carte du lot : {num: clé de liste}."""
+    ici = {c["id"]: c["idList"] for c in cartes_du_tableau()}
+    return {c["num"]: LISTE_DE_ID.get(ici.get(c["id"]), "?") for c in etat["cartes"]}
+
+
+def deplacer(etat, nums, liste, haut=False):
+    par_num = {c["num"]: c for c in etat["cartes"]}
+    faits, rates = [], []
+    for n in sorted(nums):
+        try:
+            trello("PUT", f"/cards/{par_num[n]['id']}", idList=LISTES[liste], pos="top" if haut else "bottom")
+            faits.append(n)
+        except RuntimeError:
+            rates.append(n)
+    if faits:
+        journal(etat["version"], f"Trello : cartes {', '.join(map(str, faits))} en {NOM_LISTE[liste]}")
+    if rates:
+        journal(etat["version"], f"Trello : ÉCHEC du déplacement en {NOM_LISTE[liste]} des cartes {', '.join(map(str, rates))}")
+    return faits, rates
+
+
+# ---------------------------------------------------------------- GitHub
+
+def prs_ouvertes(base):
+    res = []
+    for depot, nom in DEPOTS.items():
+        for p in gh_json("pr", "list", "-R", nom, "--base", base, "--state", "open", "--limit", "20",
+                         "--json", "number,headRefName,headRefOid,labels,url,title"):
+            res.append({"depot": depot, "num": p["number"], "branche": p["headRefName"], "sha": p["headRefOid"],
+                        "url": p["url"], "titre": p["title"], "labels": [lb["name"] for lb in p["labels"]]})
+    return res
+
+
+def vue_pr(depot, num):
+    return gh_json("pr", "view", str(num), "-R", DEPOTS[depot], "--json",
+                   "number,state,headRefOid,headRefName,baseRefName,labels,mergeable,mergeCommit,url")
+
+
+def runs(depot, **filtres):
+    args = ["run", "list", "-R", DEPOTS[depot], "--workflow", WORKFLOW[depot], "--limit", "30",
+            "--json", "databaseId,status,conclusion,event,headSha,headBranch,createdAt"]
+    for k, v in filtres.items():
+        args += [f"--{k}", v]
+    return gh_json(*args)
+
+
+def dernier_run(depot, sha, event, branche=None):
+    rs = [r for r in runs(depot, commit=sha, event=event) if branche is None or r["headBranch"] == branche]
+    return max(rs, key=lambda r: r["createdAt"]) if rs else None
+
+
+def jobs_du_run(depot, run_id):
+    return {j["name"]: j.get("conclusion") for j in gh_json("run", "view", str(run_id), "-R", DEPOTS[depot],
+                                                             "--json", "jobs")["jobs"]}
+
+
+def bilan_run(depot, run, requis=()):
+    """('absent' | 'en cours' | 'vert' | 'rouge', résumé) d'un run, jobs requis compris (un job sauté n'a rien testé)."""
+    if not run:
+        return "absent", "aucun run"
+    rid = run["databaseId"]
+    if run["status"] != "completed":
+        return "en cours", f"run {rid} {run['status']}"
+    jobs = jobs_du_run(depot, rid)
+    manquants = [n for n in requis if jobs.get(n) != "success"]
+    if run["conclusion"] == "success" and not manquants:
+        return "vert", f"run {rid} vert"
+    rouges = [n for n, c in jobs.items() if c in ("failure", "cancelled", "timed_out")]
+    sautes = [n for n in manquants if jobs.get(n) in ("skipped", None)]
+    detail = f"run {rid} {run['conclusion']}"
+    if rouges:
+        detail += f", jobs rouges : {', '.join(rouges)}"
+    if sautes:
+        detail += f", jobs requis sautés ou absents : {', '.join(sautes)}"
+    return "rouge", detail
+
+
+def rouge_sans_rapport(depot, run):
+    if run.get("conclusion") == "cancelled":
+        return True
+    rc, log = gh_cmd("run", "view", str(run["databaseId"]), "-R", DEPOTS[depot], "--log-failed", timeout=240)
+    return bool(RE_NON_CODE.search(log))
+
+
+def relancer_si_sans_rapport(etat, depot, run, deja):
+    """Relance une fois les jobs rouges d'un run qui ne juge pas le code. True si relancé."""
+    cle = str(run["databaseId"])
+    if cle in deja or not rouge_sans_rapport(depot, run):
+        return False
+    rc, out = gh_cmd("run", "rerun", cle, "-R", DEPOTS[depot], "--failed")
+    deja.append(cle)
+    journal(etat["version"], f"run {cle} ({depot}) rouge sans rapport avec le code : relancé une fois ({'ok' if rc == 0 else out[-200:]})")
+    return rc == 0
+
+
+def ci_pr(pr, requis):
+    if PAUSE in pr.get("labels", []):
+        return "rouge", f"étiquette {PAUSE} encore posée : la CI n'a pas jugé ce code"
+    return bilan_run(pr["depot"], dernier_run(pr["depot"], pr["sha"], "pull_request"), requis)
+
+
+def tete(depot, branche):
+    return gh_json("api", f"repos/{DEPOTS[depot]}/git/ref/heads/{branche}")["object"]["sha"]
+
+
+def url_preview_front(sha):
+    """URL de la preview du front pour ce commit, d'après les déploiements GitHub (Vercel, Netlify… les créent)."""
+    if "front" not in DEPOTS:
+        return None
+    try:
+        deps = gh_json("api", f"repos/{DEPOTS['front']}/deployments?sha={sha}&per_page=5")
+        for d in deps or []:
+            for s in gh_json("api", f"repos/{DEPOTS['front']}/deployments/{d['id']}/statuses") or []:
+                if s.get("state") == "success" and s.get("environment_url"):
+                    return s["environment_url"]
+    except RuntimeError:
+        pass
+    return None
+
+
+def lancer_deploiement_preview(etat, branche):
+    """Back du lot sur la preview, par un workflow_dispatch de son workflow sur la branche du lot (le workflow doit
+    déployer une branche lancée à la main sur l'environnement de preview). Une PR n'étant pas déployée, les tests
+    Playwright du relecteur verraient sinon le front du lot avec l'ancien back."""
+    t0 = maintenant() - dt.timedelta(minutes=1)
+    depot = PREVIEW["depot"]
+    rc, out = gh_cmd("workflow", "run", PREVIEW.get("workflow") or WORKFLOW[depot], "-R", DEPOTS[depot], "--ref", branche)
+    dep = {"branche": branche, "lance": iso(), "run": None, "erreur": None if rc == 0 else out[-300:],
+           "relances": [], "vert_a": None}
+    if rc == 0:
+        for _ in range(6):
+            dep["run"] = trouver_run_dispatch(branche, t0)
+            if dep["run"]:
+                break
+            time.sleep(5)
+    journal(etat["version"], f"déploiement preview de {branche} : run {dep['run'] or '?'}{' ÉCHEC ' + dep['erreur'] if dep['erreur'] else ''}")
+    return dep
+
+
+def trouver_run_dispatch(branche, apres):
+    try:
+        rs = [r for r in runs(PREVIEW["depot"], branch=branche, event="workflow_dispatch") if date(r["createdAt"]) >= apres]
+    except RuntimeError:
+        return None
+    return max(rs, key=lambda r: r["createdAt"])["databaseId"] if rs else None
+
+
+# ---------------------------------------------------------------- consignes envoyées aux agents
+
+def ligne_pr(p):
+    s = f"• {p['depot']} #{p['num']} ({p.get('base') or p.get('branche')}) {p['url']}, tête `{p['sha'][:7]}`"
+    if p.get("ci"):
+        s += f", CI : {p['ci']}"
+    if p.get("merge"):
+        s += f", mergée en `{p['merge']['commit'][:7]}`"
+    return s
+
+
+def pied(etat, agent=None):
+    return (f"\n\nÉtat complet : `cycle-lot etat {etat['version']}`. Procédure : {DOC_PROCEDURE}. "
+            f"Réponse obligatoire dans ce fil, NO_REPLY interdit : dis en une ou deux phrases ce que tu lances. "
+            f"Ne mentionne pas l'autre agent avec <@…> : le relais le réveillera. Tout travail de plus de 30 min tourne "
+            f"dans une unit `{agent or etat['tour']}-{etat['prefixe']}-…` dont la fin te réveille ; n'écris aucun script "
+            f"qui attende l'autre agent ou la CI, c'est le relais qui attend.")
+
+
+def consigne(etat, extra="", agent=None):
+    v, e, p = etat["version"], etat["etape"], etat["prefixe"]
+    tete_msg = (f"[RELAIS DU CYCLE DE LOT {v} — message automatique de cycle-lot, pas de {HUMAIN}] "
+                f"Étape « {e} » : {ETAPES[e][2]}. La main est à toi.")
+    dernier = etat.get("dernier_message") or {}
+    mot = (f"\nMessage de {NOMS.get(dernier['de'], dernier['de'])} ({hm(dernier['heure'])}) : {dernier['texte']}"
+           if dernier.get("texte") else "")
+    ar = f"aller-retour {etat['aller_retours'] + 1}/{etat['max_aller_retours']}"
+    if e == "revue":
+        rap = etat["rapports"][-1]["fichier"] if etat["rapports"] else None
+        corps = (f"\nRevue du lot, {ar}. PR à revoir :\n" + "\n".join(ligne_pr(x) for x in etat["prs_lot"]) +
+                 f"{mot}\nDossier du lot (cartes, arbitrages, passations) : "
+                 f"{etat.get('dossier_lot') or 'voir le message de ' + N_DEV}."
+                 f"\nFais la revue complète avec {GRILLE} : relecture, tests, et parcours "
+                 "Playwright sur la version déployée (URL ci-dessous). Rapporte TOUS les points dès cette revue."
+                 + (f"\nRevue de correction : vérifie chaque point de ton rapport précédent ({rap}) et ce que les "
+                    f"corrections touchent. Un défaut non bloquant découvert maintenant dans du code que le lot n'a pas "
+                    f"modifié devient une carte de la version suivante, pas un nouvel aller-retour." if rap else "") +
+                 f"\nTermine par `cycle-lot verdict {v} --merger --rapport <fichier>` ou `cycle-lot verdict {v} "
+                 f"--a-reprendre --rapport <fichier> --cartes-ok <n,…> --cartes-ko <n,…>` (chaque carte en Under review "
+                 f"classée). À REPRENDRE dès qu'il reste un point bloquant OU non bloquant.")
+    elif e == "merge-lot":
+        corps = (f"\nVerdict À MERGER enregistré. Merge chaque PR du lot, back d'abord : "
+                 + " puis ".join(f"`cycle-lot merge {v} --pr {x['depot']}#{x['num']}`" for x in etat["prs_lot"]
+                                 if not x.get("merge")) +
+                 f". Le relais attend ensuite la CI du push sur la release, puis passe la main à {N_DEV}.")
+    elif e == "correction":
+        rap = etat["rapports"][-1]["fichier"] if etat["rapports"] else "(pas de rapport)"
+        corps = (f"\nÀ corriger, {ar} : rapport {rap}.{mot}\nCorrige TOUS les points, bloquants et non bloquants, "
+                 f"sur les PR ouvertes vers release/{v} (les mêmes si le lot n'est pas mergé, de nouvelles sinon), en "
+                 f"reprise run-lot, une passe par carte, avec un test rouge avant chaque correction, le test du cas "
+                 f"voisin et les appelants vérifiés. Quand la CI de fin de reprise est verte : `cycle-lot passe {v} "
+                 f"--vers {REV} --message \"<ce qui a été corrigé, point par point>\"`.")
+    elif e == "livraison":
+        attente = [i for i in etat["interventions"] if not i["faite"]]
+        corps = (f"\nLes PR du lot sont mergées dans release/{v} et la CI du push sur la release est verte.{mot}"
+                 + (f"\nInterventions de {HUMAIN} encore ouvertes (à vérifier avant la livraison, sinon `cycle-lot arret`) : "
+                    + "; ".join(f"{i['n']}. {i['texte']}" for i in attente) if attente else "") +
+                 f"\nOuvre les PR de livraison : `cycle-lot ouvrir-livraison {v}`. Le relais attend leur CI et "
+                 f"réveille {N_REV}.")
+    elif e == "revue-livraison":
+        corps = (f"\nLes PR de livraison ont fini leur CI :\n" + "\n".join(ligne_pr(x) for x in etat["prs_livraison"]) +
+                 f"{mot}\nVérifie qu'elles n'apportent que le lot revu (et des commits déjà sur develop), puis merge-les "
+                 f"avec `cycle-lot merge {v} --pr <depot>#<n>`, back avant front. Rouge persistant sans rapport avec le "
+                 f"code : relance-le (`gh run rerun <id> --failed`) puis `cycle-lot attendre-ci {v}`. Défaut de code : "
+                 f"`cycle-lot verdict {v} --a-reprendre --rapport <fichier>`.")
+    elif e == "liste-validation":
+        corps = (f"\nLe lot est en production : CI de develop et de master verte, déploiement compris.{mot}"
+                 f"\nRédige la liste des validations visuelles à faire en production ({URL_PROD}) : une entrée par "
+                 f"évolution ou correction du lot, avec la carte, le parcours exact et le résultat attendu. Écris-la dans "
+                 f"{dossier(v)}/validations-prod.md, poste-la dans ce fil, puis `cycle-lot passe {v} --vers {REV} --etape "
+                 f"validation-prod --fichier {dossier(v)}/validations-prod.md`.")
+    elif e == "validation-prod":
+        corps = (f"\nTeste en production ({URL_PROD}), avec Playwright, chaque entrée de {etat.get('liste_validation')}."
+                 f"{mot}\nPour chaque défaut : `cycle-lot carte-bug {v} --titre … --appli back|front|back/front --gravite "
+                 f"critique|important|normal|faible|cosmetique --description-fichier <fichier>` (carte de la version "
+                 f"suivante, en Not Ready). Puis `cycle-lot fin {v} --rapport <fichier>` et le bilan dans ce fil.")
+    elif e == "dev":
+        corps = (f"\nTu as la main sur le développement du lot.{mot}\nSi ton lanceur run-lot tourne, rien à faire. "
+                 f"Sinon reprends le lot là où il s'est arrêté ; quand la CI de fin de lot est verte : `cycle-lot passe "
+                 f"{v} --vers {REV} --message \"<bilan du lot, arbitrages pris>\"`.")
+    else:
+        corps = mot
+    return tete_msg + corps + (("\n" + extra) if extra else "") + pied(etat, agent)
+
+
+def arreter(etat, par, motif, message, etape_reprise=None):
+    etat["arret"] = {"motif": motif, "message": message, "par": par, "heure": iso(),
+                     "etape": etape_reprise or etat["etape"],
+                     "attente": None if etape_reprise else etat.get("attente")}
+    changer_etape(etat, "arret", par, f"arrêt ({motif}) : {message}")
+    # un message de l'humain sans mention ne réveille aucun agent (règle de groupe des agents) : nommer celui à mentionner
+    qui = NOMS[par] if par in (DEV, REV) else N_DEV
+    planifier_avis(etat, f"⛔ cycle arrêté ({motif}). {message} <@{HUMAIN_SLACK}> ta décision est attendue : réponds dans ce fil "
+                 f"en mentionnant {qui}, qui relancera le cycle (`cycle-lot reprise`). Sans mention, aucun agent ne se "
+                 f"réveille.")
+
+
+# ---------------------------------------------------------------- commandes
+
+def cmd_debut(a):
+    agent = appelant(a)
+    v = a.version
+    if agent not in (DEV, RELAIS):
+        raise Refus(f"seul {N_DEV} lance un lot, et seulement quand {HUMAIN} le lui demande")
+    if not RE_VERSION.match(v):
+        raise Refus(f"version « {v} » illisible (ex. 1.0.0 ou 1.2.3.4)")
+    m = RE_SESSION.match(a.session_key.strip())
+    if not m or m.group("agent") != DEV:
+        raise Refus(f"--session-key : la clé de session de {N_DEV} dans le fil du lot (ligne Runtime, "
+                    f"agent:{DEV}:slack:channel:…:thread:…)")
+    with verrou(v, creer=True):
+        if chemin_etat(v).exists():
+            e = lire(v)
+            raise Refus(f"un cycle existe déjà pour le lot {v} (étape « {e['etape']} ») : `cycle-lot etat {v}`")
+        cartes = cartes_de_version(v)
+        cartes = [c for c in cartes if c["liste"] != LISTES["finished"]]
+        if not cartes:
+            raise Refus(f"aucune carte [V{v}-…] ouverte sur le tableau Trello")
+        nums = [c["num"] for c in cartes]
+        doublons = sorted({n for n in nums if nums.count(n) > 1})
+        if doublons:
+            raise Refus(f"numéros de cartes en double dans le lot : {doublons}. {N_REV} classe les cartes par numéro : "
+                        f"renumérote-les sur Trello, puis relance `cycle-lot debut`.")
+        etat = {"version": v, "prefixe": v.replace(".", ""), "release": f"release/{v}",
+                "fil": {"canal": m.group("canal").upper(), "ts": m.group("ts"), "cle_dev": a.session_key.strip()},
+                "dossier_lot": a.dossier_lot, "cree": iso(), "etape": None, "tour": None, "depuis": None, "seq": 0,
+                "aller_retours": 0, "max_aller_retours": MAX_ALLER_RETOURS, "ci_rouges": 0,
+                "cartes": [{"id": c["id"], "num": c["num"], "nom": c["nom"], "url": c["url"]} for c in cartes],
+                "prs_lot": [], "prs_livraison": [], "interventions": [], "rapports": [], "cartes_bugs": [],
+                "attente": None, "arret": None, "relances": {}, "reveils": [], "a_reveiller": None, "avis_en_attente": [],
+                "historique": [], "dernier_message": None, "liste_validation": None}
+        changer_etape(etat, "dev", agent, f"cycle créé à la demande de {HUMAIN}")
+        faits, rates = deplacer(etat, {c["num"] for c in cartes}, "wip")
+        ecrire(etat)
+    print(f"Cycle du lot {v} créé : étape « dev », main à {N_DEV}. Fil {etat['fil']['canal']} {etat['fil']['ts']}.")
+    print(f"{len(cartes)} cartes du lot : {', '.join(str(c['num']) for c in cartes)} ; en Work in progress : "
+          f"{', '.join(map(str, faits)) or 'aucune'}" + (f" ; ÉCHEC Trello pour {rates}" if rates else ""))
+    print(f"Ensuite : arbitrages et interventions dès maintenant (règles a-d, `cycle-lot arret {v}` si bloquant), "
+          f"puis run-lot impl ; à la CI verte, `cycle-lot passe {v} --vers {REV}`.")
+
+
+def cmd_passe(a):
+    agent = appelant(a)
+    v = a.version
+    avertissement = ""
+    with verrou(v):
+        etat = lire(v)
+        if a.dossier_lot:
+            etat["dossier_lot"] = a.dossier_lot
+        if a.vers == REV and (a.etape or "revue") == "revue":
+            exiger(etat, agent, ("dev", "correction"))
+            prs = prs_ouvertes(etat["release"])
+            if not prs:
+                raise Refus(f"aucune PR ouverte vers {etat['release']} : rien à faire revoir")
+            problemes = []
+            for pr in prs:
+                verdict, resume = ci_pr(pr, REQUIS_LOT[pr["depot"]])
+                pr["ci"] = resume
+                if verdict != "vert":
+                    problemes.append(f"{pr['depot']} #{pr['num']} : {verdict}, {resume}")
+            if problemes:
+                raise Refus("la CI des PR du lot n'est pas verte. Étape 6 du cycle : corrige avant de demander la "
+                            "revue (ou attends la fin de l'étape CI de run-lot).\n" + "\n".join(problemes))
+            etat["prs_lot"] = prs
+            ou = ou_sont(etat)
+            a_revoir = {n for n, liste in ou.items() if liste in ("waiting", "wip")}
+            encore_wip = sorted(n for n, liste in ou.items() if liste == "wip")
+            deplacer(etat, a_revoir, "review")
+            if encore_wip:
+                avertissement = (f"Cartes encore en Work in progress au passage en revue (leur passe a-t-elle "
+                                 f"abouti ?) : {', '.join(map(str, encore_wip))}.")
+            a_deployer = [p for p in prs if PREVIEW and p["depot"] == PREVIEW["depot"]]
+            msg = (a.message or "") + (f"\n{avertissement}" if avertissement else "")
+            if a_deployer:
+                dep = lancer_deploiement_preview(etat, a_deployer[0]["branche"])
+                changer_etape(etat, "deploiement-revue", agent, msg, attente={"deploiement": dep})
+                suite = (f"Le back du lot se déploie sur la preview (run {dep['run'] or '?'}) ; le relais réveille "
+                         f"{N_REV} dès qu'il est en ligne.")
+            else:
+                changer_etape(etat, "revue", agent, msg)
+                planifier_reveil(etat, REV, "revue", extra=extra_revue(etat, None))
+                suite = f"Le relais réveille {N_REV} pour la revue dans les 2 minutes."
+            ecrire(etat)
+            print(f"Main passée à {N_REV} pour la revue du lot {v} (aller-retour {etat['aller_retours'] + 1}/"
+                  f"{etat['max_aller_retours']}). PR : " + ", ".join(f"{p['depot']}#{p['num']}" for p in prs) + ". " + suite)
+            if avertissement:
+                print(avertissement)
+        elif a.vers == REV and a.etape == "validation-prod":
+            exiger(etat, agent, ("liste-validation",))
+            if not a.fichier or not Path(a.fichier).is_file() or Path(a.fichier).stat().st_size == 0:
+                raise Refus("--fichier : la liste des validations visuelles (fichier non vide)")
+            etat["liste_validation"] = str(Path(a.fichier).resolve())
+            changer_etape(etat, "validation-prod", agent, a.message or "")
+            planifier_reveil(etat, REV, "validation-prod")
+            ecrire(etat)
+            print(f"Main passée à {N_REV} pour les validations en production : le relais le réveille dans les 2 minutes.")
+        else:
+            raise Refus(f"passe : `--vers {REV}` (revue, après le dev ou une correction) ou `--vers {REV} --etape "
+                        "validation-prod --fichier <liste>`. Les autres passages de main sont faits par verdict, "
+                        "merge, ouvrir-livraison et la veille.")
+
+
+def extra_revue(etat, note):
+    lignes = []
+    front = [p for p in etat["prs_lot"] if p["depot"] == "front"]
+    if front:
+        url = url_preview_front(front[0]["sha"])
+        lignes.append(f"Front du lot : preview de la PR, {url or 'URL dans les checks de la PR'}.")
+    else:
+        lignes.append(f"Pas de PR front : front de la release sur {URL_PREVIEW}.")
+    dep = (etat.get("attente") or {}).get("deploiement")
+    if dep:
+        lignes.append(f"Back du lot : branche {dep['branche']} déployée sur la preview (run {dep.get('run') or '?'}). "
+                      f"Vérifie que /health du back de preview a redémarré après ce run avant tes parcours.")
+    else:
+        lignes.append("Pas de PR back : le back de preview est celui de la release.")
+    if note:
+        lignes.append(note)
+    return "\n".join(lignes)
+
+
+def cmd_verdict(a):
+    agent = appelant(a)
+    v = a.version
+    with verrou(v):
+        etat = lire(v)
+        exiger(etat, agent, ("revue", "revue-livraison"))
+        rapport = Path(a.rapport).resolve() if a.rapport else None
+        if not rapport or not rapport.is_file() or rapport.stat().st_size == 0:
+            raise Refus("--rapport : ton rapport de revue (fichier non vide, points bloquants et non bloquants avec "
+                        "fichier:ligne, cartes validées et refusées)")
+        if a.merger and etat["etape"] == "revue-livraison":
+            raise Refus("à l'étape revue-livraison, l'accord se traduit par le merge des PR : `cycle-lot merge`")
+        ok, ko = liste_nums(a.cartes_ok), liste_nums(a.cartes_ko)
+        connus = {c["num"] for c in etat["cartes"]}
+        if (ok | ko) - connus:
+            raise Refus(f"cartes inconnues du lot : {sorted((ok | ko) - connus)} (lot : {sorted(connus)})")
+        if ok & ko:
+            raise Refus(f"cartes à la fois validées et refusées : {sorted(ok & ko)}")
+        ou = ou_sont(etat)
+        en_revue = {n for n, liste in ou.items() if liste == "review"}
+        etat["rapports"].append({"heure": iso(), "fichier": str(rapport), "verdict": "merger" if a.merger else "a-reprendre",
+                                 "etape": etat["etape"], "aller_retour": etat["aller_retours"] + 1})
+        if a.merger:
+            if ko:
+                raise Refus("--merger avec des cartes refusées : c'est un verdict À REPRENDRE")
+            restantes = {n for n, liste in ou.items() if liste != "finished"}
+            deplacer(etat, restantes, "finished", haut=True)
+            changer_etape(etat, "merge-lot", agent, a.message or "verdict À MERGER")
+            ecrire(etat)
+            print(f"Verdict À MERGER enregistré, cartes {sorted(restantes)} en Finished. Merge maintenant, back d'abord : "
+                  + " puis ".join(f"cycle-lot merge {v} --pr {x['depot']}#{x['num']}" for x in etat["prs_lot"]))
+            return
+        if etat["etape"] == "revue":
+            manquantes = en_revue - ok - ko
+            if manquantes:
+                raise Refus(f"classe chaque carte en Under review avec --cartes-ok ou --cartes-ko ; manquent : "
+                            f"{sorted(manquantes)}")
+        deplacer(etat, ok, "finished", haut=True)
+        deplacer(etat, ko, "wip")
+        etat["aller_retours"] += 1
+        msg = a.message or f"À REPRENDRE, rapport {rapport}"
+        if etat["aller_retours"] >= etat["max_aller_retours"]:
+            arreter(etat, agent, "aller-retours",
+                    f"{etat['aller_retours']}e verdict À REPRENDRE de {N_REV} (rapport {rapport}) : le cycle s'arrête "
+                    f"au bout de {etat['max_aller_retours']} aller-retours. {N_DEV} ne lance pas de nouvelle correction.",
+                    etape_reprise="correction")
+            ecrire(etat)
+            print("Verdict À REPRENDRE enregistré. C'est le dernier aller-retour permis : cycle ARRÊTÉ, décision de "
+                  f"{HUMAIN} attendue. Poste ton rapport dans le fil.")
+            return
+        changer_etape(etat, "correction", agent, msg)
+        planifier_reveil(etat, DEV, "correction")
+        ecrire(etat)
+        print(f"Verdict À REPRENDRE enregistré (aller-retour {etat['aller_retours']}/{etat['max_aller_retours']}). "
+              f"Cartes validées : {sorted(ok) or 'aucune'} ; à reprendre : {sorted(ko) or 'aucune'}. "
+              f"Le relais réveille {N_DEV} pour la correction dans les 2 minutes.")
+
+
+def cmd_merge(a):
+    agent = appelant(a)
+    v = a.version
+    depot, num = num_pr(a.pr)
+    with verrou(v):
+        etat = lire(v)
+        exiger(etat, agent, ("merge-lot", "revue-livraison"))
+        ensemble = etat["prs_lot"] if etat["etape"] == "merge-lot" else etat["prs_livraison"]
+        pr = next((x for x in ensemble if x["depot"] == depot and x["num"] == num), None)
+        if not pr:
+            raise Refus(f"{depot}#{num} ne fait pas partie des PR de l'étape : "
+                        + ", ".join(f"{x['depot']}#{x['num']}" for x in ensemble))
+        if pr.get("merge"):
+            print(f"{depot}#{num} est déjà mergée ({pr['merge']['commit'][:7]}).")
+            return
+        if depot == "front" and any(x["depot"] == "back" and not x.get("merge") for x in ensemble):
+            raise Refus("back d'abord : une release se livre dans l'ordre back, puis front")
+        vue = vue_pr(depot, num)
+        if vue["state"] == "MERGED":
+            pr["merge"] = {"heure": iso(), "commit": (vue.get("mergeCommit") or {}).get("oid", ""), "par": "hors relais"}
+        else:
+            if vue["state"] != "OPEN":
+                raise Refus(f"{depot}#{num} est {vue['state']}")
+            if vue["headRefOid"] != pr["sha"]:
+                raise Refus(f"la tête de {depot}#{num} a bougé depuis la revue ({pr['sha'][:7]} -> "
+                            f"{vue['headRefOid'][:7]}) : ce commit n'a pas été revu")
+            labels = [lb["name"] for lb in vue.get("labels", [])]
+            if PAUSE in labels:
+                raise Refus(f"{depot}#{num} porte encore l'étiquette {PAUSE} : sa CI n'a rien jugé")
+            if vue.get("mergeable") == "CONFLICTING":
+                raise Refus(f"{depot}#{num} est en conflit avec {vue['baseRefName']}")
+            base = vue["baseRefName"]
+            if base.startswith("release/"):
+                verdict, resume = ci_pr({**pr, "labels": labels}, REQUIS_LOT[depot])
+            elif base == "master":
+                verdict, resume = ci_pr({**pr, "labels": labels}, REQUIS_MASTER[depot])
+            else:  # develop : aucune CI de PR (les workflows n'écoutent pas les PR vers develop)
+                run = dernier_run(depot, pr["sha"], "pull_request")
+                verdict, resume = ("vert", "pas de CI de PR vers develop") if not run else bilan_run(depot, run)
+            if verdict != "vert":
+                raise Refus(f"CI de {depot}#{num} : {verdict}, {resume}. Pas de merge sur une CI qui n'est pas verte.")
+            methode = "--squash" if base.startswith("release/") else "--merge"
+            rc, out = gh_cmd("pr", "merge", str(num), "-R", DEPOTS[depot], methode, "--match-head-commit", pr["sha"])
+            if rc != 0:
+                raise Refus(f"merge de {depot}#{num} refusé par GitHub : {out[-400:]}")
+            vue = vue_pr(depot, num)
+            pr["merge"] = {"heure": iso(), "commit": (vue.get("mergeCommit") or {}).get("oid", ""), "par": agent}
+        journal(v, f"{depot}#{num} mergée ({pr['merge']['commit'][:7]}) par {pr['merge']['par']}")
+        reste = [f"{x['depot']}#{x['num']}" for x in ensemble if not x.get("merge")]
+        if not reste:
+            if etat["etape"] == "merge-lot":
+                depots = sorted({x["depot"] for x in ensemble})
+                changer_etape(etat, "ci-release", agent, f"PR du lot mergées dans {etat['release']}",
+                              attente={"depots": depots, "relances": []})
+                suite = (f"Toutes les PR du lot sont mergées. Le relais attend la CI du push sur {etat['release']} "
+                         f"puis réveille {N_DEV} pour la livraison.")
+            else:
+                commits = [{"depot": x["depot"], "base": x["base"], "commit": x["merge"]["commit"]} for x in ensemble]
+                changer_etape(etat, "deploiement", agent, "PR de livraison mergées sur develop et master",
+                              attente={"commits": commits, "relances": []})
+                suite = ("Les PR de livraison sont mergées. Le relais attend la CI de develop et de master "
+                         f"(déploiement compris) puis réveille {N_DEV} pour la liste des validations.")
+        else:
+            suite = f"Reste à merger : {', '.join(reste)}."
+        ecrire(etat)
+    print(f"{depot}#{num} mergée en {pr['merge']['commit'][:7]}. {suite}")
+
+
+def cmd_ouvrir_livraison(a):
+    agent = appelant(a)
+    v = a.version
+    with verrou(v):
+        etat = lire(v)
+        exiger(etat, agent, ("livraison",))
+        ouvertes = [i for i in etat["interventions"] if not i["faite"]]
+        if ouvertes:
+            raise Refus(f"interventions de {HUMAIN} encore ouvertes : " + "; ".join(f"{i['n']}. {i['texte']}" for i in ouvertes)
+                        + f". Fais-les confirmer (`cycle-lot intervention {v} --faite N`) ou `cycle-lot arret {v} "
+                          f"--motif intervention`.")
+        rel = etat["release"]
+        prs, creees = [], []
+        for depot, nom in DEPOTS.items():
+            for base in ("develop", "master"):
+                ahead = gh_json("api", f"repos/{nom}/compare/{base}...{rel}", "--jq", ".ahead_by")
+                if not ahead:
+                    continue
+                exist = gh_json("pr", "list", "-R", nom, "--head", rel, "--base", base, "--state", "open",
+                                "--json", "number")
+                if exist:
+                    n = exist[0]["number"]
+                    if base == "master":  # le back n'écoute pas `synchronize` : rouvrir relance la CI sur la tête
+                        gh_cmd("pr", "close", str(n), "-R", nom)
+                        gh_cmd("pr", "reopen", str(n), "-R", nom)
+                else:
+                    lot = ", ".join(f"#{x['num']}" for x in etat["prs_lot"] if x["depot"] == depot) or "-"
+                    corps = (f"Livraison du lot {v} : `{rel}` vers `{base}` ({depot}).\n\nPR du lot : {lot}. "
+                             f"Cartes : {', '.join(str(c['num']) for c in etat['cartes'])}.\n"
+                             f"Dernier rapport de revue de {N_REV} : {etat['rapports'][-1]['fichier'] if etat['rapports'] else '-'}.\n\n"
+                             f"Cycle de lot : revue et merge par {N_REV} via `cycle-lot merge`, après la CI.")
+                    rc, out = gh_cmd("pr", "create", "-R", nom, "--base", base, "--head", rel,
+                                     "--title", f"release({v}): lot {v} vers {base} ({depot})", "--body", corps)
+                    if rc != 0:
+                        raise Refus(f"création de la PR {depot} vers {base} refusée : {out[-300:]}")
+                    m = re.search(r"/pull/(\d+)", out)
+                    n = int(m.group(1)) if m else gh_json("pr", "list", "-R", nom, "--head", rel, "--base", base,
+                                                          "--state", "open", "--json", "number")[0]["number"]
+                    creees.append(f"{depot}#{n}")
+                vue = vue_pr(depot, n)
+                prs.append({"depot": depot, "num": n, "base": base, "branche": rel, "sha": vue["headRefOid"],
+                            "url": vue["url"], "labels": []})
+        if not prs:
+            raise Refus(f"{rel} n'a aucun commit d'avance sur develop ni master : rien à livrer")
+        etat["prs_livraison"] = prs
+        changer_etape(etat, "ci-livraison", agent, a.message or "PR de livraison ouvertes",
+                      attente={"debut": iso(), "relances": []})
+        ecrire(etat)
+    print("PR de livraison : " + ", ".join(f"{p['depot']}#{p['num']} vers {p['base']}" for p in prs)
+          + (f" (créées : {', '.join(creees)})" if creees else "") +
+          f". Le relais attend leur CI puis réveille {N_REV} pour la revue et le merge.")
+
+
+def cmd_attendre_ci(a):
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        exiger(etat, agent, ("revue-livraison",))
+        changer_etape(etat, "ci-livraison", agent, a.message or "CI relancée, attente du verdict",
+                      attente={"debut": iso(), "relances": []})
+        ecrire(etat)
+    print("Le relais attend la CI des PR de livraison et te réveille au verdict.")
+
+
+def cmd_arret(a):
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        if etat["etape"] in ("arret", "livre"):
+            raise Refus(f"le lot est déjà à l'étape « {etat['etape']} »")
+        if agent not in (etat["tour"], RELAIS) and etat["tour"] != "veille":
+            raise Refus(f"la main est à {etat['tour']} : c'est à lui d'arrêter le lot")
+        arreter(etat, agent, a.motif, a.message)
+        ecrire(etat)
+    print(f"Cycle arrêté, avis posté pour {HUMAIN}. Pose-lui maintenant ta question dans le fil : une liste numérotée, "
+          "options chiffrées, ta recommandation selon les règles a-d.")
+
+
+def cmd_reprise(a):
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        if etat["etape"] != "arret":  # à l'arrêt, la main est à l'humain : l'agent qu'il a désigné reprend
+            raise Refus(f"le lot n'est pas arrêté (étape « {etat['etape']} »)")
+        arret = etat["arret"] or {}
+        etape = a.etape or arret.get("etape") or "dev"
+        if etape not in ETAPES or etape in ("arret", "livre"):
+            raise Refus(f"étape de reprise « {etape} » inconnue")
+        if a.rallonge:
+            etat["max_aller_retours"] += 1
+        if arret.get("motif") == "aller-retours" and etat["aller_retours"] >= etat["max_aller_retours"] \
+                and etape in ("correction", "revue"):
+            raise Refus(f"le plafond d'aller-retours est atteint : reprends avec --rallonge si {HUMAIN} autorise une "
+                        "correction de plus, ou avec --etape merge-lot s'il fait merger en l'état")
+        changer_etape(etat, etape, agent, f"reprise sur décision de {HUMAIN} : {a.decision}",
+                      attente=arret.get("attente"))
+        tour = etat["tour"]
+        msg = f"Le lot reprend à l'étape « {etape} »."
+        if tour in (DEV, REV) and tour != agent:
+            planifier_reveil(etat, tour, "reprise", extra=f"Décision de {HUMAIN} : {a.decision}")
+            msg += f" Le relais réveille {tour} dans les 2 minutes."
+        elif tour == "veille":
+            msg += " Le relais attend GitHub."
+        ecrire(etat)
+    print(msg)
+
+
+def cmd_intervention(a):
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        if a.ajouter:
+            n = len(etat["interventions"]) + 1
+            etat["interventions"].append({"n": n, "texte": a.ajouter, "faite": False, "par": agent, "heure": iso()})
+            journal(a.version, f"intervention {n} demandée à {HUMAIN} : {a.ajouter}")
+            print(f"Intervention {n} notée. Demande-la à {HUMAIN} dans le fil dès maintenant ; l'ouverture des PR de "
+                  f"livraison est refusée tant qu'elle n'est pas faite.")
+        elif a.faite:
+            i = next((x for x in etat["interventions"] if x["n"] == a.faite), None)
+            if not i:
+                raise Refus(f"intervention {a.faite} inconnue")
+            i["faite"] = True
+            i["faite_le"] = iso()
+            journal(a.version, f"intervention {a.faite} faite : {i['texte']}")
+            print(f"Intervention {a.faite} marquée faite.")
+        else:
+            for i in etat["interventions"]:
+                print(f"{i['n']}. [{'faite' if i['faite'] else 'à faire'}] {i['texte']}")
+        ecrire(etat)
+
+
+def version_suivante(version, toutes):
+    def cle(s):
+        return tuple(int(x) for x in s.split("."))
+    vues = set()
+    for c in toutes:
+        m = RE_CARTE.match(c["name"])
+        if m and c["idList"] not in (LISTES["canceled"], LISTES["archived"]):
+            vues.add(m.group("ver"))
+    plus = sorted((x for x in vues if cle(x) > cle(version)), key=cle)
+    if plus:
+        return plus[0]
+    parts = version.split(".")
+    parts[-1] = str(int(parts[-1]) + 1)
+    return ".".join(parts)
+
+
+def cmd_carte_bug(a):
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        exiger(etat, agent, ("validation-prod",))
+        desc = Path(a.description_fichier)
+        if not desc.is_file() or desc.stat().st_size == 0:
+            raise Refus("--description-fichier : constat, parcours pour reproduire, attendu, carte du lot concernée")
+        toutes = cartes_du_tableau()
+        suivante = version_suivante(a.version, toutes)
+        nums = [int(m.group("num")) for c in toutes if (m := RE_CARTE.match(c["name"])) and m.group("ver") == suivante]
+        n = max(nums, default=0) + 1
+        appli = {"back": "Back", "front": "Front", "back/front": "Back/Front"}[a.appli]
+        nom = f"[V{suivante}-Fix-{appli}] {n}. {a.titre.strip()}"
+        carte = trello("POST", "/cards", idList=LISTES["not_ready"], name=nom, desc=desc.read_text()[:16000],
+                       idLabels=GRAVITES[a.gravite], pos="bottom")
+        etat["cartes_bugs"].append({"id": carte.get("id"), "nom": nom, "url": carte.get("shortUrl"), "heure": iso()})
+        journal(a.version, f"carte de bug créée : {nom} {carte.get('shortUrl')}")
+        ecrire(etat)
+    print(f"Carte créée en Not Ready : {nom} {carte.get('shortUrl')}")
+
+
+def cmd_fin(a):
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        exiger(etat, agent, ("validation-prod",))
+        rapport = Path(a.rapport)
+        if not rapport.is_file() or rapport.stat().st_size == 0:
+            raise Refus("--rapport : le bilan des validations en production (fichier non vide)")
+        etat["rapport_prod"] = str(rapport.resolve())
+        changer_etape(etat, "livre", agent, f"validations en production faites, {len(etat['cartes_bugs'])} carte(s) de bug")
+        ecrire(etat)
+    print(f"Lot {a.version} livré et validé. Poste le bilan dans le fil : validations OK, défauts et leurs cartes "
+          f"({len(etat['cartes_bugs'])}).")
+
+
+def cmd_programmer(a):
+    """Lancement différé demandé EXPLICITEMENT par l'humain (« quand X est livré, attaque Y »). Remplace les
+    veilleurs écrits à la main par un agent, qui finissent par attendre l'autre agent."""
+    appelant(a)
+    m = RE_SESSION.match(a.session_key.strip())
+    if not m or m.group("agent") != DEV:
+        raise Refus(f"--session-key : la clé de session de {N_DEV} dans le fil où {HUMAIN} a fait la demande")
+    p = CYCLES / "programmations.json"
+    CYCLES.mkdir(parents=True, exist_ok=True)
+    progs = json.loads(p.read_text()) if p.exists() else []
+    progs.append({"version": a.version, "apres": a.apres, "cle": a.session_key.strip(), "cree": iso(), "fait": None})
+    p.write_text(json.dumps(progs, ensure_ascii=False, indent=2))
+    print(f"Noté : quand le lot {a.apres} sera mergé sur develop et master et en production, le relais te réveillera "
+          f"dans ce fil pour lancer le lot {a.version}.")
+
+
+def cmd_etat(a):
+    if not a.version:
+        vus = sorted(CYCLES.glob("*/etat.json"))
+        if not vus:
+            print("Aucun cycle de lot.")
+        for p in vus:
+            e = json.loads(p.read_text())
+            print(f"{e['version']} : « {e['etape']} », main à {e['tour']} depuis {hm(e['depuis'])}, aller-retours "
+                  f"{e['aller_retours']}/{e['max_aller_retours']}")
+        return
+    e = lire(a.version)
+    if a.json:
+        print(json.dumps(e, ensure_ascii=False, indent=2))
+        return
+    print(f"Lot {e['version']} : étape « {e['etape']} » ({ETAPES[e['etape']][2]}), main à {e['tour'] or 'personne'} depuis "
+          f"{hm(e['depuis'])}.")
+    print(f"Fil : {e['fil']['canal']} {e['fil']['ts']}. Aller-retours : {e['aller_retours']}/{e['max_aller_retours']}. "
+          f"Dossier du lot : {e.get('dossier_lot') or '-'}.")
+    if e["arret"] and e["etape"] == "arret":
+        print(f"Arrêt ({e['arret']['motif']}) par {e['arret']['par']} : {e['arret']['message']}")
+    for titre, prs in (("PR du lot", e["prs_lot"]), ("PR de livraison", e["prs_livraison"])):
+        if prs:
+            print(f"{titre} :")
+            for p in prs:
+                print("  " + ligne_pr(p))
+    if e["interventions"]:
+        print("Interventions : " + "; ".join(f"{i['n']}. [{'faite' if i['faite'] else 'à faire'}] {i['texte']}"
+                                              for i in e["interventions"]))
+    print("Cartes : " + ", ".join(str(c["num"]) for c in e["cartes"]))
+    if e["rapports"]:
+        r = e["rapports"][-1]
+        print(f"Dernier rapport de {N_REV} : {r['fichier']} ({r['verdict']}, {hm(r['heure'])})")
+    if e.get("a_reveiller"):
+        r = e["a_reveiller"]
+        print(f"Réveil en attente : {r['agent']} ({r['motif']}, demandé {hm(r['demande'])}, {r['essais']} essai(s))")
+    print("Dernières étapes :")
+    for h in e["historique"][-6:]:
+        print(f"  {hm(h['heure'])} {h['de']} -> {h['vers']} par {h['par']}" + (f" : {h['message'][:140]}" if h["message"] else ""))
+
+
+def cmd_reveiller(a):
+    with verrou(a.version):
+        etat = lire(a.version)
+        agent = a.agent or etat["tour"]
+        if agent not in (DEV, REV):
+            raise Refus(f"la main est à {etat['tour']} : personne à réveiller")
+        planifier_reveil(etat, agent, "réveil manuel", extra=a.message or "")
+        ecrire(etat)
+    print(f"Réveil de {agent} planifié : le relais le fait dans les 2 minutes.")
+
+
+# ---------------------------------------------------------------- veille (timer)
+
+def units_actives(agent, prefixe):
+    rc, out, err = lancer([SYSTEMCTL, "--user", "list-units", f"{agent}-*", "--state=active,activating",
+                           "--no-legend", "--plain"], timeout=30)
+    motif = re.compile(rf"^{agent}-{re.escape(prefixe)}([^0-9]|$)")
+    return [l.split()[0] for l in out.splitlines() if l.strip() and motif.match(l.split()[0])]
+
+
+def session_active(etat, agent):
+    """True / False ; None si le gateway ne répond pas (on ne relance pas sur une inconnue)."""
+    rc, out, err = lancer([OPENCLAW, "gateway", "call", "sessions.list", "--json", "--params",
+                           json.dumps({"agentId": agent, "limit": 60})], timeout=90, env=env_openclaw())
+    d = json_dans(out)
+    if rc != 0 or "sessions" not in d:
+        return None
+    cle = cle_session(etat, agent)
+    return any(s.get("key") == cle and (s.get("hasActiveRun") or s.get("status") == "running") for s in d["sessions"])
+
+
+def veiller_tour(etat):
+    """Un agent a la main : rien à faire tant qu'un job `<agent>-<prefixe>-*` tourne ou que l'étape est récente.
+    Le CLI openclaw coûte ~20 s de CPU : on ne lit l'état de la session qu'après INACTIF_MIN sans signe de vie,
+    et pas plus d'une fois toutes les 10 min."""
+    agent, r = etat["tour"], etat["relances"]
+    units = units_actives(agent, etat["prefixe"])
+    plafond = ETAPES[etat["etape"]][1]
+
+    def plafond_depasse(quoi):
+        if plafond and minutes_depuis(etat["depuis"]) > plafond * 60 and not r.get("alerte_plafond"):
+            r["alerte_plafond"] = True
+            planifier_avis(etat, f"l'étape « {etat['etape']} » dure depuis {hm(etat['depuis'])}, au-delà de son plafond "
+                                 f"de {plafond} h, alors que {agent} travaille encore ({quoi}). Rien n'est bloqué côté "
+                                 f"relais ; à regarder si ça te semble anormal.")
+    if units:
+        r["vu_actif"] = iso()
+        plafond_depasse(", ".join(units))
+        return
+    reperes = [date(etat["depuis"])] + [date(x) for x in (r.get("vu_actif"), r.get("derniere")) if x]
+    inactif = (maintenant() - max(reperes)).total_seconds() / 60
+    if inactif < INACTIF_MIN:
+        return
+    if r.get("verif_session") and minutes_depuis(r["verif_session"]) < 10:
+        return
+    r["verif_session"] = iso()
+    actif = session_active(etat, agent)
+    if actif is None:
+        return
+    if actif:
+        r["vu_actif"] = iso()
+        plafond_depasse("tour en cours")
+        return
+    if r.get("nb", 0) < NB_RELANCES:
+        r["nb"] = r.get("nb", 0) + 1
+        r["derniere"] = iso()
+        prefixe = (f"Relance automatique n°{r['nb']} : depuis {int(inactif)} min, ni changement d'étape, ni tour en "
+                   f"cours, ni job `{agent}-{etat['prefixe']}-…` actif. Si l'étape est finie, termine-la par sa "
+                   f"commande ; si un job tourne sous un autre nom, dis-le en une ligne.\n")
+        planifier_reveil(etat, agent, f"relance {r['nb']}", prefixe=prefixe)
+    elif not r.get("alerte"):
+        r["alerte"] = True
+        planifier_avis(etat, f"{agent} ne répond pas sur l'étape « {etat['etape']} » (main depuis {hm(etat['depuis'])}, "
+                             f"{NB_RELANCES} relances sans effet). <@{HUMAIN_SLACK}> une relance de ta part dans ce fil est "
+                             f"nécessaire.")
+
+
+def url_run(depot, run_id):
+    return f"https://github.com/{DEPOTS[depot]}/actions/runs/{run_id}" if run_id else None
+
+
+def veiller_runs(etat, cibles, requis_par_cible):
+    """cibles : [(depot, sha, event, branche)] -> ('attente' | 'vert' | 'rouge', lignes de bilan, {(depot, sha): résumé}).
+    Le dernier état lu de chaque run reste dans attente.suivi : le monitor (vue Graph) l'affiche sous le lot."""
+    att = etat["attente"]
+    lignes, en_cours, rouges, par_cible = [], False, False, {}
+    suivi = []
+    for (depot, sha, event, branche), requis in zip(cibles, requis_par_cible):
+        run = dernier_run(depot, sha, event, branche)
+        verdict, resume = bilan_run(depot, run, requis)
+        rid = run["databaseId"] if run else None
+        suivi.append({"depot": depot, "branche": branche, "sha": sha, "event": event, "run": rid,
+                      "url": url_run(depot, rid), "verdict": verdict, "resume": resume,
+                      "debut": run.get("createdAt") if run else None})
+        if verdict in ("absent", "en cours"):
+            en_cours = True
+        elif verdict == "rouge":
+            if relancer_si_sans_rapport(etat, depot, run, att.setdefault("relances", [])):
+                en_cours = True
+                resume += " (relancé une fois : sans rapport avec le code)"
+                suivi[-1]["verdict"] = "en cours"
+            else:
+                rouges = True
+        par_cible[(depot, sha)] = resume
+        suivi[-1]["resume"] = resume
+        lignes.append(f"{depot}{' ' + branche if branche else ''} `{sha[:7]}` : {verdict}, {resume}")
+    att["suivi"] = suivi
+    att["suivi_heure"] = iso()
+    return ("attente" if en_cours else "rouge" if rouges else "vert"), lignes, par_cible
+
+
+def veiller_attente(etat):
+    e, att = etat["etape"], etat["attente"] or {}
+    duree = minutes_depuis(etat["depuis"])
+    plafond = (ETAPES[e][1] or 3) * 60
+    if e == "deploiement-revue":
+        dep = att.get("deploiement") or {}
+        note = None
+        if dep.get("erreur"):
+            note = f"Déploiement du back du lot sur la preview impossible ({dep['erreur'][:200]})."
+        else:
+            if not dep.get("run"):
+                dep["run"] = trouver_run_dispatch(dep["branche"], date(dep["lance"]) - dt.timedelta(minutes=1))
+            if dep.get("run"):
+                depot = PREVIEW["depot"]
+                run = next((r for r in runs(depot, branch=dep["branche"], event="workflow_dispatch")
+                            if r["databaseId"] == dep["run"]), None)
+                verdict, resume = bilan_run(depot, run, tuple(PREVIEW.get("jobs_requis") or REQUIS_PUSH))
+                dep.update(verdict=verdict, resume=resume, url=url_run(depot, dep["run"]), vu=iso())
+                if verdict == "vert":
+                    dep["vert_a"] = dep.get("vert_a") or iso()
+                    if minutes_depuis(dep["vert_a"]) < ATTENTE_PREVIEW_MIN:
+                        return
+                elif verdict == "rouge":
+                    if relancer_si_sans_rapport(etat, depot, run, dep.setdefault("relances", [])):
+                        return
+                    note = (f"Le déploiement du back du lot sur la preview a échoué ({resume}). Si c'est le code du "
+                            f"lot, c'est un point bloquant ; sinon fais la revue sans le back du lot en preview et dis-le.")
+                elif duree < plafond:
+                    return
+                else:
+                    note = f"Déploiement du back du lot toujours en cours après {int(duree)} min ({resume})."
+            elif duree < 20:
+                return
+            else:
+                note = "Aucun run de déploiement trouvé pour la branche du lot."
+        changer_etape(etat, "revue", "veille")
+        etat["attente"] = {"deploiement": dep}
+        planifier_reveil(etat, REV, "revue", extra=extra_revue(etat, note))
+    elif e == "ci-release":
+        cibles = [(d, tete(d, etat["release"]), "push", etat["release"]) for d in att["depots"]]
+        verdict, lignes, _ = veiller_runs(etat, cibles, [REQUIS_PUSH] * len(cibles))
+        if verdict == "attente" and duree < plafond:
+            return
+        if verdict == "vert":
+            etat["ci_rouges"] = 0
+            changer_etape(etat, "livraison", "veille", "CI du push sur la release verte :\n" + "\n".join(lignes))
+            planifier_reveil(etat, DEV, "livraison")
+        elif verdict == "rouge":
+            etat["ci_rouges"] += 1
+            if etat["ci_rouges"] >= MAX_CI_ROUGES:
+                arreter(etat, "veille", "ci", f"CI du push sur {etat['release']} rouge {etat['ci_rouges']} fois de suite : "
+                        + " ; ".join(lignes))
+            else:
+                changer_etape(etat, "correction", "veille", f"CI du push sur {etat['release']} rouge après le merge du lot. "
+                              f"Corrige par une PR vers {etat['release']}, puis `cycle-lot passe {etat['version']} "
+                              f"--vers {REV}`.\n" + "\n".join(lignes))
+                planifier_reveil(etat, DEV, "correction")
+        else:
+            arreter(etat, "veille", "ci", f"CI du push sur {etat['release']} sans verdict après {int(duree)} min : "
+                    + " ; ".join(lignes))
+    elif e == "ci-livraison":
+        master = [x for x in etat["prs_livraison"] if x["base"] == "master"]
+        cibles = [(x["depot"], x["sha"], "pull_request", None) for x in master]
+        verdict, lignes, par_cible = veiller_runs(etat, cibles, [REQUIS_MASTER[x["depot"]] for x in master])
+        if verdict == "attente" and duree < plafond:
+            return
+        for x in etat["prs_livraison"]:
+            x["ci"] = par_cible.get((x["depot"], x["sha"]), "?") if x["base"] == "master" else "pas de CI de PR vers develop"
+        note = "" if verdict != "attente" else f"\nCI encore incomplète après {int(duree)} min."
+        changer_etape(etat, "revue-livraison", "veille", "CI des PR de livraison :\n" + "\n".join(lignes) + note)
+        planifier_reveil(etat, REV, "revue-livraison")
+    elif e == "deploiement":
+        cibles = [(c["depot"], c["commit"], "push", c["base"]) for c in att["commits"]]
+        verdict, lignes, _ = veiller_runs(etat, cibles, [REQUIS_PUSH] * len(cibles))
+        if verdict == "attente" and duree < plafond:
+            return
+        if verdict == "vert":
+            changer_etape(etat, "liste-validation", "veille", "CI de develop et de master verte, lot en production :\n"
+                          + "\n".join(lignes))
+            planifier_reveil(etat, DEV, "liste-validation")
+        else:
+            arreter(etat, "veille", "deploiement",
+                    ("CI de livraison rouge" if verdict == "rouge" else f"CI de livraison sans verdict après "
+                     f"{int(duree)} min") + " : " + " ; ".join(lignes) + f". {N_DEV} est réveillé pour le diagnostic.",
+                    etape_reprise="liste-validation")
+            planifier_reveil(etat, DEV, "diagnostic", texte=(
+                f"[RELAIS DU CYCLE DE LOT {etat['version']} — message automatique de cycle-lot, pas de {HUMAIN}] La mise "
+                f"en production du lot est en échec :\n" + "\n".join(lignes) +
+                f"\nLe cycle est arrêté pour {HUMAIN}. Diagnostique (code, serveur, Sonar, réseau) et poste dans ce fil ce que "
+                "tu proposes ; ne corrige rien sans sa réponse. Réponse obligatoire, NO_REPLY interdit."))
+
+
+def veiller_lot(etat):
+    executer_en_attente(etat)
+    if etat.get("a_reveiller") or etat["etape"] == "arret":
+        return
+    if etat["tour"] == "veille":
+        att = etat.get("attente") or {}
+        if att.get("verifie") and minutes_depuis(att["verifie"]) < INTERVALLE_GH_MIN:
+            return
+        att["verifie"] = iso()
+        etat["attente"] = att
+        veiller_attente(etat)
+    elif etat["tour"] in (DEV, REV):
+        veiller_tour(etat)
+    executer_en_attente(etat)
+
+
+def veiller_programmations():
+    p = CYCLES / "programmations.json"
+    if not p.exists():
+        return
+    progs = json.loads(p.read_text())
+    change = False
+    for prog in progs:
+        if prog.get("fait"):
+            continue
+        try:
+            avant = lire(prog["apres"])
+        except Refus:
+            continue
+        if avant["etape"] in ("liste-validation", "validation-prod", "livre"):
+            m = RE_SESSION.match(prog["cle"])
+            faux = {"version": prog["version"], "prefixe": prog["version"].replace(".", ""), "seq": 0, "reveils": [],
+                    "n_reveil": int(time.time()),
+                    "fil": {"canal": m.group("canal").upper(), "ts": m.group("ts")}}
+            texte = (f"[RELAIS — lancement différé demandé par {HUMAIN}] Le lot {prog['apres']} est mergé sur develop et "
+                     f"master et en production. {HUMAIN} t'a demandé d'attaquer ensuite le lot {prog['version']} : "
+                     f"lance-le maintenant (`cycle-lot debut {prog['version']} --session-key {prog['cle']}`, branches "
+                     f"release/{prog['version']} tirées de develop). Réponse obligatoire dans ce fil.")
+            if reveiller(faux, DEV, texte, "lancement différé"):
+                prog["fait"] = iso()
+                change = True
+    if change:
+        p.write_text(json.dumps(progs, ensure_ascii=False, indent=2))
+
+
+def cmd_veille(a):
+    t0, lots, erreurs = time.monotonic(), [], []
+    for p in sorted(CYCLES.glob("*/etat.json")):
+        v = p.parent.name
+        try:
+            with verrou(v):
+                etat = lire(v)
+                if etat["etape"] == "livre":
+                    continue
+                lots.append(v)
+                veiller_lot(etat)
+                ecrire(etat)
+        except Exception as e:  # noqa: BLE001 — un lot en erreur ne bloque pas les autres
+            print(f"{v} : {type(e).__name__} : {e}", file=sys.stderr)
+            erreurs.append(f"{v} : {type(e).__name__} : {str(e)[:300]}")
+            try:
+                journal(v, f"veille : erreur {type(e).__name__} : {str(e)[:300]}")
+            except OSError:
+                pass
+    try:
+        veiller_programmations()
+    except Exception as e:  # noqa: BLE001
+        print(f"programmations : {e}", file=sys.stderr)
+        erreurs.append(f"programmations : {str(e)[:300]}")
+    # pouls du relais, lu par le monitor (vue Graph) : un passage daté, sa durée et ses erreurs
+    CYCLES.mkdir(parents=True, exist_ok=True)
+    pouls = CYCLES / ".veille.json"
+    tmp = pouls.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"derniere": iso(), "duree_s": round(time.monotonic() - t0, 1), "lots": lots,
+                               "erreurs": erreurs}, ensure_ascii=False))
+    os.replace(tmp, pouls)
+
+
+# ---------------------------------------------------------------- entrée
+
+def main():
+    ap = argparse.ArgumentParser(prog="cycle-lot", description=f"Cycle de lot : relais {N_DEV} <-> {N_REV} (README.md).")
+    ap.add_argument("--par", choices=(DEV, REV, RELAIS), help="agent appelant (déduit du dossier courant sinon)")
+    commun = argparse.ArgumentParser(add_help=False)
+    commun.add_argument("--par", choices=(DEV, REV, RELAIS), default=argparse.SUPPRESS,
+                        help="agent appelant (déduit du dossier courant sinon)")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sp.add_parser("debut", help=f"{N_DEV}, sur demande de {HUMAIN} : crée le cycle du lot", parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--session-key", required=True)
+    p.add_argument("--dossier-lot")
+    p.set_defaults(f=cmd_debut)
+
+    p = sp.add_parser("passe", help=f"{N_DEV} : passe la main à {N_REV} (revue, ou validations en production)",
+                      parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--vers", required=True, choices=(REV,))
+    p.add_argument("--etape", choices=("revue", "validation-prod"))
+    p.add_argument("--message")
+    p.add_argument("--fichier")
+    p.add_argument("--dossier-lot")
+    p.set_defaults(f=cmd_passe)
+
+    p = sp.add_parser("verdict", help=f"{N_REV} : verdict de revue", parents=[commun])
+    p.add_argument("version")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--merger", action="store_true")
+    g.add_argument("--a-reprendre", action="store_true")
+    p.add_argument("--rapport", required=True)
+    p.add_argument("--cartes-ok")
+    p.add_argument("--cartes-ko")
+    p.add_argument("--message")
+    p.set_defaults(f=cmd_verdict)
+
+    p = sp.add_parser("merge", help=f"{N_REV} : merge gardé d'une PR de l'étape", parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--pr", required=True)
+    p.set_defaults(f=cmd_merge)
+
+    p = sp.add_parser("ouvrir-livraison", help=f"{N_DEV} : PR release -> develop et master", parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--message")
+    p.set_defaults(f=cmd_ouvrir_livraison)
+
+    p = sp.add_parser("attendre-ci", help=f"{N_REV} : CI de livraison relancée, le relais attend le verdict",
+                      parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--message")
+    p.set_defaults(f=cmd_attendre_ci)
+
+    p = sp.add_parser("arret", help=f"arrête le cycle : décision de {HUMAIN} attendue", parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--motif", required=True, choices=("arbitrage", "intervention", "aller-retours", "ci",
+                                                     "deploiement", "autre"))
+    p.add_argument("--message", required=True)
+    p.set_defaults(f=cmd_arret)
+
+    p = sp.add_parser("reprise", help=f"reprend un cycle arrêté, après la réponse de {HUMAIN}", parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--decision", required=True)
+    p.add_argument("--etape")
+    p.add_argument("--rallonge", action="store_true", help=f"un aller-retour de plus, autorisé par {HUMAIN}")
+    p.set_defaults(f=cmd_reprise)
+
+    p = sp.add_parser("intervention", help=f"interventions de {HUMAIN} demandées au démarrage", parents=[commun])
+    p.add_argument("version")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--ajouter")
+    g.add_argument("--faite", type=int)
+    p.set_defaults(f=cmd_intervention)
+
+    p = sp.add_parser("carte-bug", help=f"{N_REV} : carte de bug vu en production, version suivante, Not Ready",
+                      parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--titre", required=True)
+    p.add_argument("--appli", required=True, choices=("back", "front", "back/front"))
+    p.add_argument("--gravite", required=True, choices=tuple(GRAVITES))
+    p.add_argument("--description-fichier", required=True)
+    p.set_defaults(f=cmd_carte_bug)
+
+    p = sp.add_parser("fin", help=f"{N_REV} : lot validé en production", parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--rapport", required=True)
+    p.set_defaults(f=cmd_fin)
+
+    p = sp.add_parser("programmer", help=f"{N_DEV}, sur demande explicite de {HUMAIN} : lancer Y quand X est livré",
+                      parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--apres", required=True)
+    p.add_argument("--session-key", required=True)
+    p.set_defaults(f=cmd_programmer)
+
+    p = sp.add_parser("etat", help="état d'un cycle (ou de tous)", parents=[commun])
+    p.add_argument("version", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_etat)
+
+    p = sp.add_parser("reveiller", help="réveil manuel de l'agent qui a la main", parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--agent", choices=(DEV, REV))
+    p.add_argument("--message")
+    p.set_defaults(f=cmd_reveiller)
+
+    p = sp.add_parser("veille", help="le timer : attentes GitHub, relances, alertes", parents=[commun])
+    p.set_defaults(f=cmd_veille)
+
+    a = ap.parse_args()
+    try:
+        a.f(a)
+    except Refus as e:
+        print(f"REFUS : {e}", file=sys.stderr)
+        sys.exit(2)
+    except RuntimeError as e:
+        print(f"ERREUR (réseau, GitHub ou Trello) : {e}. Réessaie dans une minute ; rien n'a été changé si l'erreur "
+              f"est arrivée avant le message de succès.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Faux `openclaw` : gateway call agent | sessions.list, message send. Tout est noté dans le monde JSON.
+Comme le vrai gateway, refuse un `gateway call agent` lancé depuis l'exec d'un agent (OPENCLAW_SHELL=exec)."""
+import fcntl
+import json
+import os
+import sys
+
+MONDE = os.environ["MONDE"]
+a = sys.argv[1:]
+f = open(MONDE + ".lock", "w")
+fcntl.flock(f, fcntl.LOCK_EX)
+m = json.load(open(MONDE))
+rc = 0
+if a[:3] == ["gateway", "call", "agent"]:
+    params = json.loads(a[a.index("--params") + 1])
+    if os.environ.get("OPENCLAW_SHELL") == "exec":
+        m.setdefault("refus_exec", []).append(params["sessionKey"])
+        print(json.dumps({"ok": False, "error": {"message": "Gateway agent from agent exec would lose inter-session attribution."}}))
+        rc = 1
+    elif m.get("gateway_en_panne"):
+        print("gateway injoignable", file=sys.stderr)
+        rc = 1
+    else:
+        m.setdefault("reveils", []).append(params)
+        print(json.dumps({"status": "accepted", "runId": f"run-{len(m['reveils'])}"}))
+elif a[:3] == ["gateway", "call", "sessions.list"]:
+    params = json.loads(a[a.index("--params") + 1])
+    print(json.dumps({"sessions": m.get("sessions", {}).get(params["agentId"], [])}))
+elif a[:2] == ["message", "send"]:
+    m.setdefault("avis", []).append(a[a.index("--message") + 1])
+    print(json.dumps({"ok": True}))
+else:
+    print("faux openclaw : " + " ".join(a), file=sys.stderr)
+    rc = 1
+json.dump(m, open(MONDE, "w"), indent=1)
+fcntl.flock(f, fcntl.LOCK_UN)
+sys.exit(rc)

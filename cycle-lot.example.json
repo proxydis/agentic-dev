@@ -1,0 +1,62 @@
+{
+  "_lisez_moi": "Modèle de configuration de cycle-lot. Copier en cycle-lot.json (non versionné) et remplacer chaque valeur.",
+  "humain": {
+    "nom": "Camille",
+    "slack_id": "U0000000000"
+  },
+  "agents": {
+    "dev": {"id": "dev", "nom": "Dev"},
+    "relecteur": {"id": "relecteur", "nom": "Relecteur"},
+    "relais": {"id": "mainteneur", "nom": "Mainteneur"}
+  },
+  "openclaw_bin": "openclaw",
+  "depots": {
+    "back": {
+      "github": "mon-org/mon-app-back",
+      "workflow": "back.yml",
+      "jobs_requis_lot": ["quality"],
+      "jobs_requis_master": ["quality"]
+    },
+    "front": {
+      "github": "mon-org/mon-app-front",
+      "workflow": "front.yml",
+      "jobs_requis_lot": ["quality", "e2e"],
+      "jobs_requis_master": ["quality", "e2e"]
+    }
+  },
+  "jobs_requis_push": ["quality", "deploy"],
+  "deploiement_preview": {
+    "depot": "back",
+    "jobs_requis": ["quality", "deploy"],
+    "delai_min": 10
+  },
+  "etiquette_pause": "ci-en-pause",
+  "urls": {
+    "production": "https://app.example.com",
+    "preview": "https://preview.app.example.com"
+  },
+  "trello": {
+    "tableau": "<id du tableau>",
+    "listes": {
+      "not_ready": "<id de la liste Not Ready>",
+      "standby": "<id de la liste Standby>",
+      "wip": "<id de la liste Work in progress>",
+      "waiting": "<id de la liste Waiting for review>",
+      "review": "<id de la liste Under review>",
+      "finished": "<id de la liste Finished>",
+      "blocked": "<id de la liste Blocked>",
+      "archived": "<id de la liste Archived>",
+      "canceled": "<id de la liste Canceled>"
+    },
+    "etiquettes_gravite": {
+      "critique": "<id de l'étiquette>",
+      "important": "<id de l'étiquette>",
+      "normal": "<id de l'étiquette>",
+      "faible": "<id de l'étiquette>",
+      "cosmetique": "<id de l'étiquette>"
+    }
+  },
+  "doc_procedure": "AGENTS.md, section « Cycle de lot »",
+  "grille_revue": "GRILLE-REVUE.md",
+  "max_aller_retours": 3
+}

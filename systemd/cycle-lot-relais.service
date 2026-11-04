@@ -1,0 +1,15 @@
+# Relais du cycle de lot : lance `cycle-lot veille` (réveils planifiés par les commandes des agents, attentes GitHub,
+# relances d'un agent muet, alertes à l'humain). Il tourne hors de l'exec d'un agent : le gateway OpenClaw refuse
+# qu'un agent réveille lui-même une autre session. Installation : README.md.
+[Unit]
+Description=Relais du cycle de lot (cycle-lot veille)
+
+[Service]
+Type=oneshot
+# Adapter le chemin du dépôt ; openclaw et gh doivent être dans ce PATH.
+ExecStart=/usr/bin/python3 -I %h/agentic-dev/cycle-lot veille
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=15min
+Nice=5
+MemoryHigh=900M
+MemoryMax=1300M

@@ -1,0 +1,11 @@
+# Toutes les 2 min après la fin du passage précédent : jamais deux veilles en même temps.
+[Unit]
+Description=Relais du cycle de lot, toutes les 2 min
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

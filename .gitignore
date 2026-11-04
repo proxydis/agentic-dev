@@ -1,0 +1,8 @@
+# configuration privée de la machine (identifiants Trello, Slack, GitHub, chemins)
+cycle-lot.json
+run-lot.conf
+regles-arbitrage.md
+# état d'exécution
+cycles/
+slots/
+__pycache__/

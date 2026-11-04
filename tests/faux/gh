@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Faux `gh` pour le banc d'essai de cycle-lot : un monde JSON (MONDE) que le scénario manipule."""
+import fcntl
+import json
+import os
+import sys
+import time
+
+MONDE = os.environ["MONDE"]
+
+
+def charger():
+    f = open(MONDE + ".lock", "w")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f, json.load(open(MONDE))
+
+
+def sauver(m, f):
+    json.dump(m, open(MONDE, "w"), indent=1)
+    fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def opt(args, nom, defaut=None):
+    return args[args.index(nom) + 1] if nom in args else defaut
+
+
+def champs(d, fields):
+    return {k: d.get(k) for k in fields.split(",")} if fields else d
+
+
+def depot_de(args):
+    return opt(args, "-R").split("/")[1].rsplit("-", 1)[-1]
+
+
+def main():
+    a = sys.argv[1:]
+    f, m = charger()
+    m.setdefault("appels", []).append(a)
+    try:
+        if a[:2] == ["pr", "list"]:
+            d = depot_de(a)
+            res = [p for p in m["prs"][d].values() if p["state"] == "OPEN"
+                   and (opt(a, "--base") is None or p["baseRefName"] == opt(a, "--base"))
+                   and (opt(a, "--head") is None or p["headRefName"] == opt(a, "--head"))]
+            print(json.dumps([champs(p, opt(a, "--json")) for p in res]))
+        elif a[:2] == ["pr", "view"]:
+            d = depot_de(a)
+            print(json.dumps(champs(m["prs"][d][a[2]], opt(a, "--json"))))
+        elif a[:2] == ["pr", "merge"]:
+            d = depot_de(a)
+            p = m["prs"][d][a[2]]
+            if p["headRefOid"] != opt(a, "--match-head-commit"):
+                print("Head branch was modified", file=sys.stderr)
+                sys.exit(1)
+            p["state"] = "MERGED"
+            p["mergeCommit"] = {"oid": f"merge{d}{a[2]}".ljust(40, "0")}
+            p["methode"] = "squash" if "--squash" in a else "merge"
+        elif a[:2] == ["pr", "create"]:
+            d = depot_de(a)
+            n = str(m["next_pr"])
+            m["next_pr"] += 1
+            head = opt(a, "--head")
+            m["prs"][d][n] = {"number": int(n), "state": "OPEN", "headRefName": head, "baseRefName": opt(a, "--base"),
+                              "headRefOid": m["refs"][d][head], "labels": [], "mergeable": "MERGEABLE",
+                              "mergeCommit": None, "url": f"https://github.com/exemple/app-{d}/pull/{n}",
+                              "title": opt(a, "--title")}
+            print(f"https://github.com/exemple/app-{d}/pull/{n}")
+        elif a[:2] in (["pr", "close"], ["pr", "reopen"]):
+            pass
+        elif a[:2] == ["run", "list"]:
+            d = depot_de(a)
+            res = [r for r in m["runs"][d]
+                   if (opt(a, "--commit") is None or r["headSha"] == opt(a, "--commit"))
+                   and (opt(a, "--event") is None or r["event"] == opt(a, "--event"))
+                   and (opt(a, "--branch") is None or r["headBranch"] == opt(a, "--branch"))]
+            print(json.dumps([{k: v for k, v in r.items() if k not in ("jobs", "log")} for r in res]))
+        elif a[:2] == ["run", "view"]:
+            d = depot_de(a)
+            r = next(x for x in m["runs"][d] if str(x["databaseId"]) == a[2])
+            if "--log-failed" in a:
+                print(r.get("log", ""))
+            else:
+                print(json.dumps({"jobs": [{"name": k, "conclusion": v} for k, v in r["jobs"].items()]}))
+        elif a[:2] == ["run", "rerun"]:
+            d = depot_de(a)
+            r = next(x for x in m["runs"][d] if str(x["databaseId"]) == a[2])
+            r["status"], r["conclusion"] = "in_progress", None
+            r["relance"] = r.get("relance", 0) + 1
+        elif a[:2] == ["workflow", "run"]:
+            d = depot_de(a)
+            br = opt(a, "--ref")
+            m["next_run"] += 1
+            m["runs"][d].append({"databaseId": m["next_run"], "status": "in_progress", "conclusion": None,
+                                 "event": "workflow_dispatch", "headSha": m["refs"][d].get(br, "x" * 40),
+                                 "headBranch": br, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                 "jobs": {"quality": "success", "deploy": "success"}})
+        elif a[0] == "api":
+            chemin = a[1]
+            d = chemin.split("/")[2].rsplit("-", 1)[-1]
+            if "/compare/" in chemin:
+                print(m["compare"][d].get(chemin.split("/compare/")[1], 0))
+            elif "/git/ref/heads/" in chemin:
+                print(json.dumps({"object": {"sha": m["refs"][d][chemin.split("/git/ref/heads/")[1]]}}))
+            elif "/statuses" in chemin:
+                print(json.dumps([{"state": "success", "environment_url": "https://front-preview.example.test"}]))
+            elif "deployments" in chemin:
+                print(json.dumps([{"id": 1}]))
+            else:
+                print("{}")
+        else:
+            print("faux gh : commande inconnue " + " ".join(a), file=sys.stderr)
+            sys.exit(1)
+    finally:
+        sauver(m, f)
+
+
+main()

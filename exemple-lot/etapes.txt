@@ -1,0 +1,13 @@
+# <nom> <phase> <repo> <carte|-> <branche> <base> [opt]   une carte par étape A ou B
+# PRE : études et mesures avant tout développement (run-lot.sh <lot> pre). Une étape PRE peut ne rien pousser.
+P1 PRE back - etude/1.0.0 release/1.0.0
+#
+# Voie A : le back. Voie B : le front, puis une carte back indépendante dans son propre worktree (branche -vB).
+A1 A back 1 feat/1.0.0-lot release/1.0.0
+B2 B front 2 feat/1.0.0-lot release/1.0.0
+B3 B back 3 feat/1.0.0-lot-vB release/1.0.0
+#
+# FIN : fusion de la branche -vB dans celle de la voie A, puis suite complète de chaque appli et PR (une par appli).
+FUSIONB FIN back - feat/1.0.0-lot feat/1.0.0-lot-vB
+FINB FIN back - feat/1.0.0-lot release/1.0.0
+FINF FIN front - feat/1.0.0-lot release/1.0.0
