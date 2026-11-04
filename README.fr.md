@@ -130,8 +130,8 @@ Réglages de la machine : [`run-lot.example.conf`](run-lot.example.conf), à cop
 | `veille` | relais | Le passage du timer |
 
 L'état d'un lot vit dans `cycles/<version>/etat.json`, avec son journal `journal.log`. Le pouls du relais est dans
-`cycles/.veille.json` (dernier passage, erreurs) : un tableau de bord peut le lire pour montrer les lots et les runs
-attendus.
+`cycles/.veille.json` (dernier passage, erreurs). La vue Graph d'[openclaw-task-monitor](https://github.com/proxydis/openclaw-task-monitor)
+les lit pour montrer chaque lot, l'agent qui a la main et les runs que le relais attend.
 
 **Installation.**
 

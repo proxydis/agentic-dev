@@ -129,7 +129,9 @@ Machine settings: [`run-lot.example.conf`](run-lot.example.conf), to copy as `ru
 | `veille` | relay | One pass of the timer |
 
 A batch's state lives in `cycles/<version>/etat.json`, next to its log `journal.log`. The relay's heartbeat is
-`cycles/.veille.json` (last pass, errors): a dashboard can read it to show batches and the runs being waited for.
+`cycles/.veille.json` (last pass, errors). The Graph view of
+[openclaw-task-monitor](https://github.com/proxydis/openclaw-task-monitor) reads them to show each batch, the agent
+holding the hand and the runs the relay is waiting for.
 
 **Installation.**
 
