@@ -113,7 +113,21 @@ def main():
                 if contenu is None:
                     print("gh: Not Found (HTTP 404)", file=sys.stderr)
                     sys.exit(1)
-                print(json.dumps({"content": base64.b64encode(contenu.encode()).decode()}))
+                sha = f"lu{d}{len(m.setdefault('blobs_lus', {}))}".ljust(40, "0")
+                m["blobs_lus"][sha] = contenu
+                if len(contenu.encode()) > m.get("limite_contenu", 1_000_000):  # comme GitHub : > 1 Mo, pas de contenu
+                    print(json.dumps({"content": "", "encoding": "none", "size": len(contenu.encode()), "sha": sha}))
+                else:
+                    print(json.dumps({"content": base64.b64encode(contenu.encode()).decode(), "encoding": "base64",
+                                      "size": len(contenu.encode()), "sha": sha}))
+            elif "/git/blobs/" in chemin:
+                sha = chemin.rsplit("/", 1)[1]
+                contenu = m.get("blobs_lus", {}).get(sha, m.get("blobs", {}).get(sha))
+                if contenu is None:
+                    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+                    sys.exit(1)
+                m["lectures_blob"] = m.get("lectures_blob", 0) + 1
+                print(json.dumps({"content": base64.b64encode(contenu.encode()).decode(), "encoding": "base64"}))
             elif chemin.endswith("/git/blobs"):
                 n = f"blob{len(m.setdefault('blobs', {}))}"
                 m["blobs"][n] = corps["content"]

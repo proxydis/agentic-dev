@@ -185,7 +185,7 @@ Linux with user-mode systemd (cgroups v2), Python 3.11 or later (standard librar
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (75 checks)
+python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (76 checks)
 bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories (22 checks, ~1 min)
 ```
 

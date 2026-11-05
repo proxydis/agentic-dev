@@ -1032,6 +1032,16 @@ def bascule_texte(texte, v, date_v):
     return "\n".join(lignes[:i + 1] + ["", f"## [{v}] - {date_v}", ""] + lignes[j:])
 
 
+def lire_fichier_gh(nom, chemin, ref, essais=3):
+    """Texte d'un fichier du dépôt à cette ref. Au-delà de 1 Mo, l'API contents ne sert pas le contenu (`encoding`
+    « none », `content` vide) : on le lit alors par l'API des blobs (jusqu'à 100 Mo). Un CHANGELOG tenu depuis
+    longtemps dépasse vite cette taille. Lève RuntimeError (404 compris)."""
+    d = gh_json("api", f"repos/{nom}/contents/{chemin}?ref={ref}", essais=essais)
+    if d.get("encoding") != "base64" or (not d.get("content") and d.get("size")):
+        d = gh_json("api", f"repos/{nom}/git/blobs/{d['sha']}", essais=essais)
+    return base64.b64decode(d.get("content") or "").decode("utf-8")
+
+
 def basculer_changelog(etat):
     """Commit de release mécanique sur release/<v> (« docs(changelog): basculer [Unreleased] dans [v] - date ») :
     la section [v] ouvre ce qui était sous [Unreleased], et la version de package.json
@@ -1045,17 +1055,15 @@ def basculer_changelog(etat):
         nom = DEPOTS[depot]
         try:
             fichiers = {}
-            ch = gh_json("api", f"repos/{nom}/contents/CHANGELOG.md?ref={rel}")
-            neuf = bascule_texte(base64.b64decode(ch["content"]).decode("utf-8"), v, date_v)
+            neuf = bascule_texte(lire_fichier_gh(nom, "CHANGELOG.md", rel), v, date_v)
             if neuf is not None:
                 fichiers["CHANGELOG.md"] = neuf
                 if re.fullmatch(r"\d+\.\d+\.\d+", v):
                     try:
-                        pk = gh_json("api", f"repos/{nom}/contents/package.json?ref={rel}", essais=1)
+                        t = lire_fichier_gh(nom, "package.json", rel, essais=1)
                     except RuntimeError:
-                        pk = None  # pas de package.json dans ce dépôt
-                    if pk and pk.get("content"):
-                        t = base64.b64decode(pk["content"]).decode("utf-8")
+                        t = None  # pas de package.json dans ce dépôt
+                    if t:
                         t2 = re.sub(r'^(\s*"version"\s*:\s*")[^"]*(")', rf"\g<1>{v}\g<2>", t, count=1, flags=re.M)
                         if t2 != t:
                             fichiers["package.json"] = t2

@@ -145,6 +145,7 @@ MONDE.write_text(json.dumps({
     "compare": {"back": {"develop...release/1.0.0": 3, "master...release/1.0.0": 5},
                 "front": {"develop...release/1.0.0": 2, "master...release/1.0.0": 4}},
     "next_pr": 500, "next_run": 9000, "units": [], "sessions": {},
+    "limite_contenu": 100,  # CHANGELOG au-delà de la limite de l'API contents (lu par l'API des blobs), package.json en deçà
     "fichiers": {"back": {"release/1.0.0": {"CHANGELOG.md": CL}},
                  "front": {"release/1.0.0": {"CHANGELOG.md": CL, "package.json": PK}}}}, indent=1))
 (TMP / "openclaw.json").write_text(json.dumps({"channels": {"slack": {"accounts": {}}}}))
@@ -321,6 +322,7 @@ verifier("## [Unreleased]\n\n## [1.0.0] - " in cl and cl.index("## [1.0.0]") < c
          "CHANGELOG : la section [1.0.0] ouvre ce qui était sous [Unreleased]")
 verifier('"version": "1.0.0"' in m["fichiers"]["front"]["release/1.0.0"]["package.json"]
          and "package.json" not in m["fichiers"]["back"]["release/1.0.0"], "package.json du front passé en 1.0.0")
+verifier(m.get("lectures_blob", 0) >= 2, "CHANGELOG de plus de 1 Mo (limite de l'API contents) lu par l'API des blobs")
 verifier(e["commits_revus"] == {"back": ["mergeback301".ljust(40, "0")], "front": ["mergefront401".ljust(40, "0")]},
          "commits de merge du lot notés comme revus")
 

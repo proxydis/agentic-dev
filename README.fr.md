@@ -184,7 +184,7 @@ Slack pour `cycle-lot`. Les deux dépôts suivent un flux `develop` / `release/<
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (75 vérifications)
+python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (76 vérifications)
 bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux (22 vérifications, ~1 min)
 ```
 
