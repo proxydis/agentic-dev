@@ -50,6 +50,10 @@ class Trello(BaseHTTPRequestHandler):
         self.wfile.write(corps)
 
     def do_GET(self):
+        if monde().get("trello_panne"):
+            self.send_response(503)
+            self.end_headers()
+            return
         self.repondre(monde()["cartes"])
 
     def do_PUT(self):
@@ -221,6 +225,11 @@ def ci_verte(m):
 
 
 monde(ci_verte)
+lancer("veille")
+av = etat()["avancement"]
+verifier(av["faites"] == 3 and av["total"] == 4 and av["par_liste"] == {"Work in progress": 1, "Waiting for review": 3}
+         and av["cartes"] == {"1": "waiting", "2": "waiting", "3": "waiting", "4": "wip"},
+         "avancement lu par le relais : 3 cartes faites sur 4 (passes poussées, en Waiting for review)")
 out = lancer("passe", "1.0.0", "--vers", "relecteur", "--message", "lot fini, arbitrages A1-A3 pris", par="dev")
 e = etat()
 verifier(e["etape"] == "deploiement-revue" and e["tour"] == "veille", "étape deploiement-revue, le relais attend")
@@ -272,6 +281,31 @@ verifier(e["etape"] == "correction" and e["aller_retours"] == 1, "étape correct
 verifier(e["rapports"][-1]["tetes"] == {"back#301": "featback1".ljust(40, "0"), "front#401": "featfront1".ljust(40, "0")},
          "têtes revues notées avec le rapport")
 verifier([liste_de(n) for n in range(1, 5)] == ["finished", "finished", "wip", "wip"], "cartes 1-2 Finished, 3-4 WIP")
+av = etat()["avancement"]
+verifier(av["faites"] == 2 and av["total"] == 4 and av["par_liste"] == {"Work in progress": 2, "Finished": 2},
+         "avancement : 2/4 après le verdict, les cartes renvoyées en Work in progress repassent dans le reste à faire")
+monde(lambda m: m.update(trello_panne=True))
+lancer("veille")
+lancer("veille")
+av = etat()["avancement"]
+jl = (TMP / "cycles" / "1.0.0" / "journal.log").read_text()
+pouls = json.loads((TMP / "cycles" / ".veille.json").read_text())
+verifier(av["faites"] == 2 and av["total"] == 4 and av.get("erreur") and pouls["erreurs"] == []
+         and jl.count("avancement : lecture de Trello impossible") == 1,
+         "Trello en panne : dernier compte gardé, erreur notée une seule fois, pas une erreur du relais")
+
+
+def annuler_4(m):
+    m["trello_panne"] = False
+    next(c for c in m["cartes"] if c["id"] == "k4")["idList"] = L["canceled"]
+
+
+monde(annuler_4)
+lancer("veille")
+av = etat()["avancement"]
+verifier(av["faites"] == 2 and av["total"] == 3 and "erreur" not in av and av["cartes"]["4"] == "canceled",
+         "Trello revenu : compte à jour, une carte annulée sort du total")
+monde(lambda m: next(c for c in m["cartes"] if c["id"] == "k4").update(idList=L["wip"]))
 verifier(derniers_reveils()[0]["sessionKey"] == FIL and "rapport1.md" in derniers_reveils()[0]["message"], "dev réveillé avec le rapport")
 lancer("ouvrir-livraison", "1.0.0", par="dev", attendu=2)
 

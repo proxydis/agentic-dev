@@ -427,7 +427,7 @@ def trello_cles():
         raise RuntimeError("clés Trello introuvables (TRELLO_API_KEY / TRELLO_TOKEN)")
 
 
-def trello(methode, chemin, **params):
+def trello(methode, chemin, _essais=3, _delai=30, **params):
     k, t = trello_cles()
     auth = urllib.parse.urlencode({"key": k, "token": t})
     corps = None
@@ -437,15 +437,16 @@ def trello(methode, chemin, **params):
     else:  # GET, PUT : paramètres dans l'URL, comme run-lot.sh
         url = f"{TRELLO_API}{chemin}?{urllib.parse.urlencode(params)}&{auth}"
     dernier = None
-    for i in range(3):
+    for i in range(_essais):
         try:
             req = urllib.request.Request(url, data=corps, method=methode)
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=_delai) as r:
                 texte = r.read().decode()
                 return json.loads(texte) if texte else {}
         except Exception as e:  # noqa: BLE001
             dernier = e
-            time.sleep(3 * (i + 1))
+            if i < _essais - 1:
+                time.sleep(3 * (i + 1))
     raise RuntimeError(f"Trello {methode} {chemin} : {dernier}")
 
 
@@ -461,6 +462,78 @@ def cartes_de_version(version, toutes=None):
             res.append({"id": c["id"], "num": int(m.group("num")), "nom": c["name"], "liste": c["idList"],
                         "url": c.get("shortUrl")})
     return sorted(res, key=lambda c: c["num"])
+
+
+# Avancement du lot, affiché par le monitor (vue Graph, nœud du cycle) : une carte est faite par le dev quand run-lot.sh
+# l'a passée en Waiting for review (sa passe est poussée dans la PR du lot), ou plus loin (Under review, Finished). Une
+# carte renvoyée en Work in progress au verdict repasse dans le reste à faire ; annulée, archivée ou fermée, elle sort
+# du total.
+LISTES_FAITES = ("waiting", "review", "finished")
+LISTES_HORS_LOT = ("canceled", "archived")
+ORDRE_LISTES = ("not_ready", "standby", "wip", "blocked", "waiting", "review", "finished")
+
+
+def lire_tableau_leger():
+    """{id de carte : id de liste} des cartes ouvertes du tableau, en une seule lecture et sans nouvel essai : le relais
+    la refait au passage suivant."""
+    return {c["id"]: c.get("idList") for c in trello("GET", f"/boards/{TRELLO_BOARD}/cards/open", _essais=1, _delai=20,
+                                                       fields="idList")}
+
+
+def avancement(etat, sur_tableau):
+    """Compte des cartes du lot faites par le dev, d'après la liste Trello de chacune."""
+    detail = {str(c["num"]): (LISTE_DE_ID.get(sur_tableau[c["id"]], "?") if c["id"] in sur_tableau else "archived")
+              for c in etat["cartes"]}
+    dans_lot = [k for k in detail.values() if k not in LISTES_HORS_LOT]
+    par_liste = {}
+    for k in ORDRE_LISTES + ("?",):
+        n = dans_lot.count(k)
+        if n:
+            par_liste[NOM_LISTE.get(k, k)] = n
+    return {"heure": iso(), "faites": sum(1 for k in dans_lot if k in LISTES_FAITES), "total": len(dans_lot),
+            "par_liste": par_liste, "cartes": detail}
+
+
+def lire_tableau_pour_avancement(chemins):
+    """Lecture du tableau pour l'avancement : une par passage du relais, hors verrou (quelques secondes pour ~800
+    cartes), et seulement s'il y a un lot en cours. Rend None (rien à lire), le tableau, ou l'erreur."""
+    for p in chemins:
+        try:
+            e = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if e.get("etape") != "livre" and e.get("cartes"):
+            try:
+                return lire_tableau_leger()
+            except Exception as ex:  # noqa: BLE001
+                return ex
+    return None
+
+
+def sans_cles(texte):
+    """Message d'erreur sans les clés Trello : il est écrit dans l'état du lot, que le monitor affiche."""
+    try:
+        for x in trello_cles():
+            texte = texte.replace(x, "***")
+    except RuntimeError:
+        pass
+    return texte
+
+
+def noter_avancement(etat, tableau):
+    """Met à jour etat["avancement"] avec le tableau lu en début de passage. Une lecture ratée garde le dernier compte
+    avec son heure et note l'erreur, sans entrer dans les erreurs du passage : l'avancement n'est qu'un affichage."""
+    if tableau is None or not etat.get("cartes"):
+        return
+    if isinstance(tableau, Exception):
+        av = dict(etat.get("avancement") or {})
+        erreur = sans_cles(str(tableau))[:200]
+        if not av.get("erreur"):
+            journal(etat["version"], f"avancement : lecture de Trello impossible ({erreur})")
+        av["erreur"] = erreur
+        etat["avancement"] = av
+    else:
+        etat["avancement"] = avancement(etat, tableau)
 
 
 def ou_sont(etat):
@@ -1677,7 +1750,9 @@ def veiller_programmations():
 
 def cmd_veille(a):
     t0, lots, erreurs = time.monotonic(), [], []
-    for p in sorted(CYCLES.glob("*/etat.json")):
+    chemins = sorted(CYCLES.glob("*/etat.json"))
+    tableau = lire_tableau_pour_avancement(chemins)  # cartes Trello des lots en cours, pour le monitor
+    for p in chemins:
         v = p.parent.name
         try:
             with verrou(v):
@@ -1686,6 +1761,7 @@ def cmd_veille(a):
                     continue
                 lots.append(v)
                 veiller_lot(etat)
+                noter_avancement(etat, tableau)
                 ecrire(etat)
         except Exception as e:  # noqa: BLE001 — un lot en erreur ne bloque pas les autres
             print(f"{v} : {type(e).__name__} : {e}", file=sys.stderr)

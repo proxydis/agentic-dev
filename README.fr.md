@@ -151,7 +151,14 @@ Réglages de la machine : [`run-lot.example.conf`](run-lot.example.conf), à cop
 
 L'état d'un lot vit dans `cycles/<version>/etat.json`, avec son journal `journal.log`. Le pouls du relais est dans
 `cycles/.veille.json` (dernier passage, erreurs). La vue Graph d'[openclaw-task-monitor](https://github.com/proxydis/openclaw-task-monitor)
-les lit pour montrer chaque lot, l'agent qui a la main et les runs que le relais attend.
+les lit pour montrer chaque lot, l'agent qui a la main, les runs que le relais attend et l'avancement du lot.
+
+**Avancement.** À chaque passage, le relais lit le tableau Trello (une lecture, hors verrou) et écrit dans l'état de
+chaque lot en cours `avancement` : cartes faites par le dev sur cartes du lot, compte par liste, liste de chaque carte
+et heure de lecture. Une carte est faite dès que `run-lot.sh` l'a passée en Waiting for review (sa passe est poussée),
+ou plus loin (Under review, Finished) ; renvoyée en Work in progress au verdict, elle repasse dans le reste à faire ;
+annulée ou archivée, elle sort du total. Une lecture ratée garde le dernier compte et note l'erreur, sans compter
+comme une erreur du relais.
 
 **Installation.**
 
@@ -184,7 +191,7 @@ Slack pour `cycle-lot`. Les deux dépôts suivent un flux `develop` / `release/<
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (76 vérifications)
+python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (80 vérifications)
 bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux (22 vérifications, ~1 min)
 ```
 

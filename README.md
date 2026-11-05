@@ -152,7 +152,14 @@ Machine settings: [`run-lot.example.conf`](run-lot.example.conf), to copy as `ru
 A batch's state lives in `cycles/<version>/etat.json`, next to its log `journal.log`. The relay's heartbeat is
 `cycles/.veille.json` (last pass, errors). The Graph view of
 [openclaw-task-monitor](https://github.com/proxydis/openclaw-task-monitor) reads them to show each batch, the agent
-holding the hand and the runs the relay is waiting for.
+holding the hand, the runs the relay is waiting for and the batch progress.
+
+**Progress.** On each pass, the relay reads the Trello board (one read, outside the locks) and writes `avancement`
+into the state of each running batch: cards done by the dev out of the batch cards, count per list, list of each card
+and time of the reading. A card is done once `run-lot.sh` has moved it to Waiting for review (its pass is pushed), or
+further (Under review, Finished); sent back to Work in progress at the verdict, it is counted as not done again;
+canceled or archived, it leaves the total. A failed read keeps the last count and records the error, without counting
+as a relay error.
 
 **Installation.**
 
@@ -185,7 +192,7 @@ Linux with user-mode systemd (cgroups v2), Python 3.11 or later (standard librar
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (76 checks)
+python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (80 checks)
 bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories (22 checks, ~1 min)
 ```
 
