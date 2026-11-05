@@ -39,7 +39,7 @@ Verdict : **À REPRENDRE** dès qu'il reste un point BLOQUANT **ou** NON BLOQUAN
 - La première revue est exhaustive : tous les points, avec `fichier:ligne`, le constat, la correction attendue et la
   carte concernée.
 - Une revue de correction vérifie chaque point du rapport précédent, puis ce que les corrections touchent (diff de la
-  reprise, appelants, tests). Un défaut non bloquant découvert tard dans du code que le lot n'a pas modifié devient une
+  reprise depuis la tête revue, plage donnée par le relais ; appelants, tests). Pas de nouvelle revue complète. Un défaut non bloquant découvert tard dans du code que le lot n'a pas modifié devient une
   carte de la version suivante. Un défaut bloquant reste toujours un point bloquant.
 
 ## Format du rapport

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Faux `gh` pour le banc d'essai de cycle-lot : un monde JSON (MONDE) que le scénario manipule."""
+import base64
 import fcntl
 import json
 import os
@@ -55,6 +56,7 @@ def main():
             p["state"] = "MERGED"
             p["mergeCommit"] = {"oid": f"merge{d}{a[2]}".ljust(40, "0")}
             p["methode"] = "squash" if "--squash" in a else "merge"
+            m["refs"][d][p["baseRefName"]] = p["mergeCommit"]["oid"]
         elif a[:2] == ["pr", "create"]:
             d = depot_de(a)
             n = str(m["next_pr"])
@@ -95,10 +97,44 @@ def main():
                                  "headBranch": br, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                  "jobs": {"quality": "success", "deploy": "success"}})
         elif a[0] == "api":
-            chemin = a[1]
+            methode, chemin = (a[2], a[3]) if a[1] == "-X" else ("GET", a[1])
+            corps = json.loads(sys.stdin.read() or "{}") if "--input" in a else {}
             d = chemin.split("/")[2].rsplit("-", 1)[-1]
             if "/compare/" in chemin:
-                print(m["compare"][d].get(chemin.split("/compare/")[1], 0))
+                cle = chemin.split("/compare/")[1]
+                if "--jq" in a:
+                    print(m["compare"][d].get(cle, 0))
+                else:
+                    print(json.dumps({"ahead_by": m["compare"][d].get(cle, 0), "commits": [
+                        {"sha": x} for x in m.get("compare_commits", {}).get(d, {}).get(cle, [])]}))
+            elif "/contents/" in chemin:
+                fichier, _, ref = chemin.split("/contents/")[1].partition("?ref=")
+                contenu = m.get("fichiers", {}).get(d, {}).get(ref, {}).get(fichier)
+                if contenu is None:
+                    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+                    sys.exit(1)
+                print(json.dumps({"content": base64.b64encode(contenu.encode()).decode()}))
+            elif chemin.endswith("/git/blobs"):
+                n = f"blob{len(m.setdefault('blobs', {}))}"
+                m["blobs"][n] = corps["content"]
+                print(json.dumps({"sha": n}))
+            elif chemin.endswith("/git/trees"):
+                n = f"arbre{len(m.setdefault('arbres', {}))}"
+                m["arbres"][n] = corps["tree"]
+                print(json.dumps({"sha": n}))
+            elif chemin.endswith("/git/commits") and methode == "POST":
+                n = f"bascule{d}{len(m.setdefault('commits_api', {}))}".ljust(40, "0")
+                m["commits_api"][n] = corps
+                print(json.dumps({"sha": n}))
+            elif "/git/commits/" in chemin:
+                print(json.dumps({"tree": {"sha": "arbre-de-" + chemin.rsplit("/", 1)[1]}}))
+            elif "/git/refs/heads/" in chemin and methode == "PATCH":
+                branche = chemin.split("/git/refs/heads/")[1]
+                c = m["commits_api"][corps["sha"]]
+                for e in m["arbres"][c["tree"]]:
+                    m.setdefault("fichiers", {}).setdefault(d, {}).setdefault(branche, {})[e["path"]] = m["blobs"][e["sha"]]
+                m["refs"][d][branche] = corps["sha"]
+                print(json.dumps({"object": {"sha": corps["sha"]}}))
             elif "/git/ref/heads/" in chemin:
                 print(json.dumps({"object": {"sha": m["refs"][d][chemin.split("/git/ref/heads/")[1]]}}))
             elif "/statuses" in chemin:

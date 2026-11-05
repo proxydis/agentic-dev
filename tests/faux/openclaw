@@ -27,6 +27,18 @@ if a[:3] == ["gateway", "call", "agent"]:
 elif a[:3] == ["gateway", "call", "sessions.list"]:
     params = json.loads(a[a.index("--params") + 1])
     print(json.dumps({"sessions": m.get("sessions", {}).get(params["agentId"], [])}))
+elif a[:3] == ["gateway", "call", "sessions.reset"]:
+    params = json.loads(a[a.index("--params") + 1])
+    m.setdefault("resets", []).append(params)
+    for s in m.get("sessions", {}).get(params.get("agentId"), []):
+        if s.get("key") == params["key"]:
+            if params.get("expectedSessionId") not in (None, s.get("sessionId")):
+                print(json.dumps({"ok": False, "error": {"details": {"reason": "session-changed"}}}))
+                rc = 1
+                break
+            s["sessionId"] = (s.get("sessionId") or "s") + "-r"
+    else:
+        print(json.dumps({"ok": True, "key": params["key"]}))
 elif a[:2] == ["message", "send"]:
     m.setdefault("avis", []).append(a[a.index("--message") + 1])
     print(json.dumps({"ok": True}))

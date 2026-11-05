@@ -15,11 +15,15 @@ systemd lance toutes les 2 min. La veille relance aussi un agent dont le tour es
 répond toujours pas. Deux agents qui écrivent chacun un script qui attend l'autre finissent par s'attendre
 mutuellement : ici, le seul veilleur ne dépend que de GitHub, et cet interblocage ne peut pas se produire.
 
+Économie de jetons : avant chaque réveil d'étape, le relais remet la session de l'agent à zéro, et les gestes
+mécaniques ne coûtent aucun tour d'agent (merges au verdict, commit de release, PR de livraison ouvertes, contrôlées
+et mergées par le relais quand elles n'apportent que le lot revu).
+
   cycle-lot debut <v> --session-key <clé du dev>        le dev, sur demande de l'humain : crée le cycle, cartes en WIP
   cycle-lot passe <v> --vers <relecteur> [--message …]  le dev : fin du dev ou d'une correction, CI verte exigée
-  cycle-lot verdict <v> --merger|--a-reprendre …        le relecteur : fin de revue, cartes Finished ou WIP
+  cycle-lot verdict <v> --merger|--a-reprendre …        le relecteur : fin de revue ; --merger merge aussitôt le lot
   cycle-lot merge <v> --pr back#N                       le relecteur : merge gardé (tête revue, CI verte, back d'abord)
-  cycle-lot ouvrir-livraison <v>                        le dev : les 4 PR release -> develop/master
+  cycle-lot ouvrir-livraison <v>                        le dev : les 4 PR release -> develop/master (si le relais n'a pu)
   cycle-lot passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>   le dev : validations en prod
   cycle-lot carte-bug <v> --titre … --appli … --gravite … --description-fichier …   le relecteur : bug vu en prod
   cycle-lot fin <v> --rapport <fichier>                 le relecteur : lot livré et validé
@@ -29,6 +33,7 @@ mutuellement : ici, le seul veilleur ne dépend que de GitHub, et cet interbloca
   cycle-lot veille                                      le timer, toutes les 2 min
 """
 import argparse
+import base64
 import datetime as dt
 import fcntl
 import json
@@ -131,6 +136,15 @@ ATTENTE_PREVIEW_MIN = int((PREVIEW or {}).get("delai_min", 10))  # après le dé
 MAX_ALLER_RETOURS = int(CONF.get("max_aller_retours", 3))  # 3e verdict À REPRENDRE : arrêt
 MAX_CI_ROUGES = 3         # CI de release ou de livraison rouge sur du code, 3 fois de suite : arrêt
 INTERVALLE_GH_MIN = float(os.environ.get("CYCLE_LOT_INTERVALLE_GH_MIN", "4"))  # attentes GitHub : 1 lecture / 4 min
+# Contexte neuf à chaque étape : avant un réveil qui ouvre une étape, le relais remet à zéro la session de l'agent dans
+# le fil du lot (sessions.reset). Au fil d'un lot, le contexte de cette session dépasse vite 100 k jetons, et sa
+# réécriture en cache fait l'essentiel du coût de chaque tour ; une session neuve repart du seul contexte de démarrage.
+# La consigne du relais se suffit à elle-même. Relances et réveils manuels gardent le contexte de l'étape.
+# CYCLE_LOT_CONTEXTE_NEUF=0 désactive la remise à zéro.
+CONTEXTE_NEUF = os.environ.get("CYCLE_LOT_CONTEXTE_NEUF", "1") != "0"
+MOTIFS_ETAPE = {"revue", "correction", "livraison", "revue-livraison", "liste-validation", "validation-prod", "reprise",
+                "diagnostic"}
+ATTENTE_TOUR_MIN = 30     # un tour de l'agent tourne déjà : on attend sa fin pour remettre à zéro, au plus 30 min
 
 
 class Refus(Exception):
@@ -309,7 +323,8 @@ def planifier_reveil(etat, agent, motif, texte=None, extra="", prefixe=""):
     (systemd, toutes les 2 min, hors de l'exec d'un agent) qui réveille, à partir de l'état. La consigne est écrite
     au moment du réveil, sur l'état à jour."""
     etat["a_reveiller"] = {"agent": agent, "motif": motif, "texte": texte, "extra": extra, "prefixe": prefixe,
-                           "seq": etat["seq"], "demande": iso(), "essais": 0, "signale": False}
+                           "seq": etat["seq"], "demande": iso(), "essais": 0, "signale": False,
+                           "contexte_neuf": CONTEXTE_NEUF and motif in MOTIFS_ETAPE, "contexte": None}
 
 
 def planifier_avis(etat, texte):
@@ -338,8 +353,17 @@ def executer_en_attente(etat):
                          f"({r['essais']} essais). <@{HUMAIN_SLACK}> le gateway a peut-être un problème ; une mention de "
                          f"l'agent dans ce fil le relance.")
         return
+    if r.get("contexte_neuf") and not r.get("contexte"):
+        res = remettre_a_zero(etat, r["agent"])
+        if res == "occupee" and minutes_depuis(r["demande"]) < ATTENTE_TOUR_MIN:
+            return  # un tour de l'agent tourne dans cette session : le relais repasse dans 2 min
+        r["contexte"] = res
+    neuf = (f"\nContexte neuf : ta session a été remise à zéro pour cette étape, l'historique du fil n'y est plus. Tout ce "
+            f"qu'il te faut est dans ce message, dans `cycle-lot etat {etat['version']}`, le dossier du lot et les rapports."
+            if r.get("contexte") == "faite" else "")
     r["essais"] += 1
-    texte = r["texte"] or (r.get("prefixe") or "") + consigne(etat, r.get("extra") or "", agent=r["agent"])
+    texte = (r["texte"] + neuf) if r["texte"] else (r.get("prefixe") or "") + consigne(etat, (r.get("extra") or "") + neuf,
+                                                                                        agent=r["agent"])
     if reveiller(etat, r["agent"], texte, r["motif"] + (f" (essai {r['essais']})" if r["essais"] > 1 else "")):
         etat["a_reveiller"] = None
 
@@ -606,6 +630,25 @@ def pied(etat, agent=None):
             f"qui attende l'autre agent ou la CI, c'est le relais qui attend.")
 
 
+def diff_depuis_revue(pr, rapport):
+    """Ligne de consigne : ce que la reprise a changé sur une PR depuis la tête revue."""
+    cle = f"{pr['depot']}#{pr['num']}"
+    avant = (rapport.get("tetes") or {}).get(cle)
+    if not avant:
+        return f"• {cle} : tête revue inconnue, relis le diff de la reprise (`git log` de la branche depuis ta revue)"
+    if avant == pr["sha"]:
+        return f"• {cle} : inchangée depuis ta revue (`{avant[:7]}`), rien à relire"
+    detail = ""
+    try:
+        cmp = gh_json("api", f"repos/{DEPOTS[pr['depot']]}/compare/{avant}...{pr['sha']}", essais=2)
+        fichiers = cmp.get("files") or []
+        detail = (f" : {len(cmp.get('commits') or [])} commit(s), {len(fichiers)} fichier(s), "
+                  f"+{sum(f.get('additions', 0) for f in fichiers)} −{sum(f.get('deletions', 0) for f in fichiers)}")
+    except (RuntimeError, AttributeError):
+        pass
+    return f"• {cle} : `git diff {avant[:12]}..{pr['sha'][:12]}`{detail}"
+
+
 def consigne(etat, extra="", agent=None):
     v, e, p = etat["version"], etat["etape"], etat["prefixe"]
     tete_msg = (f"[RELAIS DU CYCLE DE LOT {v} — message automatique de cycle-lot, pas de {HUMAIN}] "
@@ -615,23 +658,37 @@ def consigne(etat, extra="", agent=None):
            if dernier.get("texte") else "")
     ar = f"aller-retour {etat['aller_retours'] + 1}/{etat['max_aller_retours']}"
     if e == "revue":
-        rap = etat["rapports"][-1]["fichier"] if etat["rapports"] else None
+        dernier_rap = etat["rapports"][-1] if etat["rapports"] else None
+        rap = dernier_rap["fichier"] if dernier_rap else None
+        if rap:  # revue de correction ciblée sur le diff exact depuis la tête revue
+            quoi = (f"\nRevue de CORRECTION, ciblée : vérifie chaque point de ton rapport précédent ({rap}), puis relis "
+                    f"seulement ce que la reprise a changé :\n" + "\n".join(diff_depuis_revue(x, dernier_rap) for x in etat["prs_lot"])
+                    + "\nRejoue les tests touchés et ceux des appelants, et les parcours Playwright des cartes concernées, sur la "
+                    "version déployée (URL ci-dessous). Pas de nouvelle revue complète : un défaut non bloquant découvert "
+                    "maintenant dans du code que le lot n'a pas modifié devient une carte de la version suivante, pas un nouvel "
+                    "aller-retour.")
+        else:
+            quoi = (f"\nFais la revue complète avec {GRILLE} : relecture, tests, et parcours Playwright sur la version "
+                    "déployée (URL ci-dessous). Rapporte TOUS les points dès cette revue.")
         corps = (f"\nRevue du lot, {ar}. PR à revoir :\n" + "\n".join(ligne_pr(x) for x in etat["prs_lot"]) +
                  f"{mot}\nDossier du lot (cartes, arbitrages, passations) : "
                  f"{etat.get('dossier_lot') or 'voir le message de ' + N_DEV}."
-                 f"\nFais la revue complète avec {GRILLE} : relecture, tests, et parcours "
-                 "Playwright sur la version déployée (URL ci-dessous). Rapporte TOUS les points dès cette revue."
-                 + (f"\nRevue de correction : vérifie chaque point de ton rapport précédent ({rap}) et ce que les "
-                    f"corrections touchent. Un défaut non bloquant découvert maintenant dans du code que le lot n'a pas "
-                    f"modifié devient une carte de la version suivante, pas un nouvel aller-retour." if rap else "") +
+                 + quoi +
+                 # les notifications d'avancement réveillent l'orchestrateur de revue pour rien : seules les fins de
+                 # sous-agents et de commandes en fond le réveillent
+                 f"\nJob de revue : une unit `{REV}-{p}-rev…` avec openclaw-job-done, `claude --print --disallowedTools "
+                 f"Monitor` (aucun suivi d'avancement : les sous-agents et les commandes en fond te notifient à leur fin)." +
                  f"\nTermine par `cycle-lot verdict {v} --merger --rapport <fichier>` ou `cycle-lot verdict {v} "
                  f"--a-reprendre --rapport <fichier> --cartes-ok <n,…> --cartes-ko <n,…>` (chaque carte en Under review "
                  f"classée). À REPRENDRE dès qu'il reste un point bloquant OU non bloquant.")
     elif e == "merge-lot":
-        corps = (f"\nVerdict À MERGER enregistré. Merge chaque PR du lot, back d'abord : "
+        # `verdict --merger` merge déjà : on n'arrive ici qu'après un merge refusé
+        corps = (f"\nVerdict À MERGER enregistré, mais des PR du lot restent à merger (merge refusé au verdict : le "
+                 f"REFUS dit quoi faire). Une fois la cause corrigée, back d'abord : "
                  + " puis ".join(f"`cycle-lot merge {v} --pr {x['depot']}#{x['num']}`" for x in etat["prs_lot"]
                                  if not x.get("merge")) +
-                 f". Le relais attend ensuite la CI du push sur la release, puis passe la main à {N_DEV}.")
+                 ". Le relais pose ensuite le commit de release, attend la CI du push sur la release et ouvre les PR "
+                 "de livraison.")
     elif e == "correction":
         rap = etat["rapports"][-1]["fichier"] if etat["rapports"] else "(pas de rapport)"
         corps = (f"\nÀ corriger, {ar} : rapport {rap}.{mot}\nCorrige TOUS les points, bloquants et non bloquants, "
@@ -829,16 +886,27 @@ def cmd_verdict(a):
         ou = ou_sont(etat)
         en_revue = {n for n, liste in ou.items() if liste == "review"}
         etat["rapports"].append({"heure": iso(), "fichier": str(rapport), "verdict": "merger" if a.merger else "a-reprendre",
-                                 "etape": etat["etape"], "aller_retour": etat["aller_retours"] + 1})
+                                 "etape": etat["etape"], "aller_retour": etat["aller_retours"] + 1,
+                                 "tetes": {f"{x['depot']}#{x['num']}": x["sha"] for x in etat["prs_lot"]}})
         if a.merger:
             if ko:
                 raise Refus("--merger avec des cartes refusées : c'est un verdict À REPRENDRE")
             restantes = {n for n, liste in ou.items() if liste != "finished"}
             deplacer(etat, restantes, "finished", haut=True)
             changer_etape(etat, "merge-lot", agent, a.message or "verdict À MERGER")
+            # les merges gardés suivent le verdict dans la même commande ; un refus laisse la main au relecteur
+            refus = []
+            for x in sorted(etat["prs_lot"], key=lambda x: x["depot"] != "back"):
+                try:
+                    merger_pr(etat, etat["prs_lot"], x["depot"], x["num"], agent)
+                except (Refus, RuntimeError) as e:
+                    refus.append(f"{x['depot']}#{x['num']} : {e}")
+                    break
+            suite = apres_merges(etat, agent)
             ecrire(etat)
-            print(f"Verdict À MERGER enregistré, cartes {sorted(restantes)} en Finished. Merge maintenant, back d'abord : "
-                  + " puis ".join(f"cycle-lot merge {v} --pr {x['depot']}#{x['num']}" for x in etat["prs_lot"]))
+            print(f"Verdict À MERGER enregistré, cartes {sorted(restantes)} en Finished. {suite}"
+                  + (f"\nMerge refusé, {refus[0]}. Corrige, puis `cycle-lot merge {v} --pr <depot>#<n>` (back d'abord)."
+                     if refus else ""))
             return
         if etat["etape"] == "revue":
             manquantes = en_revue - ok - ko
@@ -866,6 +934,167 @@ def cmd_verdict(a):
               f"Le relais réveille {N_DEV} pour la correction dans les 2 minutes.")
 
 
+def merger_pr(etat, ensemble, depot, num, par):
+    """Merge gardé d'une PR de l'étape : tête inchangée depuis la revue, CI verte (jobs requis non sautés), pas de
+    conflit, back avant front. Squash vers la release, commit de merge vers develop et master. Rend (pr, fait) ; lève
+    Refus. Utilisé par le relecteur (`merge`, `verdict --merger`) et par le relais (PR de livraison)."""
+    pr = next((x for x in ensemble if x["depot"] == depot and x["num"] == num), None)
+    if not pr:
+        raise Refus(f"{depot}#{num} ne fait pas partie des PR de l'étape : "
+                    + ", ".join(f"{x['depot']}#{x['num']}" for x in ensemble))
+    if pr.get("merge"):
+        return pr, False
+    if depot == "front" and any(x["depot"] == "back" and not x.get("merge") for x in ensemble):
+        raise Refus("back d'abord : une release se livre dans l'ordre back, puis front (README du front)")
+    vue = vue_pr(depot, num)
+    if vue["state"] == "MERGED":
+        pr["merge"] = {"heure": iso(), "commit": (vue.get("mergeCommit") or {}).get("oid", ""), "par": "hors relais"}
+    else:
+        if vue["state"] != "OPEN":
+            raise Refus(f"{depot}#{num} est {vue['state']}")
+        if vue["headRefOid"] != pr["sha"]:
+            raise Refus(f"la tête de {depot}#{num} a bougé depuis la revue ({pr['sha'][:7]} -> "
+                        f"{vue['headRefOid'][:7]}) : ce commit n'a pas été revu")
+        labels = [lb["name"] for lb in vue.get("labels", [])]
+        if PAUSE in labels:
+            raise Refus(f"{depot}#{num} porte encore l'étiquette {PAUSE} : sa CI n'a rien jugé")
+        if vue.get("mergeable") == "CONFLICTING":
+            raise Refus(f"{depot}#{num} est en conflit avec {vue['baseRefName']}")
+        base = vue["baseRefName"]
+        if base.startswith("release/"):
+            verdict, resume = ci_pr({**pr, "labels": labels}, REQUIS_LOT[depot])
+        elif base == "master":
+            verdict, resume = ci_pr({**pr, "labels": labels}, REQUIS_MASTER[depot])
+        else:  # develop : aucune CI de PR (les workflows n'écoutent pas les PR vers develop)
+            run = dernier_run(depot, pr["sha"], "pull_request")
+            verdict, resume = ("vert", "pas de CI de PR vers develop") if not run else bilan_run(depot, run)
+        if verdict != "vert":
+            raise Refus(f"CI de {depot}#{num} : {verdict}, {resume}. Pas de merge sur une CI qui n'est pas verte.")
+        methode = "--squash" if base.startswith("release/") else "--merge"
+        rc, out = gh_cmd("pr", "merge", str(num), "-R", DEPOTS[depot], methode, "--match-head-commit", pr["sha"])
+        if rc != 0:
+            raise Refus(f"merge de {depot}#{num} refusé par GitHub : {out[-400:]}")
+        vue = vue_pr(depot, num)
+        pr["merge"] = {"heure": iso(), "commit": (vue.get("mergeCommit") or {}).get("oid", ""), "par": par}
+    if "base" not in pr:  # PR du lot : son commit de merge est un commit revu (contrôle des PR de livraison)
+        etat.setdefault("commits_revus", {}).setdefault(depot, []).append(pr["merge"]["commit"])
+    journal(etat["version"], f"{depot}#{num} mergée ({pr['merge']['commit'][:7]}) par {pr['merge']['par']}")
+    return pr, True
+
+
+def apres_merges(etat, par):
+    """Suite de l'étape une fois ses PR mergées : commit de release puis CI de la release, ou mise en production."""
+    ensemble = etat["prs_lot"] if etat["etape"] == "merge-lot" else etat["prs_livraison"]
+    reste = [f"{x['depot']}#{x['num']}" for x in ensemble if not x.get("merge")]
+    if reste:
+        return f"Reste à merger : {', '.join(reste)}."
+    if etat["etape"] == "merge-lot":
+        bascule = basculer_changelog(etat)
+        depots = sorted({x["depot"] for x in ensemble})
+        changer_etape(etat, "ci-release", par, f"PR du lot mergées dans {etat['release']}" + (f" ; {bascule}" if bascule else ""),
+                      attente={"depots": depots, "relances": []})
+        return (f"Toutes les PR du lot sont mergées{' ; ' + bascule if bascule else ''}. Le relais attend la CI du push "
+                f"sur {etat['release']}, ouvre les PR de livraison et attend leur CI.")
+    commits = [{"depot": x["depot"], "base": x["base"], "commit": x["merge"]["commit"]} for x in ensemble]
+    changer_etape(etat, "deploiement", par, "PR de livraison mergées sur develop et master",
+                  attente={"commits": commits, "relances": []})
+    return ("Les PR de livraison sont mergées. Le relais attend la CI de develop et de master "
+            f"(déploiement compris) puis réveille {N_DEV} pour la liste des validations.")
+
+
+def gh_ecrire(chemin, methode, corps):
+    """Appel d'écriture à l'API GitHub, corps JSON sur l'entrée standard (un CHANGELOG ne tient pas dans un argument)."""
+    try:
+        r = subprocess.run([GH, "api", "-X", methode, chemin, "--input", "-"], input=json.dumps(corps),
+                           capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(f"gh api {methode} {chemin} : {e}")
+    if r.returncode != 0:
+        raise RuntimeError(f"gh api {methode} {chemin} : {(r.stderr or r.stdout).strip()[-300:]}")
+    return json.loads(r.stdout or "{}")
+
+
+def bascule_texte(texte, v, date_v):
+    """CHANGELOG.md avec « ## [v] - date » ouvrant ce qui était sous « ## [Unreleased] » ; None s'il n'y a rien à faire
+    (version déjà présente, pas de section [Unreleased], ou section vide)."""
+    lignes = texte.split("\n")
+    if any(re.match(rf"^## \[{re.escape(v)}\]", l) for l in lignes):
+        return None
+    i = next((k for k, l in enumerate(lignes) if l.strip().startswith("## [Unreleased]")), None)
+    if i is None:
+        return None
+    j = i + 1
+    while j < len(lignes) and not lignes[j].strip():
+        j += 1
+    fin = next((k for k in range(j, len(lignes)) if lignes[k].startswith("## [")), len(lignes))
+    if not any(l.strip() for l in lignes[j:fin]):
+        return None
+    return "\n".join(lignes[:i + 1] + ["", f"## [{v}] - {date_v}", ""] + lignes[j:])
+
+
+def basculer_changelog(etat):
+    """Commit de release mécanique sur release/<v> (« docs(changelog): basculer [Unreleased] dans [v] - date ») :
+    la section [v] ouvre ce qui était sous [Unreleased], et la version de package.json
+    suit pour une version X.Y.Z. Un seul commit par dépôt, par l'API Git de GitHub (pas de clone). Idempotent. Une erreur
+    est notée sans arrêter le cycle : la release diffère alors du lot revu et la revue de livraison du relecteur la verra.
+    Rend un résumé, vide si rien n'a été fait."""
+    v, rel = etat["version"], etat["release"]
+    date_v = maintenant().strftime("%Y-%m-%d")
+    faits = []
+    for depot in sorted({x["depot"] for x in etat["prs_lot"]}):
+        nom = DEPOTS[depot]
+        try:
+            fichiers = {}
+            ch = gh_json("api", f"repos/{nom}/contents/CHANGELOG.md?ref={rel}")
+            neuf = bascule_texte(base64.b64decode(ch["content"]).decode("utf-8"), v, date_v)
+            if neuf is not None:
+                fichiers["CHANGELOG.md"] = neuf
+                if re.fullmatch(r"\d+\.\d+\.\d+", v):
+                    try:
+                        pk = gh_json("api", f"repos/{nom}/contents/package.json?ref={rel}", essais=1)
+                    except RuntimeError:
+                        pk = None  # pas de package.json dans ce dépôt
+                    if pk and pk.get("content"):
+                        t = base64.b64decode(pk["content"]).decode("utf-8")
+                        t2 = re.sub(r'^(\s*"version"\s*:\s*")[^"]*(")', rf"\g<1>{v}\g<2>", t, count=1, flags=re.M)
+                        if t2 != t:
+                            fichiers["package.json"] = t2
+            if not fichiers:
+                continue
+            tete_sha = gh_json("api", f"repos/{nom}/git/ref/heads/{rel}")["object"]["sha"]
+            arbre = gh_json("api", f"repos/{nom}/git/commits/{tete_sha}")["tree"]["sha"]
+            entrees = [{"path": chemin, "mode": "100644", "type": "blob",
+                        "sha": gh_ecrire(f"repos/{nom}/git/blobs", "POST", {"content": t, "encoding": "utf-8"})["sha"]}
+                       for chemin, t in fichiers.items()]
+            nouvel_arbre = gh_ecrire(f"repos/{nom}/git/trees", "POST", {"base_tree": arbre, "tree": entrees})["sha"]
+            commit = gh_ecrire(f"repos/{nom}/git/commits", "POST",
+                               {"message": f"docs(changelog): basculer [Unreleased] dans [{v}] - {date_v}",
+                                "tree": nouvel_arbre, "parents": [tete_sha]})["sha"]
+            gh_ecrire(f"repos/{nom}/git/refs/heads/{rel}", "PATCH", {"sha": commit, "force": False})
+            etat.setdefault("bascule", {}).setdefault(depot, []).append(commit)
+            faits.append(f"{depot} {commit[:7]} ({', '.join(fichiers)})")
+            journal(etat["version"], f"commit de release {depot} {commit[:7]} sur {rel} : {', '.join(fichiers)}")
+        except (RuntimeError, KeyError, ValueError, TypeError) as e:
+            journal(etat["version"], f"commit de release {depot} : ÉCHEC {str(e)[:200]}")
+            faits.append(f"{depot} : commit de release impossible ({str(e)[:120]})")
+    return ("commit de release " + ", ".join(faits)) if faits else ""
+
+
+def controle_livraison(etat):
+    """Les PR de livraison n'apportent que le lot revu si, sur chaque dépôt, les commits de la release absents de develop
+    sont tous des merges de PR du lot revues par le relecteur, ou le commit de release du relais. Rend (ok, détail)."""
+    revus, bascule = etat.get("commits_revus") or {}, etat.get("bascule") or {}
+    for depot in sorted({x["depot"] for x in etat["prs_livraison"]}):
+        cmp = gh_json("api", f"repos/{DEPOTS[depot]}/compare/develop...{etat['release']}")
+        shas = [c.get("sha", "") for c in (cmp or {}).get("commits", [])]
+        attendus = set(revus.get(depot, [])) | set(bascule.get(depot, []))
+        intrus = [x[:7] for x in shas if x not in attendus]
+        if intrus:
+            return False, (f"{depot} : {len(intrus)} commit(s) de {etat['release']} absents de develop et hors du lot revu "
+                           f"({', '.join(intrus[:6])}) : revue de livraison nécessaire")
+    return True, "contenu des PR de livraison = lot revu (et commits déjà sur develop)"
+
+
 def cmd_merge(a):
     agent = appelant(a)
     v = a.version
@@ -874,64 +1103,56 @@ def cmd_merge(a):
         etat = lire(v)
         exiger(etat, agent, ("merge-lot", "revue-livraison"))
         ensemble = etat["prs_lot"] if etat["etape"] == "merge-lot" else etat["prs_livraison"]
-        pr = next((x for x in ensemble if x["depot"] == depot and x["num"] == num), None)
-        if not pr:
-            raise Refus(f"{depot}#{num} ne fait pas partie des PR de l'étape : "
-                        + ", ".join(f"{x['depot']}#{x['num']}" for x in ensemble))
-        if pr.get("merge"):
-            print(f"{depot}#{num} est déjà mergée ({pr['merge']['commit'][:7]}).")
-            return
-        if depot == "front" and any(x["depot"] == "back" and not x.get("merge") for x in ensemble):
-            raise Refus("back d'abord : une release se livre dans l'ordre back, puis front")
-        vue = vue_pr(depot, num)
-        if vue["state"] == "MERGED":
-            pr["merge"] = {"heure": iso(), "commit": (vue.get("mergeCommit") or {}).get("oid", ""), "par": "hors relais"}
-        else:
-            if vue["state"] != "OPEN":
-                raise Refus(f"{depot}#{num} est {vue['state']}")
-            if vue["headRefOid"] != pr["sha"]:
-                raise Refus(f"la tête de {depot}#{num} a bougé depuis la revue ({pr['sha'][:7]} -> "
-                            f"{vue['headRefOid'][:7]}) : ce commit n'a pas été revu")
-            labels = [lb["name"] for lb in vue.get("labels", [])]
-            if PAUSE in labels:
-                raise Refus(f"{depot}#{num} porte encore l'étiquette {PAUSE} : sa CI n'a rien jugé")
-            if vue.get("mergeable") == "CONFLICTING":
-                raise Refus(f"{depot}#{num} est en conflit avec {vue['baseRefName']}")
-            base = vue["baseRefName"]
-            if base.startswith("release/"):
-                verdict, resume = ci_pr({**pr, "labels": labels}, REQUIS_LOT[depot])
-            elif base == "master":
-                verdict, resume = ci_pr({**pr, "labels": labels}, REQUIS_MASTER[depot])
-            else:  # develop : aucune CI de PR (les workflows n'écoutent pas les PR vers develop)
-                run = dernier_run(depot, pr["sha"], "pull_request")
-                verdict, resume = ("vert", "pas de CI de PR vers develop") if not run else bilan_run(depot, run)
-            if verdict != "vert":
-                raise Refus(f"CI de {depot}#{num} : {verdict}, {resume}. Pas de merge sur une CI qui n'est pas verte.")
-            methode = "--squash" if base.startswith("release/") else "--merge"
-            rc, out = gh_cmd("pr", "merge", str(num), "-R", DEPOTS[depot], methode, "--match-head-commit", pr["sha"])
-            if rc != 0:
-                raise Refus(f"merge de {depot}#{num} refusé par GitHub : {out[-400:]}")
-            vue = vue_pr(depot, num)
-            pr["merge"] = {"heure": iso(), "commit": (vue.get("mergeCommit") or {}).get("oid", ""), "par": agent}
-        journal(v, f"{depot}#{num} mergée ({pr['merge']['commit'][:7]}) par {pr['merge']['par']}")
-        reste = [f"{x['depot']}#{x['num']}" for x in ensemble if not x.get("merge")]
-        if not reste:
-            if etat["etape"] == "merge-lot":
-                depots = sorted({x["depot"] for x in ensemble})
-                changer_etape(etat, "ci-release", agent, f"PR du lot mergées dans {etat['release']}",
-                              attente={"depots": depots, "relances": []})
-                suite = (f"Toutes les PR du lot sont mergées. Le relais attend la CI du push sur {etat['release']} "
-                         f"puis réveille {N_DEV} pour la livraison.")
-            else:
-                commits = [{"depot": x["depot"], "base": x["base"], "commit": x["merge"]["commit"]} for x in ensemble]
-                changer_etape(etat, "deploiement", agent, "PR de livraison mergées sur develop et master",
-                              attente={"commits": commits, "relances": []})
-                suite = ("Les PR de livraison sont mergées. Le relais attend la CI de develop et de master "
-                         f"(déploiement compris) puis réveille {N_DEV} pour la liste des validations.")
-        else:
-            suite = f"Reste à merger : {', '.join(reste)}."
+        pr, fait = merger_pr(etat, ensemble, depot, num, agent)
+        suite = apres_merges(etat, agent)
         ecrire(etat)
-    print(f"{depot}#{num} mergée en {pr['merge']['commit'][:7]}. {suite}")
+    print(f"{depot}#{num} {'mergée' if fait else 'déjà mergée'} en {pr['merge']['commit'][:7]}. {suite}")
+
+
+def ouvrir_prs_livraison(etat):
+    """Les PR release/<v> -> develop et master de chaque dépôt en avance, créées ou rouvertes (le back n'écoute pas
+    `synchronize` : rouvrir relance la CI sur la tête). Rend (prs, créées) ; lève Refus."""
+    ouvertes = [i for i in etat["interventions"] if not i["faite"]]
+    if ouvertes:
+        raise Refus(f"interventions de {HUMAIN} encore ouvertes : " + "; ".join(f"{i['n']}. {i['texte']}" for i in ouvertes)
+                    + f". Fais-les confirmer (`cycle-lot intervention {etat['version']} --faite N`) ou `cycle-lot arret "
+                      f"{etat['version']} --motif intervention`.")
+    v, rel = etat["version"], etat["release"]
+    prs, creees = [], []
+    for depot, nom in DEPOTS.items():
+        for base in ("develop", "master"):
+            ahead = gh_json("api", f"repos/{nom}/compare/{base}...{rel}", "--jq", ".ahead_by")
+            if not ahead:
+                continue
+            exist = gh_json("pr", "list", "-R", nom, "--head", rel, "--base", base, "--state", "open", "--json", "number")
+            if exist:
+                n = exist[0]["number"]
+                if base == "master":
+                    gh_cmd("pr", "close", str(n), "-R", nom)
+                    gh_cmd("pr", "reopen", str(n), "-R", nom)
+            else:
+                lot = ", ".join(f"#{x['num']}" for x in etat["prs_lot"] if x["depot"] == depot) or "-"
+                corps = (f"Livraison du lot {v} : `{rel}` vers `{base}` ({depot}).\n\nPR du lot : {lot}. "
+                         f"Cartes : {', '.join(str(c['num']) for c in etat['cartes'])}.\n"
+                         f"Dernier rapport de revue de {N_REV} : "
+                         f"{etat['rapports'][-1]['fichier'] if etat['rapports'] else '-'}.\n\n"
+                         f"Cycle de lot : CI, contrôle du contenu (lot revu seulement) et merge par le relais ; revue de "
+                         f"{N_REV} en cas d'écart.")
+                rc, out = gh_cmd("pr", "create", "-R", nom, "--base", base, "--head", rel,
+                                 "--title", f"release({v}): lot {v} vers {base} ({depot})", "--body", corps)
+                if rc != 0:
+                    raise Refus(f"création de la PR {depot} vers {base} refusée : {out[-300:]}")
+                m = re.search(r"/pull/(\d+)", out)
+                n = int(m.group(1)) if m else gh_json("pr", "list", "-R", nom, "--head", rel, "--base", base,
+                                                      "--state", "open", "--json", "number")[0]["number"]
+                creees.append(f"{depot}#{n}")
+            vue = vue_pr(depot, n)
+            prs.append({"depot": depot, "num": n, "base": base, "branche": rel, "sha": vue["headRefOid"],
+                        "url": vue["url"], "labels": []})
+    if not prs:
+        raise Refus(f"{rel} n'a aucun commit d'avance sur develop ni master : rien à livrer")
+    etat["prs_livraison"] = prs
+    return prs, creees
 
 
 def cmd_ouvrir_livraison(a):
@@ -940,51 +1161,13 @@ def cmd_ouvrir_livraison(a):
     with verrou(v):
         etat = lire(v)
         exiger(etat, agent, ("livraison",))
-        ouvertes = [i for i in etat["interventions"] if not i["faite"]]
-        if ouvertes:
-            raise Refus(f"interventions de {HUMAIN} encore ouvertes : " + "; ".join(f"{i['n']}. {i['texte']}" for i in ouvertes)
-                        + f". Fais-les confirmer (`cycle-lot intervention {v} --faite N`) ou `cycle-lot arret {v} "
-                          f"--motif intervention`.")
-        rel = etat["release"]
-        prs, creees = [], []
-        for depot, nom in DEPOTS.items():
-            for base in ("develop", "master"):
-                ahead = gh_json("api", f"repos/{nom}/compare/{base}...{rel}", "--jq", ".ahead_by")
-                if not ahead:
-                    continue
-                exist = gh_json("pr", "list", "-R", nom, "--head", rel, "--base", base, "--state", "open",
-                                "--json", "number")
-                if exist:
-                    n = exist[0]["number"]
-                    if base == "master":  # le back n'écoute pas `synchronize` : rouvrir relance la CI sur la tête
-                        gh_cmd("pr", "close", str(n), "-R", nom)
-                        gh_cmd("pr", "reopen", str(n), "-R", nom)
-                else:
-                    lot = ", ".join(f"#{x['num']}" for x in etat["prs_lot"] if x["depot"] == depot) or "-"
-                    corps = (f"Livraison du lot {v} : `{rel}` vers `{base}` ({depot}).\n\nPR du lot : {lot}. "
-                             f"Cartes : {', '.join(str(c['num']) for c in etat['cartes'])}.\n"
-                             f"Dernier rapport de revue de {N_REV} : {etat['rapports'][-1]['fichier'] if etat['rapports'] else '-'}.\n\n"
-                             f"Cycle de lot : revue et merge par {N_REV} via `cycle-lot merge`, après la CI.")
-                    rc, out = gh_cmd("pr", "create", "-R", nom, "--base", base, "--head", rel,
-                                     "--title", f"release({v}): lot {v} vers {base} ({depot})", "--body", corps)
-                    if rc != 0:
-                        raise Refus(f"création de la PR {depot} vers {base} refusée : {out[-300:]}")
-                    m = re.search(r"/pull/(\d+)", out)
-                    n = int(m.group(1)) if m else gh_json("pr", "list", "-R", nom, "--head", rel, "--base", base,
-                                                          "--state", "open", "--json", "number")[0]["number"]
-                    creees.append(f"{depot}#{n}")
-                vue = vue_pr(depot, n)
-                prs.append({"depot": depot, "num": n, "base": base, "branche": rel, "sha": vue["headRefOid"],
-                            "url": vue["url"], "labels": []})
-        if not prs:
-            raise Refus(f"{rel} n'a aucun commit d'avance sur develop ni master : rien à livrer")
-        etat["prs_livraison"] = prs
+        prs, creees = ouvrir_prs_livraison(etat)
         changer_etape(etat, "ci-livraison", agent, a.message or "PR de livraison ouvertes",
                       attente={"debut": iso(), "relances": []})
         ecrire(etat)
     print("PR de livraison : " + ", ".join(f"{p['depot']}#{p['num']} vers {p['base']}" for p in prs)
           + (f" (créées : {', '.join(creees)})" if creees else "") +
-          f". Le relais attend leur CI puis réveille {N_REV} pour la revue et le merge.")
+          f". Le relais attend leur CI, contrôle leur contenu et les merge ; il ne réveille {N_REV} qu'en cas d'écart.")
 
 
 def cmd_attendre_ci(a):
@@ -1194,15 +1377,51 @@ def units_actives(agent, prefixe):
     return [l.split()[0] for l in out.splitlines() if l.strip() and motif.match(l.split()[0])]
 
 
-def session_active(etat, agent):
-    """True / False ; None si le gateway ne répond pas (on ne relance pas sur une inconnue)."""
+def info_session(etat, agent):
+    """Session de l'agent dans le fil du lot : None si le gateway ne répond pas, {} si elle n'existe pas encore,
+    sinon {"id": sessionId, "actif": un tour tourne}."""
     rc, out, err = lancer([OPENCLAW, "gateway", "call", "sessions.list", "--json", "--params",
-                           json.dumps({"agentId": agent, "limit": 60})], timeout=90, env=env_openclaw())
+                           json.dumps({"agentId": agent, "limit": 100})], timeout=90, env=env_openclaw())
     d = json_dans(out)
     if rc != 0 or "sessions" not in d:
         return None
     cle = cle_session(etat, agent)
-    return any(s.get("key") == cle and (s.get("hasActiveRun") or s.get("status") == "running") for s in d["sessions"])
+    for s in d["sessions"]:
+        if s.get("key") == cle:
+            return {"id": s.get("sessionId"), "actif": bool(s.get("hasActiveRun") or s.get("status") == "running")}
+    return {}
+
+
+def session_active(etat, agent):
+    """True / False ; None si le gateway ne répond pas (on ne relance pas sur une inconnue)."""
+    i = info_session(etat, agent)
+    return None if i is None else bool(i.get("actif"))
+
+
+def remettre_a_zero(etat, agent):
+    """Contexte neuf pour l'étape : sessions.reset de la session de l'agent dans le fil du lot, avec le sessionId lu juste
+    avant (le gateway refuse si la session a changé entre-temps). Le routage vers le fil est conservé : la réponse au
+    réveil y est postée. Rendu : « faite », « absente » (pas encore de
+    session, donc déjà neuve), « occupee » (un tour tourne : ne pas l'interrompre), « inconnu » ou « echec » (réveil
+    sans remise à zéro, comme avant)."""
+    info = info_session(etat, agent)
+    if info is None:
+        res = "inconnu"
+    elif not info:
+        res = "absente"
+    elif info["actif"]:
+        res = "occupee"
+    else:
+        params = {"key": cle_session(etat, agent), "agentId": agent, "reason": "reset"}
+        if info.get("id"):
+            params["expectedSessionId"] = info["id"]
+        rc, out, err = lancer([OPENCLAW, "gateway", "call", "sessions.reset", "--json", "--params", json.dumps(params)],
+                              timeout=120, env=env_openclaw())
+        res = "faite" if rc == 0 and json_dans(out).get("ok") else "echec"
+        if res == "echec":
+            journal(etat["version"], f"remise à zéro de la session de {agent} : ÉCHEC {(err or out).strip()[-200:]}")
+    journal(etat["version"], f"contexte de {agent} pour l'étape « {etat['etape']} » : {res}")
+    return res
 
 
 def veiller_tour(etat):
@@ -1330,7 +1549,19 @@ def veiller_attente(etat):
             return
         if verdict == "vert":
             etat["ci_rouges"] = 0
-            changer_etape(etat, "livraison", "veille", "CI du push sur la release verte :\n" + "\n".join(lignes))
+            note = ""
+            if not [i for i in etat["interventions"] if not i["faite"]]:
+                try:  # le relais ouvre lui-même les PR de livraison : pas de tour d'agent pour un geste mécanique
+                    prs, _ = ouvrir_prs_livraison(etat)
+                    changer_etape(etat, "ci-livraison", "veille", "CI du push sur la release verte, PR de livraison ouvertes "
+                                  "par le relais :\n" + "\n".join(lignes), attente={"debut": iso(), "relances": []})
+                    planifier_avis(etat, "CI de la release verte. PR de livraison ouvertes : " + ", ".join(
+                        f"{p['depot']}#{p['num']} vers {p['base']}" for p in prs) + ". J'attends leur CI, je contrôle "
+                        f"qu'elles n'apportent que le lot revu, puis je les merge ; je ne réveille {N_REV} qu'en cas d'écart.")
+                    return
+                except (Refus, RuntimeError) as e:
+                    note = f"\nOuverture automatique des PR de livraison impossible : {e}"
+            changer_etape(etat, "livraison", "veille", "CI du push sur la release verte :\n" + "\n".join(lignes) + note)
             planifier_reveil(etat, DEV, "livraison")
         elif verdict == "rouge":
             etat["ci_rouges"] += 1
@@ -1354,6 +1585,20 @@ def veiller_attente(etat):
         for x in etat["prs_livraison"]:
             x["ci"] = par_cible.get((x["depot"], x["sha"]), "?") if x["base"] == "master" else "pas de CI de PR vers develop"
         note = "" if verdict != "attente" else f"\nCI encore incomplète après {int(duree)} min."
+        if verdict == "vert":  # contenu = lot revu et CI verte : le relais merge, sans tour du relecteur
+            try:
+                ok, detail = controle_livraison(etat)
+                if ok:
+                    for x in sorted(etat["prs_livraison"], key=lambda x: (x["depot"] != "back", x["base"])):
+                        merger_pr(etat, etat["prs_livraison"], x["depot"], x["num"], "veille")
+                    apres_merges(etat, "veille")
+                    planifier_avis(etat, "PR de livraison mergées (CI verte, contenu = lot revu) : " + ", ".join(
+                        f"{x['depot']}#{x['num']} vers {x['base']}" for x in etat["prs_livraison"])
+                        + f". J'attends la CI de develop et de master, puis {N_DEV} prépare les validations en production.")
+                    return
+                note = "\n" + detail
+            except (Refus, RuntimeError) as e:
+                note = f"\nMerge automatique des PR de livraison interrompu : {e}"
         changer_etape(etat, "revue-livraison", "veille", "CI des PR de livraison :\n" + "\n".join(lignes) + note)
         planifier_reveil(etat, REV, "revue-livraison")
     elif e == "deploiement":

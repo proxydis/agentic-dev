@@ -20,6 +20,10 @@ MONDE = TMP / "monde.json"
 L = {"not_ready": "L-not-ready", "standby": "L-standby", "wip": "L-wip", "waiting": "L-waiting", "review": "L-review",
      "finished": "L-finished", "blocked": "L-blocked", "archived": "L-archived", "canceled": "L-canceled"}
 FIL = "agent:dev:slack:channel:c000test:thread:1700000000.000100"
+CL = ("# Changelog\n\nToute évolution se note sous [Unreleased] ; la PR de release la bascule.\n\n## [Unreleased]\n\n"
+      "### Ajouté\n\n- carte 1\n\n## [0.9.0] - 2026-01-15\n\n### Ajouté\n\n- ancien\n")
+PK = '{\n  "name": "web",\n  "version": "0.9.0",\n  "private": true\n}\n'
+
 ECHECS = []
 
 
@@ -140,7 +144,9 @@ MONDE.write_text(json.dumps({
              "front": {"release/1.0.0": "relfront0".ljust(40, "0"), "feat/1.0.0-lot": "featfront1".ljust(40, "0")}},
     "compare": {"back": {"develop...release/1.0.0": 3, "master...release/1.0.0": 5},
                 "front": {"develop...release/1.0.0": 2, "master...release/1.0.0": 4}},
-    "next_pr": 500, "next_run": 9000, "units": [], "sessions": {}}, indent=1))
+    "next_pr": 500, "next_run": 9000, "units": [], "sessions": {},
+    "fichiers": {"back": {"release/1.0.0": {"CHANGELOG.md": CL}},
+                 "front": {"release/1.0.0": {"CHANGELOG.md": CL, "package.json": PK}}}}, indent=1))
 (TMP / "openclaw.json").write_text(json.dumps({"channels": {"slack": {"accounts": {}}}}))
 (TMP / "cycle-lot.json").write_text(json.dumps({
     "humain": {"nom": "Camille", "slack_id": "U0TEST"},
@@ -180,6 +186,8 @@ verifier("aucun cycle pour le lot 9.9.9" in out and not (TMP / "cycles" / "9.9.9
 out = lancer("arret", "../../evasion", "--motif", "autre", "--message", "x", par="dev", attendu=2)
 verifier("illisible" in out and not (TMP / "evasion").exists() and not (TMP.parent / "evasion").exists(),
          "version hors format refusée avant toute écriture")
+
+lancer("intervention", "1.0.0", "--ajouter", "poser FOO sur backend-prod", par="dev")
 
 print("2. passage en revue refusé tant que la CI n'est pas verte")
 out = lancer("passe", "1.0.0", "--vers", "relecteur", par="relecteur", attendu=2)
@@ -236,6 +244,10 @@ verifier(r["sessionKey"] == "agent:relecteur:slack:channel:c000test:thread:17000
          and r["deliver"],
          "réveil du relecteur dans sa session du fil, routage explicite")
 verifier("front-preview.example.test" in r["message"] and "lot fini" in r["message"], "consigne : URL preview et message du dev")
+verifier("Fais la revue complète" in r["message"] and "--disallowedTools Monitor" in r["message"],
+         "1re revue : revue complète, job de revue sans suivi d'avancement")
+verifier(not monde().get("resets") and "Contexte neuf" not in r["message"],
+         "contexte neuf : le relecteur n'a pas encore de session dans ce fil, rien à remettre à zéro")
 
 print("4. verdict À REPRENDRE")
 rap = TMP / "rapport1.md"
@@ -244,9 +256,20 @@ out = lancer("verdict", "1.0.0", "--a-reprendre", "--rapport", str(rap), "--cart
 verifier("manquent : [3, 4]" in out, "refus : cartes non classées")
 out = lancer("verdict", "1.0.0", "--a-reprendre", "--rapport", str(rap), "--cartes-ok", "1,2", "--cartes-ko", "3,4", par="relecteur")
 verifier(etat()["a_reveiller"]["agent"] == "dev" and len(monde().get("reveils", [])) == 1, "réveil du dev planifié, pas fait par la commande")
+monde(lambda m: m["sessions"].update(dev=[{"key": FIL, "sessionId": "s-dev-1", "hasActiveRun": True}]))
 lancer("veille")
+verifier(len(monde().get("reveils", [])) == 1 and etat()["a_reveiller"] and not monde().get("resets"),
+         "contexte neuf : un tour du dev tourne, ni remise à zéro ni réveil (le relais repasse)")
+monde(lambda m: m["sessions"]["dev"][0].update(hasActiveRun=False))
+lancer("veille")
+rs = monde().get("resets", [])
+verifier(len(rs) == 1 and rs[0]["key"] == FIL and rs[0].get("expectedSessionId") == "s-dev-1" and rs[0]["reason"] == "reset",
+         "contexte neuf : session du dev remise à zéro avant l'étape correction, sur le sessionId lu")
+verifier("Contexte neuf" in derniers_reveils()[0]["message"], "consigne : contexte neuf signalé au dev")
 e = etat()
 verifier(e["etape"] == "correction" and e["aller_retours"] == 1, "étape correction, aller-retour 1")
+verifier(e["rapports"][-1]["tetes"] == {"back#301": "featback1".ljust(40, "0"), "front#401": "featfront1".ljust(40, "0")},
+         "têtes revues notées avec le rapport")
 verifier([liste_de(n) for n in range(1, 5)] == ["finished", "finished", "wip", "wip"], "cartes 1-2 Finished, 3-4 WIP")
 verifier(derniers_reveils()[0]["sessionKey"] == FIL and "rapport1.md" in derniers_reveils()[0]["message"], "dev réveillé avec le rapport")
 lancer("ouvrir-livraison", "1.0.0", par="dev", attendu=2)
@@ -269,34 +292,45 @@ modifier_etat("1.0.0", lambda e: e["attente"]["deploiement"].update(vert_a=il_y_
 lancer("veille")
 e = etat()
 verifier(e["etape"] == "revue" and "rapport1.md" in derniers_reveils()[0]["message"], "2e revue : rappel du rapport précédent")
+msg = derniers_reveils()[0]["message"]
+verifier("Revue de CORRECTION" in msg and "git diff featback1000..featback2000" in msg
+         and "Fais la revue complète" not in msg, "2e revue ciblée : diff exact depuis la tête revue, pas de revue complète")
 verifier([liste_de(n) for n in range(1, 5)] == ["finished", "finished", "review", "review"], "seules 3-4 repassent en revue")
 
-print("5. verdict À MERGER et merges gardés")
+print("5. verdict À MERGER : merges gardés dans la même commande, puis commit de release")
 rap2 = TMP / "rapport2.md"
 rap2.write_text("tout est bon")
-lancer("verdict", "1.0.0", "--merger", "--rapport", str(rap2), par="relecteur")
+monde(lambda m: m["prs"]["back"]["301"].update(headRefOid="pousse-apres-revue".ljust(40, "0")))
+out = lancer("verdict", "1.0.0", "--merger", "--rapport", str(rap2), par="relecteur")
 verifier(etat()["etape"] == "merge-lot" and all(liste_de(n) == "finished" for n in range(1, 5)), "merge-lot, cartes Finished")
+verifier("a bougé depuis la revue" in out and monde()["prs"]["back"]["301"]["state"] == "OPEN",
+         "merge refusé dans le verdict : tête modifiée depuis la revue, la main reste au relecteur")
 out = lancer("merge", "1.0.0", "--pr", "front#401", par="relecteur", attendu=2)
 verifier("back d'abord" in out, "refus : front avant back")
-monde(lambda m: m["prs"]["back"]["301"].update(headRefOid="pousse-apres-revue".ljust(40, "0")))
-out = lancer("merge", "1.0.0", "--pr", "back#301", par="relecteur", attendu=2)
-verifier("a bougé depuis la revue" in out, "refus : tête modifiée depuis la revue")
 monde(lambda m: m["prs"]["back"]["301"].update(headRefOid="featback2".ljust(40, "0")))
 lancer("merge", "1.0.0", "--pr", "back#301", par="relecteur")
 lancer("merge", "1.0.0", "--pr", "front#401", par="relecteur")
 m = monde()
 verifier(m["prs"]["back"]["301"]["methode"] == "squash" and m["prs"]["front"]["401"]["state"] == "MERGED", "PR du lot squashées")
 verifier(etat()["etape"] == "ci-release", "étape ci-release : le relais attend la CI du push sur la release")
+e = etat()
+verifier(set(e.get("bascule", {})) == {"back", "front"} and m["refs"]["back"]["release/1.0.0"] == e["bascule"]["back"][-1],
+         "commit de release poussé sur release/1.0.0, back et front")
+cl = m["fichiers"]["back"]["release/1.0.0"]["CHANGELOG.md"]
+verifier("## [Unreleased]\n\n## [1.0.0] - " in cl and cl.index("## [1.0.0]") < cl.index("- carte 1") < cl.index("## [0.9.0]"),
+         "CHANGELOG : la section [1.0.0] ouvre ce qui était sous [Unreleased]")
+verifier('"version": "1.0.0"' in m["fichiers"]["front"]["release/1.0.0"]["package.json"]
+         and "package.json" not in m["fichiers"]["back"]["release/1.0.0"], "package.json du front passé en 1.0.0")
+verifier(e["commits_revus"] == {"back": ["mergeback301".ljust(40, "0")], "front": ["mergefront401".ljust(40, "0")]},
+         "commits de merge du lot notés comme revus")
 
 print("6. CI de la release, rouge réseau relancé une fois")
 
 
 def push_release(m):
-    m["refs"]["back"]["release/1.0.0"] = "mergeback301".ljust(40, "0")
-    m["refs"]["front"]["release/1.0.0"] = "mergefront401".ljust(40, "0")
-    m["runs"]["back"].append(run("back", 50, "mergeback301".ljust(40, "0"), "push", "release/1.0.0",
+    m["runs"]["back"].append(run("back", 50, m["refs"]["back"]["release/1.0.0"], "push", "release/1.0.0",
                                  jobs={"quality": "success", "deploy": "success"}))
-    m["runs"]["front"].append(run("front", 51, "mergefront401".ljust(40, "0"), "push", "release/1.0.0", concl="failure",
+    m["runs"]["front"].append(run("front", 51, m["refs"]["front"]["release/1.0.0"], "push", "release/1.0.0", concl="failure",
                                   jobs={"quality": "failure", "deploy": "skipped"}, log="npm ERR! ECONNRESET"))
 
 
@@ -313,8 +347,7 @@ monde(lambda m: m["runs"]["front"][-1].update(status="completed", conclusion="su
 lancer("veille")
 verifier(etat()["etape"] == "livraison" and derniers_reveils()[0]["sessionKey"] == FIL, "livraison, dev réveillé")
 
-print("7. PR de livraison")
-lancer("intervention", "1.0.0", "--ajouter", "poser FOO sur backend-prod", par="dev")
+print("7. PR de livraison (intervention ouverte : c'est le dev qui livre)")
 out = lancer("ouvrir-livraison", "1.0.0", par="dev", attendu=2)
 verifier("interventions de Camille encore ouvertes" in out, "refus : intervention de l'humain pas faite")
 lancer("intervention", "1.0.0", "--faite", "1", par="dev")
@@ -326,15 +359,18 @@ verifier(etat()["etape"] == "ci-livraison", "CI des PR vers master pas encore la
 
 
 def ci_master(m):
-    for d, sha in (("back", "mergeback301"), ("front", "mergefront401")):
-        m["runs"][d].append(run(d, 60, sha.ljust(40, "0"), "pull_request", "release/1.0.0",
+    m["compare_commits"] = {"back": {"develop...release/1.0.0": [m["refs"]["back"]["release/1.0.0"], "intrus".ljust(40, "0")]}}
+    for d in ("back", "front"):
+        m["runs"][d].append(run(d, 60, m["refs"][d]["release/1.0.0"], "pull_request", "release/1.0.0",
                                 jobs={"quality": "success", "integration": "success", "e2e": "success",
                                       "push-vert": "success", "env-parity": "success"}))
 
 
 monde(ci_master)
 lancer("veille")
-verifier(etat()["etape"] == "revue-livraison" and derniers_reveils()[0]["accountId"] == "relecteur", "revue-livraison, relecteur réveillé")
+verifier(etat()["etape"] == "revue-livraison" and derniers_reveils()[0]["accountId"] == "relecteur"
+         and "hors du lot revu" in derniers_reveils()[0]["message"],
+         "commit étranger au lot dans la release : pas de merge automatique, relecteur réveillé pour la revue de livraison")
 lpr = {(p["depot"], p["base"]): p["num"] for p in etat()["prs_livraison"]}
 lancer("merge", "1.0.0", "--pr", f"front#{lpr[('front', 'develop')]}", par="relecteur", attendu=2)
 for cle in (("back", "develop"), ("back", "master"), ("front", "develop"), ("front", "master")):
@@ -376,6 +412,7 @@ print("9. relances d'un agent muet, puis alerte à l'humain")
 lancer("debut", "1.0.1", "--session-key", FIL.replace("000100", "000200"), par="dev")
 lancer("veille")
 n0 = len(monde().get("reveils", []))
+r0 = len(monde().get("resets", []))
 modifier_etat("1.0.1", lambda e: e.update(depuis=il_y_a(50)))
 monde(lambda m: m.update(units=["dev-101-impl.service"]))
 lancer("veille")
@@ -390,6 +427,7 @@ verifier("Relance automatique n°2" in derniers_reveils()[0]["message"], "relanc
 modifier_etat("1.0.1", lambda e: e["relances"].update(derniere=il_y_a(50), verif_session=il_y_a(11)))
 lancer("veille")
 verifier("ne répond pas" in monde()["avis"][-1] and "<@U0TEST>" in monde()["avis"][-1], "alerte postée à l'humain")
+verifier(len(monde().get("resets", [])) == r0, "contexte neuf : aucune remise à zéro pour une relance")
 monde(lambda m: m.update(units=[]))
 
 print("10. arrêt au 3e aller-retour, reprise")
@@ -426,6 +464,55 @@ r = derniers_reveils()[0]
 verifier("attaquer ensuite le lot 1.0.2" in r["message"] and r["threadId"] == "1700000000.000300", "dev réveillé pour 1.0.2")
 lancer("veille")
 verifier(sum("1.0.2" in x["message"] for x in monde()["reveils"]) == 1, "un seul réveil")
+
+print("14. piste 2 : merges au verdict, commit de release, PR de livraison ouvertes et mergées par le relais")
+F3 = FIL.replace("000100", "000400")
+
+
+def lot103(m):
+    m["cartes"].append({"id": "k31", "name": "[V1.0.3-Back] 1. carte trois", "idList": L["not_ready"]})
+    for d, n, sha in (("back", "801", "featback3"), ("front", "901", "featfront3")):
+        m["prs"][d][n] = pr(d, int(n), "feat/1.0.3-lot", "release/1.0.3", sha.ljust(40, "0"))
+        m["runs"][d].append(run(d, 1000 + int(n), sha.ljust(40, "0"), "pull_request", "feat/1.0.3-lot",
+                                jobs={"quality": "success", "integration": "success", "e2e": "success"}))
+        m["refs"][d]["release/1.0.3"] = f"rel{d}3".ljust(40, "0")
+        m["fichiers"][d]["release/1.0.3"] = {"CHANGELOG.md": CL}
+        m["compare"][d].update({"develop...release/1.0.3": 2, "master...release/1.0.3": 3})
+    m["fichiers"]["front"]["release/1.0.3"]["package.json"] = PK
+
+
+monde(lot103)
+lancer("debut", "1.0.3", "--session-key", F3, par="dev")
+modifier_etat("1.0.3", lambda e: e.update(etape="revue", tour="relecteur", prs_lot=[
+    {"depot": d, "num": int(n), "branche": "feat/1.0.3-lot", "sha": sha.ljust(40, "0"), "labels": [],
+     "url": f"https://github.com/exemple/app-{d}/pull/{n}"} for d, n, sha in (("back", "801", "featback3"),
+                                                                                  ("front", "901", "featfront3"))]))
+monde(lambda m: next(c for c in m["cartes"] if c["id"] == "k31").update(idList=L["review"]))
+nr = len(monde().get("reveils", []))
+out = lancer("verdict", "1.0.3", "--merger", "--rapport", str(rap2), par="relecteur")
+m, e = monde(), etat("1.0.3")
+verifier(m["prs"]["back"]["801"]["methode"] == "squash" and m["prs"]["front"]["901"]["methode"] == "squash"
+         and e["etape"] == "ci-release", "verdict À MERGER : les deux PR du lot mergées dans la commande, CI de la release")
+verifier("## [1.0.3] - " in m["fichiers"]["front"]["release/1.0.3"]["CHANGELOG.md"]
+         and '"version": "1.0.3"' in m["fichiers"]["front"]["release/1.0.3"]["package.json"], "commit de release du lot 1.0.3")
+monde(lambda m: [m["runs"][d].append(run(d, 1100, m["refs"][d]["release/1.0.3"], "push", "release/1.0.3",
+                                         jobs={"quality": "success", "deploy": "success"})) for d in ("back", "front")])
+lancer("veille")
+e = etat("1.0.3")
+verifier(e["etape"] == "ci-livraison" and len(e["prs_livraison"]) == 4 and len(monde().get("reveils", [])) == nr
+         and "PR de livraison ouvertes" in monde()["avis"][-1],
+         "aucune intervention : le relais ouvre les 4 PR de livraison lui-même, sans réveiller le dev")
+monde(lambda m: [m["runs"][d].append(run(d, 1200, m["refs"][d]["release/1.0.3"], "pull_request", "release/1.0.3",
+                                         jobs={"quality": "success", "integration": "success", "e2e": "success",
+                                               "push-vert": "success", "env-parity": "success"})) for d in ("back", "front")])
+monde(lambda m: m["compare_commits"].update(
+    back={"develop...release/1.0.3": [m["prs"]["back"]["801"]["mergeCommit"]["oid"]] + etat("1.0.3")["bascule"]["back"]},
+    front={"develop...release/1.0.3": [m["prs"]["front"]["901"]["mergeCommit"]["oid"]] + etat("1.0.3")["bascule"]["front"]}))
+lancer("veille")
+e, m = etat("1.0.3"), monde()
+verifier(e["etape"] == "deploiement" and all(m["prs"][p["depot"]][str(p["num"])]["methode"] == "merge" for p in e["prs_livraison"])
+         and len(m.get("reveils", [])) == nr and "PR de livraison mergées" in m["avis"][-1],
+         "CI verte et contenu = lot revu : le relais merge les 4 PR de livraison, sans réveiller le relecteur")
 
 print("13. aucune commande d'agent n'a tenté de réveil direct")
 verifier(not monde().get("refus_exec"), "aucun `gateway call agent` depuis l'exec d'un agent")

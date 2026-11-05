@@ -27,12 +27,12 @@ fichiers de configuration non versionnés.
 | 4 | Arbitrage bloquant | dev → humain | Une question que les règles ne tranchent pas arrête le cycle (`cycle-lot arret`) |
 | 5 | CI de fin de lot | `run-lot.sh` | Tests unitaires et e2e, qualité et sécurité, une fois, sur les têtes finales des PR |
 | 6 | CI rouge | dev | Le dev corrige avant de demander la revue : `cycle-lot passe` refuse une CI qui n'est pas verte |
-| 7 | Revue | relecteur | Relecture, tests, parcours Playwright sur la version déployée du lot ; verdict À MERGER ou À REPRENDRE |
+| 7 | Revue | relecteur | Relecture, tests, parcours Playwright sur la version déployée du lot ; verdict À MERGER ou À REPRENDRE. Une revue de correction ne relit que le diff depuis la tête revue |
 | 8 | Correction | dev | Tous les points, bloquants et non bloquants, sur les mêmes PR |
 | 9 | 7 ↔ 8 | | Automatique jusqu'à À MERGER ; arrêt au 3e À REPRENDRE |
-| 10 | Merge du lot | relecteur | `cycle-lot merge` de chaque PR dans la release (squash, back d'abord) |
-| 11 | Livraison | dev | `cycle-lot ouvrir-livraison` : 4 PR, release vers `develop` et `master`, back et front |
-| 12 | Revue de livraison | relecteur | Contenu limité au lot revu, puis merge des 4 PR |
+| 10 | Merge du lot | relecteur, relais | Le verdict À MERGER merge aussitôt chaque PR dans la release (squash, back d'abord) ; le relais pose le commit de release (CHANGELOG, version) |
+| 11 | Livraison | relais | Release verte : le relais ouvre les 4 PR, release vers `develop` et `master`, back et front. Le dev ne s'en charge que si une intervention de l'humain reste ouverte |
+| 12 | Revue de livraison | relais ou relecteur | CI verte et contenu limité au lot revu : le relais merge les 4 PR. Sinon le relecteur vérifie et merge |
 | 13 | Mise en production | relais, puis dev | CI de `develop` et `master` (déploiement compris), puis liste des validations visuelles à faire en production |
 | 14 | Validation en production | relecteur | Playwright sur la production, une carte Trello par défaut, dans la version suivante, en Not Ready |
 
@@ -60,6 +60,26 @@ silence. Ici, aucun agent n'attend jamais :
 Le réveil passe par le RPC `agent` du gateway OpenClaw, dans la session de l'agent pour le fil Slack du lot, et sa
 réponse y est postée. Il part du service systemd et non de l'exec d'un agent : le gateway refuse qu'un agent réveille
 lui-même une autre session.
+
+## Économie de jetons
+
+Au fil d'un lot, la session d'un agent dans le fil du lot dépasse vite 100 k jetons, et chaque tour réécrit ce
+contexte en cache : c'est l'essentiel du coût d'un tour, bien plus que le travail lui-même. Le relais réduit les deux.
+
+- **Contexte neuf à chaque étape.** Avant un réveil qui ouvre une étape (revue, correction, livraison…), le relais
+  remet à zéro la session de l'agent dans le fil (RPC `sessions.reset`, sur le `sessionId` lu juste avant ; le routage
+  vers le fil est conservé). L'agent repart du seul contexte de démarrage, et la consigne du relais se suffit : état
+  du lot, PR, rapports, commandes. Si un tour de l'agent tourne, le relais attend sa fin (30 min au plus) plutôt que de
+  l'interrompre. Les relances et les réveils de fin de job gardent la session. `CYCLE_LOT_CONTEXTE_NEUF=0` désactive.
+- **Gestes mécaniques sans tour d'agent.** Le verdict À MERGER merge dans la même commande. Le relais pose le commit
+  de release par l'API Git de GitHub (section `[Unreleased]` du CHANGELOG basculée dans `[<version>] - date`,
+  version de `package.json`), ouvre les PR de livraison, puis les merge quand leur CI est verte et que les commits de
+  la release absents de `develop` sont tous des merges revus ou ce commit de release. Chaque geste est annoncé dans le
+  fil ; un écart ou une CI rouge réveille le relecteur.
+- **Revue de correction ciblée.** Le verdict enregistre la tête de chaque PR revue ; à la revue suivante, le relais
+  donne au relecteur la plage `git diff <tête revue>..<tête actuelle>` de chaque PR, et non une nouvelle revue complète.
+- **Job de revue sans suivi d'avancement.** `claude --print --disallowedTools Monitor` : les notifications d'avancement
+  réveillaient l'orchestrateur de revue pour rien ; seules les fins de sous-agents et de commandes le réveillent.
 
 ## `run-lot.sh`
 
@@ -119,9 +139,9 @@ Réglages de la machine : [`run-lot.example.conf`](run-lot.example.conf), à cop
 |---|---|---|
 | `debut <v> --session-key <clé>` | dev, sur demande de l'humain | Crée l'état du lot, cartes en Work in progress |
 | `passe <v> --vers <relecteur> --message …` | dev | Fin du dev ou d'une correction : CI verte exigée, back du lot déployé sur la preview (si `deploiement_preview` est configuré), puis revue |
-| `verdict <v> --merger\|--a-reprendre --rapport <f> [--cartes-ok …] [--cartes-ko …]` | relecteur | Fin de revue ; arrêt automatique au 3e À REPRENDRE |
-| `merge <v> --pr back#N` | relecteur | Merge gardé : tête inchangée depuis la revue, CI verte, back avant front |
-| `ouvrir-livraison <v>` | dev | Les 4 PR de livraison ; refusé tant qu'une intervention de l'humain reste à faire |
+| `verdict <v> --merger\|--a-reprendre --rapport <f> [--cartes-ok …] [--cartes-ko …]` | relecteur | Fin de revue ; `--merger` merge aussitôt les PR du lot ; arrêt automatique au 3e À REPRENDRE |
+| `merge <v> --pr back#N` | relecteur | Merge gardé : tête inchangée depuis la revue, CI verte, back avant front ; après un merge refusé au verdict, ou en revue de livraison |
+| `ouvrir-livraison <v>` | dev | Les 4 PR de livraison, quand le relais n'a pas pu les ouvrir ; refusé tant qu'une intervention de l'humain reste à faire |
 | `passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>` | dev | Liste des validations visuelles en production |
 | `carte-bug <v> --titre … --appli … --gravite … --description-fichier …` | relecteur | Carte de bug dans la version suivante, en Not Ready |
 | `fin <v> --rapport <f>` | relecteur | Lot livré et validé |
@@ -149,7 +169,9 @@ les lit pour montrer chaque lot, l'agent qui a la main et les runs que le relais
    - aucun script ni unit qui attende l'autre agent ou la CI : c'est le relais qui attend ;
    - jamais d'appel direct au RPC `agent` du gateway depuis un exec ;
    - tout travail de plus de 30 min tourne dans une unit `<agent>-<prefixe>-…` (`dev-100-impl`, `relecteur-100-rev1`),
-     sinon le relais croit l'agent inactif et le relance.
+     sinon le relais croit l'agent inactif et le relance ;
+   - la session du fil est remise à zéro à chaque étape : ce qui doit servir à une étape suivante s'écrit dans le
+     dossier du lot ou dans un rapport, jamais seulement dans le fil.
 5. La grille de revue commune est [`GRILLE-REVUE.md`](GRILLE-REVUE.md), et les règles d'arbitrage
    [`regles-arbitrage.example.md`](regles-arbitrage.example.md), à copier en `regles-arbitrage.md`.
 
@@ -162,7 +184,7 @@ Slack pour `cycle-lot`. Les deux dépôts suivent un flux `develop` / `release/<
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (59 vérifications)
+python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (75 vérifications)
 bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux (22 vérifications, ~1 min)
 ```
 

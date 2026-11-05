@@ -27,12 +27,12 @@ The scripts, their messages and the prompts they build are in French.
 | 4 | Blocking question | dev → human | A question the rules cannot settle stops the cycle (`cycle-lot arret`) |
 | 5 | End-of-batch CI | `run-lot.sh` | Unit and e2e tests, quality and security analysis, once, on the final heads of the PRs |
 | 6 | Red CI | dev | The dev fixes it before asking for review: `cycle-lot passe` refuses a CI that is not green |
-| 7 | Review | reviewer | Code review, tests, Playwright journeys on the deployed batch; verdict MERGE or REWORK |
+| 7 | Review | reviewer | Code review, tests, Playwright journeys on the deployed batch; verdict MERGE or REWORK. A rework review only reads the diff since the reviewed head |
 | 8 | Rework | dev | Every point, blocking or not, on the same PRs |
 | 9 | 7 ↔ 8 | | Automatic until MERGE; stops at the 3rd REWORK |
-| 10 | Batch merge | reviewer | `cycle-lot merge` of each PR into the release (squash, back first) |
-| 11 | Delivery | dev | `cycle-lot ouvrir-livraison`: 4 PRs, release into `develop` and `master`, back and front |
-| 12 | Delivery review | reviewer | Content limited to the reviewed batch, then merge of the 4 PRs |
+| 10 | Batch merge | reviewer, relay | The MERGE verdict immediately merges each PR into the release (squash, back first); the relay adds the release commit (CHANGELOG, version) |
+| 11 | Delivery | relay | Green release: the relay opens the 4 PRs, release into `develop` and `master`, back and front. The dev only steps in while a human action is still pending |
+| 12 | Delivery review | relay or reviewer | Green CI and content limited to the reviewed batch: the relay merges the 4 PRs. Otherwise the reviewer checks and merges |
 | 13 | Production | relay, then dev | CI of `develop` and `master` (deployment included), then the list of visual checks to run in production |
 | 14 | Production checks | reviewer | Playwright on production, one Trello card per defect, in the next version, in Not Ready |
 
@@ -60,6 +60,27 @@ Here, no agent ever waits:
 The wake-up goes through the OpenClaw gateway `agent` RPC, into the agent's session for the batch's Slack thread, and
 the agent's reply is posted there. It runs from the systemd service, not from an agent's exec: the gateway refuses to
 let an agent wake another session itself.
+
+## Saving tokens
+
+Over a batch, an agent's session in the batch thread quickly grows past 100k tokens, and every turn rewrites that
+context into the cache: that is most of a turn's cost, far more than the work itself. The relay cuts both.
+
+- **Fresh context at every step.** Before a wake-up that opens a step (review, rework, delivery…), the relay resets
+  the agent's session in the thread (`sessions.reset` RPC, on the `sessionId` read just before; routing to the thread
+  is kept). The agent starts again from its bootstrap context alone, and the relay's instructions are self-contained:
+  batch state, PRs, reports, commands. If a turn of the agent is running, the relay waits for it to end (30 minutes at
+  most) rather than interrupt it. Nudges and end-of-job wake-ups keep the session. `CYCLE_LOT_CONTEXTE_NEUF=0`
+  turns this off.
+- **Mechanical steps without an agent turn.** The MERGE verdict merges in the same command. The relay adds the release
+  commit through the GitHub Git data API (the CHANGELOG `[Unreleased]` section moved under `[<version>] - date`, the
+  `package.json` version), opens the delivery PRs, then merges them once their CI is green and every release commit
+  missing from `develop` is a reviewed merge or that release commit. Each step is announced in the thread; a mismatch or
+  a red CI wakes the reviewer.
+- **Targeted rework review.** The verdict records the head of each reviewed PR; on the next review, the relay gives the
+  reviewer the `git diff <reviewed head>..<current head>` range of each PR instead of asking for a full review.
+- **Review job without progress monitoring.** `claude --print --disallowedTools Monitor`: progress notifications woke
+  the review orchestrator for nothing; only sub-agent and background command completions wake it.
 
 ## `run-lot.sh`
 
@@ -118,9 +139,9 @@ Machine settings: [`run-lot.example.conf`](run-lot.example.conf), to copy as `ru
 |---|---|---|
 | `debut <v> --session-key <key>` | dev, when the human asks | Creates the batch state, cards to Work in progress |
 | `passe <v> --vers <reviewer> --message …` | dev | End of development or rework: green CI required, batch back end deployed to preview (when `deploiement_preview` is configured), then review |
-| `verdict <v> --merger\|--a-reprendre --rapport <f> [--cartes-ok …] [--cartes-ko …]` | reviewer | End of review; automatic stop at the 3rd REWORK |
-| `merge <v> --pr back#N` | reviewer | Guarded merge: head unchanged since the review, green CI, back before front |
-| `ouvrir-livraison <v>` | dev | The 4 delivery PRs; refused while a human action is still pending |
+| `verdict <v> --merger\|--a-reprendre --rapport <f> [--cartes-ok …] [--cartes-ko …]` | reviewer | End of review; `--merger` immediately merges the batch PRs; automatic stop at the 3rd REWORK |
+| `merge <v> --pr back#N` | reviewer | Guarded merge: head unchanged since the review, green CI, back before front; after a merge refused at the verdict, or in delivery review |
+| `ouvrir-livraison <v>` | dev | The 4 delivery PRs, when the relay could not open them; refused while a human action is still pending |
 | `passe <v> --vers <reviewer> --etape validation-prod --fichier <list>` | dev | List of visual checks in production |
 | `carte-bug <v> --titre … --appli … --gravite … --description-fichier …` | reviewer | Bug card in the next version, in Not Ready |
 | `fin <v> --rapport <f>` | reviewer | Batch delivered and validated |
@@ -149,7 +170,9 @@ holding the hand and the runs the relay is waiting for.
    - no script or unit that waits for the other agent or for CI: the relay does the waiting;
    - never call the gateway `agent` RPC directly from an exec;
    - any work longer than 30 minutes runs in a `<agent>-<prefix>-…` unit (`dev-100-impl`, `relecteur-100-rev1`),
-     otherwise the relay thinks the agent is idle and nudges it.
+     otherwise the relay thinks the agent is idle and nudges it;
+   - the thread session is reset at every step: whatever a later step needs goes into the batch folder or a report,
+     never only into the thread.
 5. The shared review grid is [`GRILLE-REVUE.md`](GRILLE-REVUE.md), and the arbitration rules
    [`regles-arbitrage.example.md`](regles-arbitrage.example.md), to copy as `regles-arbitrage.md`.
 
@@ -162,7 +185,7 @@ Linux with user-mode systemd (cgroups v2), Python 3.11 or later (standard librar
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (59 checks)
+python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (75 checks)
 bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories (22 checks, ~1 min)
 ```
 
