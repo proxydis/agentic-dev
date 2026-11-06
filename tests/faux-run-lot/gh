@@ -2,6 +2,7 @@
 """Faux `gh` pour l'essai de run-lot.sh : les PR ouvertes par le faux claude, leurs étiquettes, et un run vert par
 PR rouverte en fin de lot. Le dépôt est celui du dossier courant (run-lot.sh lance gh depuis chaque dépôt)."""
 import datetime as dt
+import fcntl
 import json
 import os
 import subprocess
@@ -9,6 +10,9 @@ import sys
 
 a = sys.argv[1:]
 chemin = os.environ["GH_ETAT"]
+# les deux voies appellent gh en même temps : état lu et réécrit sous verrou, jusqu'à la sortie
+verrou = open(chemin + ".verrou", "w")
+fcntl.flock(verrou, fcntl.LOCK_EX)
 etat = json.load(open(chemin)) if os.path.exists(chemin) else {"prs": [], "runs": [], "appels": []}
 etat["appels"].append(a)
 depot = os.path.basename(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip())
@@ -58,6 +62,7 @@ elif a[:2] in (["run", "cancel"], ["run", "rerun"], ["run", "view"]):
 else:
     print("faux gh : commande inconnue " + " ".join(a), file=sys.stderr)
     sys.exit(1)
-json.dump(etat, open(chemin, "w"), indent=1)
+json.dump(etat, open(chemin + ".tmp", "w"), indent=1)
+os.replace(chemin + ".tmp", chemin)
 if sortie:
     print(sortie)

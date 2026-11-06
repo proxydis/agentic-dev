@@ -36,9 +36,16 @@ The scripts, their messages and the prompts they build are in French.
 | 13 | Production | relay, then dev | CI of `develop` and `master` (deployment included), then the list of visual checks to run in production |
 | 14 | Production checks | reviewer | Playwright on production, one Trello card per defect, in the next version, in Not Ready |
 
-Trello follows the cycle: Work in progress at start, Waiting for review as soon as a pass is pushed to the batch PR,
-Under review when the review starts, Finished or back to Work in progress at the verdict. A validated card never moves
-again.
+Trello follows the cycle: Work in progress at start, Waiting for review as soon as a pass is pushed to the batch PR
+(steps A, B and FIN), Under review when the review starts, Finished or back to Work in progress at the verdict. MERGE
+only moves to Finished the cards still in the batch flow (Work in progress, Waiting for review, Under review); a card
+left in Not Ready, Standby, Blocked or Canceled does not move, and the command reports it. A validated card never
+moves again.
+
+**Deferring a card.** Rename it to its new version (`[V1.0.1-…]`) and move it back to Not Ready. Until the MERGE
+verdict, every read of the board (relay, `passe`, `verdict`) aligns the batch card list with the titles: the card
+leaves the batch (one journal line, out of the progress total, "Sorties du lot" in `cycle-lot etat`) and comes back if
+it is given the batch version again.
 
 **Stops.** The cycle stops on a blocking question, when the human has to act (environment variable, token,
 account…), and at the 3rd REWORK verdict. Questions and required human actions are raised at the start of the batch,

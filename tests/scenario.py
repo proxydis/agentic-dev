@@ -550,6 +550,84 @@ verifier(e["etape"] == "deploiement" and all(m["prs"][p["depot"]][str(p["num"])]
          and len(m.get("reveils", [])) == nr and "PR de livraison mergées" in m["avis"][-1],
          "CI verte et contenu = lot revu : le relais merge les 4 PR de livraison, sans réveiller le relecteur")
 
+print("15. carte reportée en cours de lot : elle sort du lot, le verdict À MERGER ne la passe pas en Finished")
+F5 = FIL.replace("000100", "000500")
+J4 = TMP / "cycles" / "1.0.4" / "journal.log"
+
+
+def lot104(m):
+    for i in range(1, 5):
+        m["cartes"].append({"id": f"k4{i}", "name": f"[V1.0.4-Back] {i}. carte {i}", "idList": L["not_ready"]})
+    for d, n, sha in (("back", "811", "featback4"), ("front", "911", "featfront4")):
+        m["prs"][d][n] = pr(d, int(n), "feat/1.0.4-lot", "release/1.0.4", sha.ljust(40, "0"))
+        m["runs"][d].append(run(d, 1300 + int(n), sha.ljust(40, "0"), "pull_request", "feat/1.0.4-lot",
+                                jobs={"quality": "success", "integration": "success", "e2e": "success"}))
+        m["refs"][d]["release/1.0.4"] = f"rel{d}4".ljust(40, "0")
+        m["refs"][d]["feat/1.0.4-lot"] = sha.ljust(40, "0")
+        m["fichiers"][d]["release/1.0.4"] = {"CHANGELOG.md": CL}
+        m["compare"][d].update({"develop...release/1.0.4": 2, "master...release/1.0.4": 3})
+    m["fichiers"]["front"]["release/1.0.4"]["package.json"] = PK
+
+
+def carte(cid):
+    return next(c for c in monde()["cartes"] if c["id"] == cid)
+
+
+def renommer(cid, nom):
+    monde(lambda m: next(c for c in m["cartes"] if c["id"] == cid).update(name=nom))
+
+
+def reporter_3(m):
+    # la carte 3 est reportée en 1.0.5 (renommée et remise en Not Ready) ; la carte 4 est remise en Not Ready sans
+    # être renommée ; les passes des cartes 1 et 2 sont poussées
+    k = {c["id"]: c for c in m["cartes"]}
+    k["k43"].update(name="[V1.0.5-Back] 1. carte 3", idList=L["not_ready"])
+    k["k44"]["idList"] = L["not_ready"]
+    for i in (1, 2):
+        k[f"k4{i}"]["idList"] = L["waiting"]
+
+
+monde(lot104)
+lancer("debut", "1.0.4", "--session-key", F5, par="dev")
+verifier([c["num"] for c in etat("1.0.4")["cartes"]] == [1, 2, 3, 4], "lot 1.0.4 : cartes 1 à 4")
+monde(reporter_3)
+lancer("veille")
+e = etat("1.0.4")
+verifier([c["num"] for c in e["cartes"]] == [1, 2, 4] and e["cartes_sorties"][0]["version"] == "1.0.5"
+         and "carte 3 sortie du lot : renommée [V1.0.5-Back] 1, en Not Ready" in J4.read_text(),
+         "relais : la carte renommée [V1.0.5-…] sort du lot, avec une ligne de journal")
+av = e["avancement"]
+verifier(av["faites"] == 2 and av["total"] == 3 and "3" not in av["cartes"], "avancement : 2/3, la carte reportée hors du total")
+out = lancer("etat", "1.0.4")
+verifier("Cartes : 1, 2, 4" in out and "Sorties du lot : 3 -> [V1.0.5-Back] 1" in out, "etat : la carte reportée est listée à part")
+lancer("veille")
+verifier(J4.read_text().count("sortie du lot") == 1, "sortie notée une seule fois")
+lancer("passe", "1.0.4", "--vers", "relecteur", par="dev")
+verifier([liste_de(n, "1.0.4") for n in (1, 2, 4)] == ["review", "review", "not_ready"]
+         and carte("k43")["idList"] == L["not_ready"], "passage en revue : les cartes en Not Ready ne bougent pas")
+modifier_etat("1.0.4", lambda e: e.update(etape="revue", tour="relecteur"))
+out = lancer("verdict", "1.0.4", "--a-reprendre", "--rapport", str(rap), "--cartes-ok", "1,2", "--cartes-ko", "3",
+             par="relecteur", attendu=2)
+verifier("cartes inconnues du lot : [3]" in out, "verdict : une carte reportée ne peut plus être classée")
+renommer("k43", "[V1.0.4-Back] 3. carte 3")
+lancer("veille")
+verifier([c["num"] for c in etat("1.0.4")["cartes"]] == [1, 2, 3, 4] and "carte 3 revenue dans le lot" in J4.read_text(),
+         "carte rendue à la version du lot : elle y revient")
+renommer("k43", "[V1.0.5-Back] 1. carte 3")
+out = lancer("verdict", "1.0.4", "--merger", "--rapport", str(rap2), par="relecteur")
+e = etat("1.0.4")
+verifier(carte("k41")["idList"] == L["finished"] and carte("k42")["idList"] == L["finished"]
+         and carte("k43")["idList"] == L["not_ready"] and carte("k44")["idList"] == L["not_ready"],
+         "À MERGER : cartes revues en Finished ; la carte reportée et celle restée en Not Ready ne bougent pas")
+verifier([c["num"] for c in e["cartes"]] == [1, 2, 4] and "laissées en place, hors revue : 4 (Not Ready)" in out
+         and e["etape"] == "ci-release",
+         "verdict : report détecté dans la commande même (sans passage du relais), carte 4 signalée, PR mergées")
+renommer("k41", "[V1.0.5-Back] 2. carte 1")
+lancer("veille")
+verifier([c["num"] for c in etat("1.0.4")["cartes"]] == [1, 2, 4], "après le verdict À MERGER, la liste du lot ne suit plus le tableau")
+verifier("sortie du lot" not in (TMP / "cycles" / "1.0.0" / "journal.log").read_text(),
+         "lot 1.0.0 du banc : aucune sortie de carte sans renommage (carte annulée comprise)")
+
 print("13. aucune commande d'agent n'a tenté de réveil direct")
 verifier(not monde().get("refus_exec"), "aucun `gateway call agent` depuis l'exec d'un agent")
 

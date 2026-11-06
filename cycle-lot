@@ -464,6 +464,58 @@ def cartes_de_version(version, toutes=None):
     return sorted(res, key=lambda c: c["num"])
 
 
+# Cartes du lot : `debut` en prend la liste, mais une carte peut être reportée ensuite (renommée [V<version suivante>-…]
+# et remise en Not Ready). Restée dans le lot, le verdict À MERGER l'aurait passée en Finished. Jusqu'au verdict À MERGER,
+# chaque lecture du tableau (relais, passe, verdict) aligne donc la liste sur les titres : une carte renommée vers une
+# autre version sort du lot, et y revient si on lui rend la version du lot.
+ETAPES_CARTES_SUIVIES = ("dev", "deploiement-revue", "revue", "correction")
+# Verdict À MERGER : seules les cartes en cours de lot passent en Finished. Une carte en Not Ready, Standby, Blocked,
+# Canceled ou Archived n'a pas été revue : elle reste où elle est, signalée.
+LISTES_EN_COURS = ("wip", "waiting", "review")
+
+
+def titre_court(nom):
+    """« [V1.0.1-Back/Front] 6 » : version, type et numéro d'un titre de carte, sans le libellé."""
+    m = RE_CARTE.match(nom or "")
+    return f"[V{m.group('ver')}-{m.group('type')}] {m.group('num')}" if m else (nom or "")[:60]
+
+
+def suivre_cartes(etat, toutes):
+    """Aligne etat["cartes"] sur les titres du tableau (toutes : cartes ouvertes, avec name et idList), jusqu'au verdict
+    À MERGER. Une carte fermée sur Trello reste (hors du total de l'avancement). Journalise et rend les changements ;
+    l'appelant écrit l'état."""
+    etape = etat["etape"] if etat["etape"] != "arret" else (etat.get("arret") or {}).get("etape")
+    if etape not in ETAPES_CARTES_SUIVIES:
+        return []
+    v, par_id, changements = etat["version"], {c["id"]: c for c in toutes}, []
+    gardees, sorties = [], etat.setdefault("cartes_sorties", [])
+    for c in etat["cartes"]:
+        t = par_id.get(c["id"])
+        m = RE_CARTE.match(t.get("name") or "") if t else None
+        if t is None or (m and m.group("ver") == v):
+            gardees.append(c)
+            continue
+        liste = NOM_LISTE.get(LISTE_DE_ID.get(t.get("idList")), "?")
+        sorties.append({**c, "nouveau_nom": t.get("name"), "version": m.group("ver") if m else None, "heure": iso()})
+        changements.append(f"carte {c['num']} sortie du lot : renommée {titre_court(t.get('name'))}, en {liste}")
+    pris = {c["num"] for c in gardees}
+    for s in {s["id"]: s for s in sorties}.values():  # rendue à la version du lot : elle revient
+        t = par_id.get(s["id"])
+        m = RE_CARTE.match(t.get("name") or "") if t else None
+        if not m or m.group("ver") != v or s["id"] in {c["id"] for c in gardees}:
+            continue
+        if int(m.group("num")) in pris:
+            continue  # numéro repris entre-temps : elle reste hors du lot plutôt que de créer un doublon
+        gardees.append({"id": s["id"], "num": int(m.group("num")), "nom": t["name"], "url": s.get("url")})
+        pris.add(int(m.group("num")))
+        changements.append(f"carte {m.group('num')} revenue dans le lot : {titre_court(t['name'])}")
+    if changements:
+        etat["cartes"] = sorted(gardees, key=lambda c: c["num"])
+        for x in changements:
+            journal(v, x)
+    return changements
+
+
 # Avancement du lot, affiché par le monitor (vue Graph, nœud du cycle) : une carte est faite par le dev quand run-lot.sh
 # l'a passée en Waiting for review (sa passe est poussée dans la PR du lot), ou plus loin (Under review, Finished). Une
 # carte renvoyée en Work in progress au verdict repasse dans le reste à faire ; annulée, archivée ou fermée, elle sort
@@ -474,10 +526,9 @@ ORDRE_LISTES = ("not_ready", "standby", "wip", "blocked", "waiting", "review", "
 
 
 def lire_tableau_leger():
-    """{id de carte : id de liste} des cartes ouvertes du tableau, en une seule lecture et sans nouvel essai : le relais
-    la refait au passage suivant."""
-    return {c["id"]: c.get("idList") for c in trello("GET", f"/boards/{TRELLO_BOARD}/cards/open", _essais=1, _delai=20,
-                                                       fields="idList")}
+    """Cartes ouvertes du tableau (id, titre, liste), en une seule lecture et sans nouvel essai : le relais la refait au
+    passage suivant. Les titres servent à suivre les cartes reportées (~160 ko pour ~800 cartes, 0,5 s)."""
+    return trello("GET", f"/boards/{TRELLO_BOARD}/cards/open", _essais=1, _delai=20, fields="name,idList")
 
 
 def avancement(etat, sur_tableau):
@@ -533,12 +584,19 @@ def noter_avancement(etat, tableau):
         av["erreur"] = erreur
         etat["avancement"] = av
     else:
-        etat["avancement"] = avancement(etat, tableau)
+        try:
+            suivre_cartes(etat, tableau)
+        except Exception as e:  # noqa: BLE001 — ne fait pas tomber le passage ; passe et verdict refont le suivi
+            journal(etat["version"], f"cartes du lot : suivi impossible ({type(e).__name__} : {str(e)[:200]})")
+        etat["avancement"] = avancement(etat, {c["id"]: c.get("idList") for c in tableau})
 
 
 def ou_sont(etat):
-    """Liste actuelle de chaque carte du lot : {num: clé de liste}."""
-    ici = {c["id"]: c["idList"] for c in cartes_du_tableau()}
+    """Liste actuelle de chaque carte du lot : {num: clé de liste}, après avoir aligné les cartes du lot sur le tableau
+    (une carte reportée en sort)."""
+    toutes = cartes_du_tableau()
+    suivre_cartes(etat, toutes)
+    ici = {c["id"]: c["idList"] for c in toutes}
     return {c["num"]: LISTE_DE_ID.get(ici.get(c["id"]), "?") for c in etat["cartes"]}
 
 
@@ -951,21 +1009,25 @@ def cmd_verdict(a):
         if a.merger and etat["etape"] == "revue-livraison":
             raise Refus("à l'étape revue-livraison, l'accord se traduit par le merge des PR : `cycle-lot merge`")
         ok, ko = liste_nums(a.cartes_ok), liste_nums(a.cartes_ko)
+        if a.merger and ko:
+            raise Refus("--merger avec des cartes refusées : c'est un verdict À REPRENDRE")
+        ou = ou_sont(etat)  # avant le contrôle des numéros : une carte reportée n'est plus du lot
         connus = {c["num"] for c in etat["cartes"]}
         if (ok | ko) - connus:
             raise Refus(f"cartes inconnues du lot : {sorted((ok | ko) - connus)} (lot : {sorted(connus)})")
         if ok & ko:
             raise Refus(f"cartes à la fois validées et refusées : {sorted(ok & ko)}")
-        ou = ou_sont(etat)
         en_revue = {n for n, liste in ou.items() if liste == "review"}
         etat["rapports"].append({"heure": iso(), "fichier": str(rapport), "verdict": "merger" if a.merger else "a-reprendre",
                                  "etape": etat["etape"], "aller_retour": etat["aller_retours"] + 1,
                                  "tetes": {f"{x['depot']}#{x['num']}": x["sha"] for x in etat["prs_lot"]}})
         if a.merger:
-            if ko:
-                raise Refus("--merger avec des cartes refusées : c'est un verdict À REPRENDRE")
-            restantes = {n for n, liste in ou.items() if liste != "finished"}
+            restantes = {n for n, liste in ou.items() if liste in LISTES_EN_COURS}
+            ailleurs = {n: liste for n, liste in ou.items() if liste not in LISTES_EN_COURS + ("finished",)}
             deplacer(etat, restantes, "finished", haut=True)
+            laissees = ", ".join(f"{n} ({NOM_LISTE.get(liste, 'introuvable sur Trello')})" for n, liste in sorted(ailleurs.items()))
+            if laissees:
+                journal(v, f"verdict À MERGER : cartes laissées en place, hors revue : {laissees}")
             changer_etape(etat, "merge-lot", agent, a.message or "verdict À MERGER")
             # les merges gardés suivent le verdict dans la même commande ; un refus laisse la main au relecteur
             refus = []
@@ -978,6 +1040,8 @@ def cmd_verdict(a):
             suite = apres_merges(etat, agent)
             ecrire(etat)
             print(f"Verdict À MERGER enregistré, cartes {sorted(restantes)} en Finished. {suite}"
+                  + (f"\nCartes du lot laissées en place, hors revue : {laissees}. Signale-les dans ton bilan."
+                     if laissees else "")
                   + (f"\nMerge refusé, {refus[0]}. Corrige, puis `cycle-lot merge {v} --pr <depot>#<n>` (back d'abord)."
                      if refus else ""))
             return
@@ -1427,6 +1491,11 @@ def cmd_etat(a):
         print("Interventions : " + "; ".join(f"{i['n']}. [{'faite' if i['faite'] else 'à faire'}] {i['texte']}"
                                               for i in e["interventions"]))
     print("Cartes : " + ", ".join(str(c["num"]) for c in e["cartes"]))
+    dans_lot = {c["id"] for c in e["cartes"]}
+    sorties = {s["id"]: s for s in e.get("cartes_sorties") or [] if s["id"] not in dans_lot}.values()
+    if sorties:
+        print("Sorties du lot : " + ", ".join(f"{s['num']} -> {titre_court(s.get('nouveau_nom'))} ({hm(s['heure'])})"
+                                              for s in sorted(sorties, key=lambda s: s["num"])))
     if e["rapports"]:
         r = e["rapports"][-1]
         print(f"Dernier rapport de {N_REV} : {r['fichier']} ({r['verdict']}, {hm(r['heure'])})")

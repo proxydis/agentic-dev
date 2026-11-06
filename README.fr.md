@@ -37,8 +37,15 @@ fichiers de configuration non versionnés.
 | 14 | Validation en production | relecteur | Playwright sur la production, une carte Trello par défaut, dans la version suivante, en Not Ready |
 
 Trello suit le cycle : Work in progress au démarrage, Waiting for review dès qu'une passe est poussée dans la PR du
-lot, Under review au début de la revue, Finished ou de nouveau Work in progress au verdict. Une carte validée ne bouge
-plus.
+lot (étapes A, B et FIN), Under review au début de la revue, Finished ou de nouveau Work in progress au verdict. À
+MERGER ne passe en Finished que les cartes en cours de lot (Work in progress, Waiting for review, Under review) ; une
+carte restée en Not Ready, Standby, Blocked ou Canceled ne bouge pas et la commande la signale. Une carte validée ne
+bouge plus.
+
+**Reporter une carte.** La renommer vers sa nouvelle version (`[V1.0.1-…]`) et la remettre en Not Ready. Jusqu'au
+verdict À MERGER, chaque lecture du tableau (relais, `passe`, `verdict`) aligne la liste du lot sur les titres : la
+carte sort du lot (une ligne au journal, hors du total de l'avancement, « Sorties du lot » dans `cycle-lot etat`) et y
+revient si on lui rend la version du lot.
 
 **Arrêts.** Le cycle s'arrête sur un arbitrage bloquant, sur une intervention nécessaire de l'humain (variable
 d'environnement, jeton, compte…) et au 3e verdict À REPRENDRE. Les arbitrages et les interventions se signalent dès le

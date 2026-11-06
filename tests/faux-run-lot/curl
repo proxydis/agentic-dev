@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Faux `curl` pour l'essai de run-lot.sh : l'API Trello des cartes, seul usage de curl dans run-lot.sh. La liste de
+# chaque carte est dans $TRELLO_ETAT/<id> : GET la rend (fields=idList), PUT la change (idList=…) et répond 200.
+url=${*: -1}
+id=$(sed -n 's#.*/cards/\([A-Za-z0-9]*\)?.*#\1#p' <<<"$url")
+case " $* " in
+  *" PUT "*) sed -n 's#.*[?&]idList=\([0-9a-f]*\).*#\1#p' <<<"$url" >"$TRELLO_ETAT/$id"; printf 200 ;;
+  *) printf '{"id":"%s","idList":"%s"}' "$id" "$(cat "$TRELLO_ETAT/$id" 2>/dev/null)" ;;
+esac

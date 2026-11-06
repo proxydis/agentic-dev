@@ -22,8 +22,8 @@ for app in back front; do
     && git push -q origin develop && git push -q origin develop:release/1.0.0)
 done
 mkdir -p "$T/bin" "$T/lot" "$T/logs"
-cp "$ICI/faux-run-lot/claude" "$ICI/faux-run-lot/gh" "$T/bin/"
-chmod +x "$T/bin/claude" "$T/bin/gh"
+cp "$ICI/faux-run-lot/claude" "$ICI/faux-run-lot/gh" "$ICI/faux-run-lot/curl" "$T/bin/"
+chmod +x "$T/bin/claude" "$T/bin/gh" "$T/bin/curl"
 cp "$RACINE/run-lot.sh" "$T/run-lot.sh"  # ses créneaux (slots/) restent dans le dossier de l'essai
 cat >"$T/run-lot.conf" <<EOF
 PATH_LOT="$T/bin:/usr/local/bin:/usr/bin:/bin"
@@ -32,6 +32,9 @@ AGENTS_RE='^essai-aucun-agent-'
 REGLES_ARBITRAGE="$T/regles.md"
 NOM_DEV="Dev"
 ATTENTE_ECHEC_S=1
+TRELLO_LISTE_WIP=a1a1
+TRELLO_LISTE_ATTENTE=b2b2
+TRELLO_LISTE_FINIE=c3c3
 EOF
 echo "1. La sécurité des utilisateurs." >"$T/regles.md"
 cat >"$T/lot/lot.conf" <<EOF
@@ -39,22 +42,25 @@ VERSION=1.0.0; REL=release/1.0.0; PREFIX=essai-100
 REPO_BACK=$T/back
 REPO_FRONT=$T/front
 LOGS=$T/logs
-declare -A CARTE=()
+declare -A CARTE=([1]=k1 [2]=k2 [3]=k3)
 EOF
 cat >"$T/lot/etapes.txt" <<'EOF'
 P1 PRE back - etude/1.0.0 release/1.0.0
 A1 A back 1 feat/1.0.0-lot release/1.0.0
 B1 B front 2 feat/1.0.0-lot release/1.0.0
+R3 FIN back 3 feat/1.0.0-lot release/1.0.0
 FINB FIN back - feat/1.0.0-lot release/1.0.0
 FINF FIN front - feat/1.0.0-lot release/1.0.0
 EOF
 echo "Étape P1 : mesure, puis écris tes questions." >"$T/lot/step-P1.md"
-for s in A1 B1 FINB FINF; do echo "Étape $s : ajoute le fichier $s.txt. Base : release/1.0.0." >"$T/lot/step-$s.md"; done
+for s in A1 B1 R3 FINB FINF; do echo "Étape $s : ajoute le fichier $s.txt. Base : release/1.0.0." >"$T/lot/step-$s.md"; done
 echo "Carte 1 : un fichier au back." >"$T/lot/card-1.md"
 echo "Carte 2 : un fichier au front." >"$T/lot/card-2.md"
+echo "Carte 3 : un fichier au back, après la fusion." >"$T/lot/card-3.md"
 echo "# Cadre commun (back)" >"$T/lot/common-back.md"
 echo "# Cadre commun (front)" >"$T/lot/common-front.md"
-export RUN_LOT_CONFIG="$T/run-lot.conf" GH_ETAT="$T/gh.json"
+export RUN_LOT_CONFIG="$T/run-lot.conf" GH_ETAT="$T/gh.json" TRELLO_ETAT="$T/trello" TRELLO_API_KEY=k TRELLO_TOKEN=t
+mkdir -p "$T/trello" && for k in k1 k2 k3; do echo d4d4 >"$T/trello/$k"; done  # cartes en Not Ready
 CHAINE_PRE=$T/logs/essai-100-pre-chain.log
 CHAINE=$T/logs/essai-100-impl-chain.log
 
@@ -82,7 +88,7 @@ printf "## Réponses de l'humain\n2. Non.\n" >>"$T/lot/arbitrages.md"
 echo "3. voies A et B en parallèle, FIN, CI de fin de lot"
 bash "$T/run-lot.sh" "$T/lot" impl >/dev/null 2>&1
 verifier '[ $? -eq 0 ]' "run-lot impl : sortie 0"
-for s in A1 B1 FINB FINF; do
+for s in A1 B1 R3 FINB FINF; do
   verifier "grep -q 'OK étape $s : ' \"\$CHAINE\"" "étape $s poussée"
 done
 verifier 'grep -q "\[voie A\] === étape A1" "$CHAINE" && grep -q "\[voie B\] === étape B1" "$CHAINE"' "A1 et B1 dans leurs voies"
@@ -96,6 +102,10 @@ verifier 'grep -q "ci-en-pause" "$GH_ETAT"' "étiquette bien posée à un moment
 verifier 'grep -q "celle qu.utilise le relecteur" "$T/logs/essai-100-FINB.prompt.md"' "grille de revue citée dans le cadre de FIN"
 verifier '! grep -q "Avant chaque poussée, lance" "$T/logs/essai-100-A1.prompt.md"' "sans VERIF : aucune vérification demandée"
 verifier '[ -s "$T/logs/essai-100-passation-A1.md" ]' "note de passation écrite par la passe"
+verifier '[ "$(cat "$T/trello/k1")" = b2b2 ] && [ "$(cat "$T/trello/k2")" = b2b2 ]' "Trello : cartes des voies A et B en Waiting for review"
+verifier '[ "$(cat "$T/trello/k3")" = b2b2 ]' "Trello : carte placée en FIN en Waiting for review"
+verifier 'awk "/Trello : carte 3 \\(k3\\) en Waiting for review/ {t = NR} /phase FIN terminée/ {f = NR} END {exit !(t && t < f)}" "$CHAINE"' \
+  "carte de FIN déplacée dès la fin de sa passe, avant le balayage final"
 
 echo
 if [ "$ECHECS" -eq 0 ]; then echo "TOUT PASSE"; else echo "$ECHECS échec(s) ; journal :"; cat "$CHAINE" 2>/dev/null | tail -30; fi

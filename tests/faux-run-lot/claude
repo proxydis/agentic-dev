@@ -4,6 +4,7 @@
 « ajoute le fichier X » : crée X, commite, pousse la branche courante et ouvre la PR du lot (dans l'état du faux gh)
 la première fois. « écris tes questions » : écrit questions-arbitrage.md à l'endroit que le cadre de la passe PRE
 indique. Écrit aussi la note de passation demandée par le cadre des voies."""
+import fcntl
 import json
 import os
 import re
@@ -29,10 +30,14 @@ if m:
     git("push", "-q", "origin", branche)
     depot = os.path.basename(git("rev-parse", "--show-toplevel"))
     base = re.search(r"Base : (\S+?)\.(?:\s|$)", prompt).group(1)
-    etat = json.load(open(etat_gh)) if os.path.exists(etat_gh) else {"prs": [], "runs": [], "appels": []}
-    if not any(p["depot"] == depot and p["branche"] == branche for p in etat["prs"]):
-        etat["prs"].append({"depot": depot, "num": len(etat["prs"]) + 1, "branche": branche, "base": base, "labels": []})
-    json.dump(etat, open(etat_gh, "w"), indent=1)
+    with open(etat_gh + ".verrou", "w") as verrou:  # le faux gh écrit le même état, depuis l'autre voie
+        fcntl.flock(verrou, fcntl.LOCK_EX)
+        etat = json.load(open(etat_gh)) if os.path.exists(etat_gh) else {"prs": [], "runs": [], "appels": []}
+        if not any(p["depot"] == depot and p["branche"] == branche for p in etat["prs"]):
+            etat["prs"].append({"depot": depot, "num": len(etat["prs"]) + 1, "branche": branche, "base": base,
+                                "labels": []})
+        json.dump(etat, open(etat_gh + ".tmp", "w"), indent=1)
+        os.replace(etat_gh + ".tmp", etat_gh)
 
 m = re.search(r"dans `([^`]*questions-arbitrage\.md)`", prompt)
 if m and "écris tes questions" in prompt:

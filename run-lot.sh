@@ -246,18 +246,20 @@ trello_wip() { trello_vers "$1" "$LISTE_WIP" "Work in progress"; }
 trello_attente() {  # <cartes> <repo> <branche>
   local dir=$REPO_BACK n c
   case $3 in *-vB) return 0 ;; esac
+  [ "$1" = - ] && return 0  # étape de FIN sans carte (fusion, suites complètes) : rien à déplacer
   [ "$2" = front ] && dir=$REPO_FRONT
   n=$(cd "$dir" && gh pr list --head "$3" --base "$REL" --state open --json number --jq '.[0].number // empty' 2>/dev/null)
   [ -n "$n" ] || return 0
   for c in ${1//,/ }; do [ "$c" = "-" ] || trello_vers "$c" "$LISTE_ATTENTE" "Waiting for review"; done
 }
-# Balayage après la FIN : les cartes de toutes les étapes A et B réussies, -vB comprises (fusionnées), passent en
-# Waiting for review si l'appli a sa PR de lot. Rattrape aussi une étape poussée avant l'ouverture de la PR.
+# Balayage après la FIN : les cartes de toutes les étapes A, B et FIN réussies, -vB comprises (fusionnées), passent en
+# Waiting for review si l'appli a sa PR de lot. Rattrape aussi une étape poussée avant l'ouverture de la PR. Une carte
+# placée en FIN (un renommage général fait après la fusion, par exemple) restait sinon en Work in progress.
 balayer_cartes() {
   local nom phase repo cartes br reste avec
   avec=$(prs_du_lot | awk '{print $4}')
   grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | while read -r nom phase repo cartes br reste; do
-    { [ "$phase" = A ] || [ "$phase" = B ]; } && [ "$cartes" != "-" ] || continue
+    { [ "$phase" = A ] || [ "$phase" = B ] || [ "$phase" = FIN ]; } && [ "$cartes" != "-" ] || continue
     grep -qx "$nom" "$LOGS/$PREFIX-ok.txt" 2>/dev/null || continue
     grep -qx "$(workflow_de "$repo")" <<<"$avec" || continue
     for c in ${cartes//,/ }; do trello_vers "$c" "$LISTE_ATTENTE" "Waiting for review"; done
@@ -423,7 +425,7 @@ etape() {
       note "OK étape $nom : $repo $br poussée en ${dist:0:7} (${duree}s)"; rendre_creneau
       echo "$nom" >"$LOGS/$PREFIX-derniere-$phase"
       echo "$nom" >>"$LOGS/$PREFIX-ok.txt"
-      { [ "$phase" = A ] || [ "$phase" = B ]; } && trello_attente "$carte" "$repo" "$br"
+      { [ "$phase" = A ] || [ "$phase" = B ] || [ "$phase" = FIN ]; } && trello_attente "$carte" "$repo" "$br"
       [ "$phase" = A ] || [ "$phase" = B ] && { [ -s "$LOGS/$PREFIX-passation-$nom.md" ] || note "$nom : pas de note de passation écrite"; }
       return 0
     fi
