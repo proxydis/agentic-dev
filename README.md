@@ -27,13 +27,13 @@ The scripts, their messages and the prompts they build are in French.
 | 4 | Blocking question | dev → human | A question the rules cannot settle stops the cycle (`cycle-lot arret`) |
 | 5 | End-of-batch CI | `run-lot.sh` | Unit and e2e tests, quality and security analysis, once, on the final heads of the PRs |
 | 6 | Red CI | dev | The dev fixes it before asking for review: `cycle-lot passe` refuses a CI that is not green |
-| 7 | Review | reviewer | Code review, tests, Playwright journeys on the deployed batch; verdict MERGE or REWORK. A rework review only reads the diff since the reviewed head |
-| 8 | Rework | dev | Every point, blocking or not, on the same PRs |
-| 9 | 7 ↔ 8 | | Automatic until MERGE; stops at the 3rd REWORK |
+| 7 | Review | reviewer | Code review, tests, Playwright journeys on the deployed batch; verdict MERGE or REWORK. The first review requires the dev's real-world evidence (`passe --reel`). A rework review only reads the diff since the reviewed head |
+| 8 | Rework | dev | Reviews 1 and 2: every point, blocking or not. From the 3rd review: blocking points only, each non-blocking point is a card of the next batch. The dev fixes the family of each defect, not the single case, and a separate pass re-reads the rework diff (`passe --contre-relecture`) |
+| 9 | 7 ↔ 8 | | Automatic until MERGE; stops at the 5th REWORK |
 | 10 | Batch merge | reviewer, relay | The MERGE verdict immediately merges each PR into the release (squash, back first); the relay adds the release commit (CHANGELOG, version) |
 | 11 | Delivery | relay | Green release: the relay opens the 4 PRs, release into `develop` and `master`, back and front. The dev only steps in while a human action is still pending |
 | 12 | Delivery review | relay or reviewer | Green CI and content limited to the reviewed batch: the relay merges the 4 PRs. Otherwise the reviewer checks and merges |
-| 13 | Production | relay, then dev | CI of `develop` and `master` (deployment included), then the list of visual checks to run in production |
+| 13 | Production | relay, then dev | CI of `develop` and `master` (deployment included), then the deployment settings declared during the batch, set and proven by the dev, and the list of visual checks to run in production |
 | 14 | Production checks | reviewer | Playwright on production, one Trello card per defect, in the next version, in Not Ready |
 
 Trello follows the cycle: Work in progress at start, Waiting for review as soon as a pass is pushed to the batch PR
@@ -47,10 +47,37 @@ verdict, every read of the board (relay, `passe`, `verdict`) aligns the batch ca
 leaves the batch (one journal line, out of the progress total, "Sorties du lot" in `cycle-lot etat`) and comes back if
 it is given the batch version again.
 
+**Review rule.** At most 5 round trips (`max_aller_retours`). At reviews 1 and 2, everything gets fixed: REWORK as
+soon as a blocking or non-blocking point remains. From the 3rd review on (`revue_report_non_bloquants`), only a
+blocking point sends the batch back; the reviewer turns each non-blocking point into a card of the next batch
+(`cycle-lot carte-report`) during the review, and the dev only fixes the blocking points. `verdict` takes
+`--bloquants` and `--non-bloquants` and refuses inconsistent verdicts: REWORK without the number of blocking points,
+MERGE with non-blocking points at reviews 1 and 2, REWORK without a blocking point from the 3rd review, more
+non-blocking points than cards created during the review. A point found after the 1st review in code unchanged since
+then is non-blocking, unless it touches security.
+
+**Before the review.** The first handover to review requires the real-world evidence of the batch (`passe --reel
+<file>`): for each card that depends on an external service (AI model, hosted database, e-mail, captcha, data source,
+storage), the command or journey played on pre-production and its result, or `--reel aucun`. A human action without
+which a card cannot be checked for real is declared with `intervention --ajouter … --avant revue`: the review is
+refused until it is done, or until the cards that depend on it are deferred. After a rework, `passe` requires the
+report of a counter-review (`--contre-relecture <file>`): a separate pass that read the rework diff with the review
+grid, asking only what the fix breaks, misses or lets through.
+
+**Short lane.** After the batch is merged, a fix that only touches CI, tests or documentation is recognized from its
+files (`motif_voie_courte`): reviewed on its diff, with no preview deployment and no counter-review, outside the
+round-trip counter. The 3rd REWORK in a row on the short lane stops the cycle (`max_voie_courte`).
+
+**Deployment settings.** Environment variables, workflows to run, data to republish or migrations that a card
+requires are declared during the batch (`cycle-lot reglage <v> --ajouter …`), by the dev or the reviewer. A setting
+only written in a PR description gets forgotten at delivery: the handover to production checks is refused until each
+setting is marked done with its proof (`reglage <v> --fait N --preuve …`), and the reviewer checks them first.
+
 **Stops.** The cycle stops on a blocking question, when the human has to act (environment variable, token,
-account…), and at the 3rd REWORK verdict. Questions and required human actions are raised at the start of the batch,
-not halfway through. On a stop, the relay posts a notice in the thread naming the agent to mention; the human answers
-by mentioning it, and that agent resumes the cycle (`cycle-lot reprise`).
+account…), at the 5th REWORK verdict, and at the 3rd REWORK in a row on the short lane. Questions and required human
+actions are raised at the start of the batch, not halfway through. On a stop, the relay posts a notice in the thread
+naming the agent to mention, and sends it to the human as a direct message too; the human answers in the thread by
+mentioning that agent, which resumes the cycle (`cycle-lot reprise`).
 
 ## Why a relay
 
@@ -62,7 +89,16 @@ Here, no agent ever waits:
   schedules the next agent's wake-up;
 - the relay (`cycle-lot veille`, every 2 minutes, under systemd) performs the wake-ups and owns every wait, which
   only depends on GitHub;
-- an agent that stops showing signs of life is nudged twice, then the human is alerted in the thread.
+- an agent that stops showing signs of life is nudged twice, then the human is alerted in the thread and by direct
+  message, again every 2 hours (5 reminders at most). Any sign of life (a job or a turn) re-arms the nudges;
+- when the CI of the batch PRs is green on heads the reviewer has not seen, with no job or turn from the dev and no
+  handover, the relay wakes the dev after 15 minutes instead of 45 (twice at most per set of heads);
+- a red run on the code is acted on at once, without waiting for the other repository's runs. Without any red, a
+  wait past the step's cap only posts a notice; the stop comes at twice the cap (runs queued on a single runner are
+  not an outage);
+- at the first green release CI of a batch, the relay compares the longest measured duration of each CI job and
+  capped step with its `timeout-minutes`, and posts a notice for those above 80% (`cycle-lot marges` shows the same
+  table on demand).
 
 The wake-up goes through the OpenClaw gateway `agent` RPC, into the agent's session for the batch's Slack thread, and
 the agent's reply is posted there. It runs from the systemd service, not from an agent's exec: the gateway refuses to
@@ -86,6 +122,14 @@ context into the cache: that is most of a turn's cost, far more than the work it
   a red CI wakes the reviewer.
 - **Targeted rework review.** The verdict records the head of each reviewed PR; on the next review, the relay gives the
   reviewer the `git diff <reviewed head>..<current head>` range of each PR instead of asking for a full review.
+- **Preview deployment only.** The preview dispatch passes `deploiement_seul=true` (input name:
+  `deploiement_preview.entree_deploiement_seul`): the workflow can skip its tests when the commit already has a green
+  run, which is the case after `passe`. A workflow without that input refuses the dispatch, and the relay runs it
+  again without it.
+- **Already validated content.** A workflow may skip its test jobs when the same git tree already has a green run (a
+  delivery PR, a push to `develop` or `master`). It then runs a marker job (`job_deja_valide`, default
+  `contenu-deja-valide`) whose success makes the skipped jobs listed in `jobs_sautables` acceptable. Without the
+  marker, a skipped required job is still a missing job.
 - **Review job without progress monitoring.** `claude --print --disallowedTools Monitor`: progress notifications woke
   the review orchestrator for nothing; only sub-agent and background command completions wake it.
 
@@ -145,14 +189,17 @@ Machine settings: [`run-lot.example.conf`](run-lot.example.conf), to copy as `ru
 | Command | Who | Effect |
 |---|---|---|
 | `debut <v> --session-key <key>` | dev, when the human asks | Creates the batch state, cards to Work in progress |
-| `passe <v> --vers <reviewer> --message …` | dev | End of development or rework: green CI required, batch back end deployed to preview (when `deploiement_preview` is configured), then review |
-| `verdict <v> --merger\|--a-reprendre --rapport <f> [--cartes-ok …] [--cartes-ko …]` | reviewer | End of review; `--merger` immediately merges the batch PRs; automatic stop at the 3rd REWORK |
+| `passe <v> --vers <reviewer> --message … [--reel <f>\|aucun] [--contre-relecture <f>]` | dev | End of development or rework: green CI required, real-world evidence at the first review, counter-review after a rework, batch back end deployed to preview (when `deploiement_preview` is configured), then review. A short-lane fix skips the preview and the counter-review |
+| `verdict <v> --merger\|--a-reprendre --rapport <f> [--bloquants N] [--non-bloquants N] [--cartes-ok …] [--cartes-ko …]` | reviewer | End of review; `--merger` immediately merges the batch PRs; inconsistent verdicts refused; automatic stop at the 5th REWORK |
 | `merge <v> --pr back#N` | reviewer | Guarded merge: head unchanged since the review, green CI, back before front; after a merge refused at the verdict, or in delivery review |
 | `ouvrir-livraison <v>` | dev | The 4 delivery PRs, when the relay could not open them; refused while a human action is still pending |
 | `passe <v> --vers <reviewer> --etape validation-prod --fichier <list>` | dev | List of visual checks in production |
-| `carte-bug <v> --titre … --appli … --gravite … --description-fichier …` | reviewer | Bug card in the next version, in Not Ready |
+| `carte-bug <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | reviewer | Bug card in the next version (or the given later one), in Not Ready |
+| `carte-report <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | reviewer or dev | Point deferred to a later batch, at any step: non-blocking point from the 3rd review, old defect out of scope, leftover decided by the human |
+| `reglage <v> [--ajouter … \| --fait N --preuve …]` | dev or reviewer | Deployment settings: declared during the batch, required before production checks; without an option, the list |
+| `marges [--ref develop]` | anyone | Longest measured duration of each CI job and capped step over the last green runs, against its `timeout-minutes` |
 | `fin <v> --rapport <f>` | reviewer | Batch delivered and validated |
-| `arret`, `reprise`, `intervention`, `programmer`, `reveiller` | | Stop and resume, human actions, deferred start, manual wake-up |
+| `arret`, `reprise`, `intervention [--avant revue]`, `programmer`, `reveiller` | | Stop and resume, human actions (required before the review with `--avant revue`, before delivery by default), deferred start, manual wake-up |
 | `etat [<v>] [--json]` | anyone | Read only |
 | `veille` | relay | One pass of the timer |
 
@@ -173,7 +220,21 @@ as a relay error.
 1. Copy [`cycle-lot.example.json`](cycle-lot.example.json) to `cycle-lot.json` and fill it in: the OpenClaw ids of
    both agents and of the account that posts the relay's notices, the human (name, Slack id), the GitHub repositories
    and required CI jobs, production and preview URLs, Trello lists and labels. Trello keys are read from the
-   environment (`TRELLO_API_KEY`, `TRELLO_TOKEN`) or from the OpenClaw config.
+   environment (`TRELLO_API_KEY`, `TRELLO_TOKEN`) or from the OpenClaw config. Optional keys, with their default:
+
+   | Key | Default | Role |
+   |---|---|---|
+   | `max_aller_retours` | 5 | REWORK verdicts before the cycle stops |
+   | `revue_report_non_bloquants` | 3 | Review from which non-blocking points become next-batch cards |
+   | `max_voie_courte` | 3 | REWORK verdicts in a row on the short lane before the cycle stops |
+   | `motif_voie_courte` | CI, tests, docs | Regular expression on file paths: a post-merge fix whose files all match takes the short lane |
+   | `job_deja_valide` | `contenu-deja-valide` | Marker job of a workflow that skipped its tests on already validated content |
+   | `jobs_sautables` | `["quality", "e2e"]` | Required jobs that may be skipped when the marker job succeeded |
+   | `deploiement_preview.entree_deploiement_seul` | `deploiement_seul` | `workflow_dispatch` input for a deployment only; empty: plain dispatch |
+   | `relais.ci_verte_min` | 15 | Minutes of green CI without handover before the dev's targeted wake-up |
+   | `relais.rappel_alerte_min`, `relais.nb_rappels_alerte` | 120, 5 | Reminders of an unanswered alert, in the thread and by direct message |
+   | `relais.seuil_marge` | 0.8 | Share of a `timeout-minutes` above which a CI duration gets a notice |
+   | `slack_archives` | none | `https://<workspace>.slack.com/archives`: link to the thread in direct messages; absent, the message has no link (`CYCLE_LOT_SLACK_ARCHIVES` overrides it) |
 2. Make the command available to the agents: `ln -s ~/agentic-dev/cycle-lot ~/.local/bin/cycle-lot`.
 3. Install the relay: copy [`systemd/`](systemd) into `~/.config/systemd/user/`, adjust the path, then
    `systemctl --user enable --now cycle-lot-relais.timer`.
@@ -186,7 +247,9 @@ as a relay error.
    - any work longer than 30 minutes runs in a `<agent>-<prefix>-…` unit (`dev-100-impl`, `relecteur-100-rev1`),
      otherwise the relay thinks the agent is idle and nudges it;
    - the thread session is reset at every step: whatever a later step needs goes into the batch folder or a report,
-     never only into the thread.
+     never only into the thread;
+   - from the review rule's report threshold on, the reviewer creates one `carte-report` per non-blocking point
+     before the verdict, and the dev only fixes the blocking points.
 5. The shared review grid is [`GRILLE-REVUE.md`](GRILLE-REVUE.md), and the arbitration rules
    [`regles-arbitrage.example.md`](regles-arbitrage.example.md), to copy as `regles-arbitrage.md`.
 
@@ -199,8 +262,8 @@ Linux with user-mode systemd (cgroups v2), Python 3.11 or later (standard librar
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (80 checks)
-bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories (22 checks, ~1 min)
+python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (134 checks)
+bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories (26 checks, ~1 min)
 ```
 
 Neither calls a real service: fake `gh`, `openclaw`, `systemctl` and `claude` commands and a fake Trello API share a

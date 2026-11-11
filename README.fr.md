@@ -27,13 +27,13 @@ fichiers de configuration non versionnés.
 | 4 | Arbitrage bloquant | dev → humain | Une question que les règles ne tranchent pas arrête le cycle (`cycle-lot arret`) |
 | 5 | CI de fin de lot | `run-lot.sh` | Tests unitaires et e2e, qualité et sécurité, une fois, sur les têtes finales des PR |
 | 6 | CI rouge | dev | Le dev corrige avant de demander la revue : `cycle-lot passe` refuse une CI qui n'est pas verte |
-| 7 | Revue | relecteur | Relecture, tests, parcours Playwright sur la version déployée du lot ; verdict À MERGER ou À REPRENDRE. Une revue de correction ne relit que le diff depuis la tête revue |
-| 8 | Correction | dev | Tous les points, bloquants et non bloquants, sur les mêmes PR |
-| 9 | 7 ↔ 8 | | Automatique jusqu'à À MERGER ; arrêt au 3e À REPRENDRE |
+| 7 | Revue | relecteur | Relecture, tests, parcours Playwright sur la version déployée du lot ; verdict À MERGER ou À REPRENDRE. La 1re revue exige les preuves en réel du dev (`passe --reel`). Une revue de correction ne relit que le diff depuis la tête revue |
+| 8 | Correction | dev | Revues 1 et 2 : tous les points, bloquants et non bloquants. À partir de la 3e revue : les bloquants seuls, chaque non bloquant devient une carte du lot suivant. Le dev corrige la famille de chaque défaut, pas le seul cas, et une passe distincte relit le diff de la reprise (`passe --contre-relecture`) |
+| 9 | 7 ↔ 8 | | Automatique jusqu'à À MERGER ; arrêt au 5e À REPRENDRE |
 | 10 | Merge du lot | relecteur, relais | Le verdict À MERGER merge aussitôt chaque PR dans la release (squash, back d'abord) ; le relais pose le commit de release (CHANGELOG, version) |
 | 11 | Livraison | relais | Release verte : le relais ouvre les 4 PR, release vers `develop` et `master`, back et front. Le dev ne s'en charge que si une intervention de l'humain reste ouverte |
 | 12 | Revue de livraison | relais ou relecteur | CI verte et contenu limité au lot revu : le relais merge les 4 PR. Sinon le relecteur vérifie et merge |
-| 13 | Mise en production | relais, puis dev | CI de `develop` et `master` (déploiement compris), puis liste des validations visuelles à faire en production |
+| 13 | Mise en production | relais, puis dev | CI de `develop` et `master` (déploiement compris), puis réglages de déploiement déclarés pendant le lot, posés et prouvés par le dev, et liste des validations visuelles à faire en production |
 | 14 | Validation en production | relecteur | Playwright sur la production, une carte Trello par défaut, dans la version suivante, en Not Ready |
 
 Trello suit le cycle : Work in progress au démarrage, Waiting for review dès qu'une passe est poussée dans la PR du
@@ -47,10 +47,39 @@ verdict À MERGER, chaque lecture du tableau (relais, `passe`, `verdict`) aligne
 carte sort du lot (une ligne au journal, hors du total de l'avancement, « Sorties du lot » dans `cycle-lot etat`) et y
 revient si on lui rend la version du lot.
 
+**Règle de revue.** 5 aller-retours au plus (`max_aller_retours`). Aux revues 1 et 2, tout se corrige : À REPRENDRE
+dès qu'il reste un point bloquant ou non bloquant. À partir de la 3e revue (`revue_report_non_bloquants`), seul un
+point bloquant renvoie le lot ; le relecteur fait de chaque point non bloquant une carte du lot suivant (`cycle-lot
+carte-report`) pendant la revue, et le dev ne corrige que les bloquants. `verdict` prend `--bloquants` et
+`--non-bloquants` et refuse les verdicts incohérents : À REPRENDRE sans le nombre de bloquants, À MERGER avec des non
+bloquants aux revues 1 et 2, À REPRENDRE sans bloquant à partir de la 3e revue, plus de non bloquants que de cartes
+créées pendant la revue. Un point découvert après la 1re revue dans du code inchangé depuis est non bloquant, sauf
+s'il touche la sécurité.
+
+**Avant la revue.** Le premier passage en revue exige les preuves en réel du lot (`passe --reel <fichier>`) : pour
+chaque carte qui dépend d'un service externe (modèle d'IA, base de données hébergée, e-mail, captcha, source de
+données, stockage), la commande ou le parcours joué sur la préproduction et son résultat, ou `--reel aucun`. Une
+intervention de l'humain sans laquelle une carte ne peut pas être vérifiée en réel se déclare avec `intervention
+--ajouter … --avant revue` : la revue est refusée tant qu'elle n'est pas faite, ou que les cartes qui en dépendent ne
+sont pas reportées. Après une correction, `passe` exige le rapport d'une contre-relecture (`--contre-relecture
+<fichier>`) : une passe distincte qui a relu le diff de la reprise avec la grille de revue, avec pour seule question
+ce que la correction casse, oublie ou laisse passer.
+
+**Voie courte.** Après le merge du lot, un correctif qui ne touche que la CI, les tests ou la documentation est reconnu
+à ses fichiers (`motif_voie_courte`) : relu sur son diff, sans déploiement de preview ni contre-relecture, hors
+compteur d'aller-retours. Le 3e À REPRENDRE de suite en voie courte arrête le cycle (`max_voie_courte`).
+
+**Réglages de déploiement.** Les variables d'environnement, workflows à lancer, données à republier ou migrations
+qu'une carte suppose se déclarent pendant le lot (`cycle-lot reglage <v> --ajouter …`), par le dev ou le relecteur. Un
+réglage écrit seulement dans une PR s'oublie à la livraison : le passage aux validations en production est refusé tant
+que chaque réglage n'est pas marqué fait avec sa preuve (`reglage <v> --fait N --preuve …`), et le relecteur les
+vérifie en premier.
+
 **Arrêts.** Le cycle s'arrête sur un arbitrage bloquant, sur une intervention nécessaire de l'humain (variable
-d'environnement, jeton, compte…) et au 3e verdict À REPRENDRE. Les arbitrages et les interventions se signalent dès le
-démarrage du lot, pas au milieu. À l'arrêt, le relais poste un avis dans le fil et nomme l'agent à mentionner ; l'humain
-répond en le mentionnant, et l'agent relance le cycle (`cycle-lot reprise`).
+d'environnement, jeton, compte…), au 5e verdict À REPRENDRE et au 3e À REPRENDRE de suite en voie courte. Les
+arbitrages et les interventions se signalent dès le démarrage du lot, pas au milieu. À l'arrêt, le relais poste un
+avis dans le fil, nomme l'agent à mentionner et l'envoie aussi à l'humain en message direct ; l'humain répond dans le
+fil en mentionnant cet agent, qui relance le cycle (`cycle-lot reprise`).
 
 ## Pourquoi un relais
 
@@ -62,7 +91,16 @@ silence. Ici, aucun agent n'attend jamais :
   planifie le réveil du suivant ;
 - le relais (`cycle-lot veille`, toutes les 2 min, sous systemd) exécute les réveils et tient toutes les attentes, qui
   ne dépendent que de GitHub ;
-- un agent qui ne donne plus signe de vie est relancé deux fois, puis l'humain est prévenu dans le fil.
+- un agent qui ne donne plus signe de vie est relancé deux fois, puis l'humain est prévenu dans le fil et en message
+  direct, de nouveau toutes les 2 h (5 rappels au plus). Tout signe de vie (un job ou un tour) réarme les relances ;
+- quand la CI des PR du lot est verte sur des têtes que le relecteur n'a pas vues, sans job ni tour du dev et sans
+  passage de main, le relais réveille le dev au bout de 15 min au lieu de 45 (deux fois au plus par jeu de têtes) ;
+- un run rouge sur du code est traité aussitôt, sans attendre les runs de l'autre dépôt. Sans aucun rouge, une attente
+  au-delà du plafond de l'étape ne donne qu'un avis ; l'arrêt vient au double du plafond (des runs en file sur un
+  runner unique ne sont pas une panne) ;
+- à la première CI de release verte d'un lot, le relais compare la plus longue durée mesurée de chaque job et de
+  chaque étape plafonnée de la CI à son `timeout-minutes`, et poste un avis pour celles qui dépassent 80 % (`cycle-lot
+  marges` donne le même tableau à la demande).
 
 Le réveil passe par le RPC `agent` du gateway OpenClaw, dans la session de l'agent pour le fil Slack du lot, et sa
 réponse y est postée. Il part du service systemd et non de l'exec d'un agent : le gateway refuse qu'un agent réveille
@@ -85,6 +123,14 @@ contexte en cache : c'est l'essentiel du coût d'un tour, bien plus que le trava
   fil ; un écart ou une CI rouge réveille le relecteur.
 - **Revue de correction ciblée.** Le verdict enregistre la tête de chaque PR revue ; à la revue suivante, le relais
   donne au relecteur la plage `git diff <tête revue>..<tête actuelle>` de chaque PR, et non une nouvelle revue complète.
+- **Déploiement de preview seul.** Le dispatch de la preview passe `deploiement_seul=true` (nom de l'entrée :
+  `deploiement_preview.entree_deploiement_seul`) : le workflow peut sauter ses tests quand le commit a déjà un run
+  vert, ce qui est le cas après `passe`. Un workflow sans cette entrée refuse le dispatch, et le relais le relance
+  sans elle.
+- **Contenu déjà validé.** Un workflow peut sauter ses jobs de test quand le même arbre git a déjà un run vert (PR de
+  livraison, push sur `develop` ou `master`). Il fait alors tourner un job marqueur (`job_deja_valide`, par défaut
+  `contenu-deja-valide`) dont le succès rend acceptables les jobs sautés listés dans `jobs_sautables`. Sans le
+  marqueur, un job requis sauté reste un manque.
 - **Job de revue sans suivi d'avancement.** `claude --print --disallowedTools Monitor` : les notifications d'avancement
   réveillaient l'orchestrateur de revue pour rien ; seules les fins de sous-agents et de commandes le réveillent.
 
@@ -145,14 +191,17 @@ Réglages de la machine : [`run-lot.example.conf`](run-lot.example.conf), à cop
 | Commande | Qui | Effet |
 |---|---|---|
 | `debut <v> --session-key <clé>` | dev, sur demande de l'humain | Crée l'état du lot, cartes en Work in progress |
-| `passe <v> --vers <relecteur> --message …` | dev | Fin du dev ou d'une correction : CI verte exigée, back du lot déployé sur la preview (si `deploiement_preview` est configuré), puis revue |
-| `verdict <v> --merger\|--a-reprendre --rapport <f> [--cartes-ok …] [--cartes-ko …]` | relecteur | Fin de revue ; `--merger` merge aussitôt les PR du lot ; arrêt automatique au 3e À REPRENDRE |
+| `passe <v> --vers <relecteur> --message … [--reel <f>\|aucun] [--contre-relecture <f>]` | dev | Fin du dev ou d'une correction : CI verte exigée, preuves en réel à la 1re revue, contre-relecture après une correction, back du lot déployé sur la preview (si `deploiement_preview` est configuré), puis revue. Un correctif en voie courte se passe de preview et de contre-relecture |
+| `verdict <v> --merger\|--a-reprendre --rapport <f> [--bloquants N] [--non-bloquants N] [--cartes-ok …] [--cartes-ko …]` | relecteur | Fin de revue ; `--merger` merge aussitôt les PR du lot ; verdicts incohérents refusés ; arrêt automatique au 5e À REPRENDRE |
 | `merge <v> --pr back#N` | relecteur | Merge gardé : tête inchangée depuis la revue, CI verte, back avant front ; après un merge refusé au verdict, ou en revue de livraison |
 | `ouvrir-livraison <v>` | dev | Les 4 PR de livraison, quand le relais n'a pas pu les ouvrir ; refusé tant qu'une intervention de l'humain reste à faire |
 | `passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>` | dev | Liste des validations visuelles en production |
-| `carte-bug <v> --titre … --appli … --gravite … --description-fichier …` | relecteur | Carte de bug dans la version suivante, en Not Ready |
+| `carte-bug <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | relecteur | Carte de bug dans la version suivante (ou celle donnée, postérieure), en Not Ready |
+| `carte-report <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | relecteur ou dev | Point reporté à un lot suivant, à toute étape : non bloquant à partir de la 3e revue, défaut ancien hors périmètre, reste décidé par l'humain |
+| `reglage <v> [--ajouter … \| --fait N --preuve …]` | dev ou relecteur | Réglages de déploiement : déclarés pendant le lot, exigés avant les validations en production ; sans option, la liste |
+| `marges [--ref develop]` | tous | Plus longue durée mesurée de chaque job et de chaque étape plafonnée de la CI sur les derniers runs verts, face à son `timeout-minutes` |
 | `fin <v> --rapport <f>` | relecteur | Lot livré et validé |
-| `arret`, `reprise`, `intervention`, `programmer`, `reveiller` | | Arrêt et reprise, interventions de l'humain, lancement différé, réveil manuel |
+| `arret`, `reprise`, `intervention [--avant revue]`, `programmer`, `reveiller` | | Arrêt et reprise, interventions de l'humain (exigées avant la revue avec `--avant revue`, avant la livraison par défaut), lancement différé, réveil manuel |
 | `etat [<v>] [--json]` | tous | Lecture seule |
 | `veille` | relais | Le passage du timer |
 
@@ -172,7 +221,22 @@ comme une erreur du relais.
 1. Copier [`cycle-lot.example.json`](cycle-lot.example.json) en `cycle-lot.json` et le remplir : les identifiants
    OpenClaw des deux agents et du compte qui poste les avis du relais, l'humain (nom, identifiant Slack), les dépôts
    GitHub et les jobs de CI exigés, les URL de production et de preview, les listes et étiquettes Trello. Les clés
-   Trello se lisent dans l'environnement (`TRELLO_API_KEY`, `TRELLO_TOKEN`) ou dans la config d'OpenClaw.
+   Trello se lisent dans l'environnement (`TRELLO_API_KEY`, `TRELLO_TOKEN`) ou dans la config d'OpenClaw. Clés
+   facultatives, avec leur valeur par défaut :
+
+   | Clé | Défaut | Rôle |
+   |---|---|---|
+   | `max_aller_retours` | 5 | Verdicts À REPRENDRE avant l'arrêt du cycle |
+   | `revue_report_non_bloquants` | 3 | Revue à partir de laquelle les non bloquants deviennent des cartes du lot suivant |
+   | `max_voie_courte` | 3 | Verdicts À REPRENDRE de suite en voie courte avant l'arrêt |
+   | `motif_voie_courte` | CI, tests, docs | Expression régulière sur les chemins : un correctif d'après merge dont tous les fichiers y répondent passe en voie courte |
+   | `job_deja_valide` | `contenu-deja-valide` | Job marqueur d'un workflow qui a sauté ses tests sur un contenu déjà validé |
+   | `jobs_sautables` | `["quality", "e2e"]` | Jobs requis qui peuvent être sautés quand le job marqueur a réussi |
+   | `deploiement_preview.entree_deploiement_seul` | `deploiement_seul` | Entrée `workflow_dispatch` d'un déploiement seul ; vide : dispatch simple |
+   | `relais.ci_verte_min` | 15 | Minutes de CI verte sans passage de main avant le réveil ciblé du dev |
+   | `relais.rappel_alerte_min`, `relais.nb_rappels_alerte` | 120, 5 | Rappels d'une alerte restée sans réponse, dans le fil et en message direct |
+   | `relais.seuil_marge` | 0.8 | Part d'un `timeout-minutes` au-delà de laquelle une durée de CI donne un avis |
+   | `slack_archives` | aucun | `https://<espace>.slack.com/archives` : lien du fil dans les messages directs ; absent, le message part sans lien (`CYCLE_LOT_SLACK_ARCHIVES` prime) |
 2. Rendre la commande accessible aux agents : `ln -s ~/agentic-dev/cycle-lot ~/.local/bin/cycle-lot`.
 3. Installer le relais : copier [`systemd/`](systemd) dans `~/.config/systemd/user/`, adapter le chemin, puis
    `systemctl --user enable --now cycle-lot-relais.timer`.
@@ -185,7 +249,9 @@ comme une erreur du relais.
    - tout travail de plus de 30 min tourne dans une unit `<agent>-<prefixe>-…` (`dev-100-impl`, `relecteur-100-rev1`),
      sinon le relais croit l'agent inactif et le relance ;
    - la session du fil est remise à zéro à chaque étape : ce qui doit servir à une étape suivante s'écrit dans le
-     dossier du lot ou dans un rapport, jamais seulement dans le fil.
+     dossier du lot ou dans un rapport, jamais seulement dans le fil ;
+   - à partir du seuil de report de la règle de revue, le relecteur crée une `carte-report` par point non bloquant
+     avant le verdict, et le dev ne corrige que les bloquants.
 5. La grille de revue commune est [`GRILLE-REVUE.md`](GRILLE-REVUE.md), et les règles d'arbitrage
    [`regles-arbitrage.example.md`](regles-arbitrage.example.md), à copier en `regles-arbitrage.md`.
 
@@ -198,8 +264,8 @@ Slack pour `cycle-lot`. Les deux dépôts suivent un flux `develop` / `release/<
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (80 vérifications)
-bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux (22 vérifications, ~1 min)
+python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (134 vérifications)
+bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux (26 vérifications, ~1 min)
 ```
 
 Aucun des deux n'appelle un vrai service : de faux `gh`, `openclaw`, `systemctl`, `claude` et une fausse API Trello

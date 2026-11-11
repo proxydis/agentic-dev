@@ -28,7 +28,8 @@
   "deploiement_preview": {
     "depot": "back",
     "jobs_requis": ["quality", "deploy"],
-    "delai_min": 10
+    "delai_min": 10,
+    "entree_deploiement_seul": "deploiement_seul"
   },
   "etiquette_pause": "ci-en-pause",
   "urls": {
@@ -58,5 +59,12 @@
   },
   "doc_procedure": "AGENTS.md, section « Cycle de lot »",
   "grille_revue": "GRILLE-REVUE.md",
-  "max_aller_retours": 3
+  "max_aller_retours": 5,
+  "revue_report_non_bloquants": 3,
+  "max_voie_courte": 3,
+  "motif_voie_courte": "^(\\.github/|tests?/|e2e/|docs/|__tests__/)|(^|/)[^/]+\\.(test|spec|e2e)\\.[a-z]+$|\\.md$|(^|/)(vitest[^/]*|playwright)\\.config\\.[a-z]+$|(^|/)conftest\\.py$",
+  "job_deja_valide": "contenu-deja-valide",
+  "jobs_sautables": ["quality", "e2e"],
+  "relais": {"ci_verte_min": 15, "rappel_alerte_min": 120, "nb_rappels_alerte": 5, "seuil_marge": 0.8},
+  "slack_archives": "https://mon-espace.slack.com/archives"
 }

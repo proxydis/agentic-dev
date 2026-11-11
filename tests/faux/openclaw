@@ -40,7 +40,8 @@ elif a[:3] == ["gateway", "call", "sessions.reset"]:
     else:
         print(json.dumps({"ok": True, "key": params["key"]}))
 elif a[:2] == ["message", "send"]:
-    m.setdefault("avis", []).append(a[a.index("--message") + 1])
+    cible = a[a.index("--target") + 1]
+    m.setdefault("dm" if cible.startswith("user:") else "avis", []).append(a[a.index("--message") + 1])
     print(json.dumps({"ok": True}))
 else:
     print("faux openclaw : " + " ".join(a), file=sys.stderr)

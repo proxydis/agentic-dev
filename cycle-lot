@@ -21,11 +21,15 @@ et mergées par le relais quand elles n'apportent que le lot revu).
 
   cycle-lot debut <v> --session-key <clé du dev>        le dev, sur demande de l'humain : crée le cycle, cartes en WIP
   cycle-lot passe <v> --vers <relecteur> [--message …]  le dev : fin du dev ou d'une correction, CI verte exigée
+                    [--reel <fichier>|aucun] [--contre-relecture <rapport>]   1re revue / après une correction
   cycle-lot verdict <v> --merger|--a-reprendre …        le relecteur : fin de revue ; --merger merge aussitôt le lot
   cycle-lot merge <v> --pr back#N                       le relecteur : merge gardé (tête revue, CI verte, back d'abord)
   cycle-lot ouvrir-livraison <v>                        le dev : les 4 PR release -> develop/master (si le relais n'a pu)
   cycle-lot passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>   le dev : validations en prod
   cycle-lot carte-bug <v> --titre … --appli … --gravite … --description-fichier …   le relecteur : bug vu en prod
+  cycle-lot carte-report <v> --titre … --appli … --gravite … --description-fichier …   point reporté au lot suivant
+  cycle-lot reglage <v> --ajouter … | --fait N --preuve …   réglages de déploiement à poser à la livraison
+  cycle-lot marges [--ref develop]                      durées mesurées des jobs de CI face à leurs plafonds
   cycle-lot fin <v> --rapport <fichier>                 le relecteur : lot livré et validé
   cycle-lot arret <v> --motif … --message …             l'un ou l'autre : arbitrage bloquant, intervention humaine
   cycle-lot reprise <v> --decision …                    après la réponse de l'humain
@@ -86,6 +90,12 @@ WORKFLOW = {app: d["workflow"] for app, d in CONF["depots"].items()}
 REQUIS_LOT = {app: tuple(d.get("jobs_requis_lot", ())) for app, d in CONF["depots"].items()}
 REQUIS_MASTER = {app: tuple(d.get("jobs_requis_master", ())) for app, d in CONF["depots"].items()}
 REQUIS_PUSH = tuple(CONF.get("jobs_requis_push") or ("quality", "deploy"))
+# Promotion d'un contenu déjà validé : sur une PR de livraison, un push de livraison ou un déploiement de preview
+# seul, le workflow peut sauter ses jobs de test quand le même arbre git a déjà un run vert. Un job marqueur ne
+# tourne que dans ce cas : son succès dit que le saut est une décision du workflow, pas un accident. Sans ce job
+# dans le workflow, un job requis sauté reste un manque.
+MARQUEUR_DEJA_VALIDE = CONF.get("job_deja_valide", "contenu-deja-valide")
+JOBS_SAUTABLES = tuple(CONF.get("jobs_sautables") or ("quality", "e2e"))
 PAUSE = CONF.get("etiquette_pause", "ci-en-pause")
 URL_PROD = CONF["urls"]["production"]
 URL_PREVIEW = CONF["urls"]["preview"]
@@ -133,7 +143,26 @@ ETAPES = {
 INACTIF_MIN = 45          # sans job, sans tour en cours et sans changement d'étape : relance
 NB_RELANCES = 2           # puis alerte à l'humain
 ATTENTE_PREVIEW_MIN = int((PREVIEW or {}).get("delai_min", 10))  # après le déploiement vert, le temps que la preview bascule
-MAX_ALLER_RETOURS = int(CONF.get("max_aller_retours", 3))  # 3e verdict À REPRENDRE : arrêt
+# Règle de revue : N aller-retours au plus ; avant la revue REVUE_REPORT, tout se corrige ; à partir d'elle, seul un
+# point bloquant renvoie le lot, et chaque point non bloquant devient une carte du lot suivant (`carte-report`).
+MAX_ALLER_RETOURS = int(CONF.get("max_aller_retours", 5))  # au verdict À REPRENDRE n° MAX_ALLER_RETOURS : arrêt
+REVUE_REPORT = int(CONF.get("revue_report_non_bloquants", 3))  # revue à partir de laquelle les non bloquants sont reportés
+# Voie courte : après le merge du lot, un correctif qui ne touche que la CI, les tests ou la documentation est relu sur
+# son diff, sans déploiement de preview et hors compteur d'aller-retours. Sans elle, un simple correctif de délai de CI
+# consomme un aller-retour, et peut arrêter le lot au dernier.
+MAX_VOIE_COURTE = int(CONF.get("max_voie_courte", 3))  # À REPRENDRE de suite en voie courte : arrêt
+RE_VOIE_COURTE = re.compile(CONF.get("motif_voie_courte") or (
+    r"^(\.github/|tests?/|e2e/|docs/|__tests__/)|(^|/)[^/]+\.(test|spec|e2e)\.[a-z]+$|\.md$|"
+    r"(^|/)(vitest[^/]*|playwright)\.config\.[a-z]+$|(^|/)conftest\.py$"))
+# Relais : un développeur qui ne passe pas la main alors que la CI de ses PR est verte, des relances parties pendant
+# qu'il travaillait encore, une alerte postée une seule fois dans un fil que personne ne lit : le lot attend des heures.
+RELAIS_CONF = CONF.get("relais") or {}
+INACTIF_CI_VERTE_MIN = int(RELAIS_CONF.get("ci_verte_min", 15))  # CI verte sur les PR, personne au travail : réveil ciblé
+RAPPEL_ALERTE_MIN = int(RELAIS_CONF.get("rappel_alerte_min", 120))  # alerte à l'humain répétée, fil et message direct
+NB_RAPPELS_ALERTE = int(RELAIS_CONF.get("nb_rappels_alerte", 5))
+SEUIL_MARGE = float(RELAIS_CONF.get("seuil_marge", 0.8))  # durée d'un job de CI au-delà de 80 % de son plafond : avis
+# Lien du fil dans les messages directs à l'humain (« https://<espace>.slack.com/archives ») ; absent : pas de lien.
+SLACK_ARCHIVES = (os.environ.get("CYCLE_LOT_SLACK_ARCHIVES") or CONF.get("slack_archives") or "").rstrip("/")
 MAX_CI_ROUGES = 3         # CI de release ou de livraison rouge sur du code, 3 fois de suite : arrêt
 INTERVALLE_GH_MIN = float(os.environ.get("CYCLE_LOT_INTERVALLE_GH_MIN", "4"))  # attentes GitHub : 1 lecture / 4 min
 # Contexte neuf à chaque étape : avant un réveil qui ouvre une étape, le relais remet à zéro la session de l'agent dans
@@ -145,6 +174,15 @@ CONTEXTE_NEUF = os.environ.get("CYCLE_LOT_CONTEXTE_NEUF", "1") != "0"
 MOTIFS_ETAPE = {"revue", "correction", "livraison", "revue-livraison", "liste-validation", "validation-prod", "reprise",
                 "diagnostic"}
 ATTENTE_TOUR_MIN = 30     # un tour de l'agent tourne déjà : on attend sa fin pour remettre à zéro, au plus 30 min
+
+
+def revues_tout_se_corrige():
+    """« aux revues 1 et 2 » pour REVUE_REPORT = 3 : revues où tout point, bloquant ou non, se corrige."""
+    if REVUE_REPORT <= 2:
+        return "à la revue 1"
+    if REVUE_REPORT == 3:
+        return "aux revues 1 et 2"
+    return f"aux revues 1 à {REVUE_REPORT - 1}"
 
 
 class Refus(Exception):
@@ -327,16 +365,17 @@ def planifier_reveil(etat, agent, motif, texte=None, extra="", prefixe=""):
                            "contexte_neuf": CONTEXTE_NEUF and motif in MOTIFS_ETAPE, "contexte": None}
 
 
-def planifier_avis(etat, texte):
-    etat.setdefault("avis_en_attente", []).append({"texte": texte, "essais": 0})
+def planifier_avis(etat, texte, dm=False):
+    """dm : l'avis attend une action de l'humain (arrêt, agent muet) ; il lui est aussi envoyé en message direct."""
+    etat.setdefault("avis_en_attente", []).append({"texte": texte, "essais": 0, "dm": dm})
 
 
 def executer_en_attente(etat):
     """Service du relais seulement : avis à poster, puis réveil planifié (4 essais, puis avis à l'humain)."""
     restants = []
     for avis in etat.pop("avis_en_attente", None) or []:
-        if not poster(etat, avis["texte"]) and avis["essais"] < 3:
-            restants.append({"texte": avis["texte"], "essais": avis["essais"] + 1})
+        if not poster(etat, avis["texte"], dm=avis.get("dm", False)) and avis["essais"] < 3:
+            restants.append({"texte": avis["texte"], "essais": avis["essais"] + 1, "dm": avis.get("dm", False)})
     if restants:
         etat["avis_en_attente"] = restants
     r = etat.get("a_reveiller")
@@ -403,14 +442,23 @@ def slack_direct(compte, canal, ts, texte):
         return False
 
 
-def poster(etat, texte):
-    """Avis du relais dans le fil du lot, au nom du compte du relais : jamais une mention d'agent."""
+def poster(etat, texte, dm=False):
+    """Avis du relais dans le fil du lot, au nom du compte du relais : jamais une mention d'agent.
+    dm : copie en message direct à l'humain, avec le lien du fil si `slack_archives` est configuré (un avis qui attend
+    une décision ne doit pas se perdre dans un fil)."""
     texte = f"⚙️ Relais du lot {etat['version']} : {texte}"
     rc, out, err = lancer([OPENCLAW, "message", "send", "--channel", "slack", "--account", RELAIS,
                            "--target", f"channel:{etat['fil']['canal']}", "--thread-id", etat["fil"]["ts"],
                            "--message", texte, "--json"], timeout=120, env=env_openclaw())
     ok = rc == 0 or slack_direct(RELAIS, etat["fil"]["canal"], etat["fil"]["ts"], texte)
     journal(etat["version"], f"avis posté ({'ok' if ok else 'ÉCHEC'}) : {texte[:200]}")
+    if dm and ok:
+        lien = (f"\nFil du lot : {SLACK_ARCHIVES}/{etat['fil']['canal']}/p{etat['fil']['ts'].replace('.', '')}"
+                if SLACK_ARCHIVES else "")
+        rc, out, err = lancer([OPENCLAW, "message", "send", "--channel", "slack", "--account", RELAIS,
+                               "--target", f"user:{HUMAIN_SLACK}", "--message", f"{texte}{lien}", "--json"],
+                              timeout=120, env=env_openclaw())
+        journal(etat["version"], f"message direct à {HUMAIN} ({'ok' if rc == 0 else 'ÉCHEC ' + (err or out).strip()[-120:]})")
     return ok
 
 
@@ -659,7 +707,9 @@ def bilan_run(depot, run, requis=()):
     if run["status"] != "completed":
         return "en cours", f"run {rid} {run['status']}"
     jobs = jobs_du_run(depot, rid)
-    manquants = [n for n in requis if jobs.get(n) != "success"]
+    deja_valide = jobs.get(MARQUEUR_DEJA_VALIDE) == "success"  # jobs de test sautés par décision du workflow
+    manquants = [n for n in requis if jobs.get(n) != "success"
+                 and not (deja_valide and n in JOBS_SAUTABLES and jobs.get(n) == "skipped")]
     if run["conclusion"] == "success" and not manquants:
         return "vert", f"run {rid} vert"
     rouges = [n for n, c in jobs.items() if c in ("failure", "cancelled", "timed_out")]
@@ -715,15 +765,47 @@ def url_preview_front(sha):
     return None
 
 
+def fichiers_pr(pr):
+    """Chemins des fichiers modifiés par une PR ; None si GitHub ne les donne pas (la voie courte ne s'applique alors pas)."""
+    try:
+        vue = gh_json("pr", "view", str(pr["num"]), "-R", DEPOTS[pr["depot"]], "--json", "files", essais=2)
+    except RuntimeError:
+        return None
+    fichiers = (vue or {}).get("files")
+    if not fichiers:
+        return None
+    return [f.get("path") or "" for f in fichiers]
+
+
+def est_voie_courte(etat, prs):
+    """Correctif d'après merge qui ne touche que la CI, les tests ou la documentation : relu sur son diff, sans preview,
+    hors compteur d'aller-retours. Dans le doute (fichiers illisibles, un seul fichier d'application), voie normale."""
+    if etat["etape"] != "correction" or not etat.get("commits_revus"):
+        return False
+    for pr in prs:
+        fichiers = fichiers_pr(pr)
+        if not fichiers or not all(RE_VOIE_COURTE.search(f) for f in fichiers):
+            return False
+    return True
+
+
 def lancer_deploiement_preview(etat, branche):
     """Back du lot sur la preview, par un workflow_dispatch de son workflow sur la branche du lot (le workflow doit
     déployer une branche lancée à la main sur l'environnement de preview). Une PR n'étant pas déployée, les tests
-    Playwright du relecteur verraient sinon le front du lot avec l'ancien back."""
+    Playwright du relecteur verraient sinon le front du lot avec l'ancien back. Le dispatch demande un déploiement seul
+    (entrée `entree_deploiement_seul` de `deploiement_preview`, « deploiement_seul » par défaut) : le workflow peut
+    sauter ses tests quand ce commit a déjà un run vert, ce qui est le cas après `passe`, au lieu de rejouer une suite
+    déjà verte. Un workflow qui n'a pas cette entrée refuse le dispatch : on le relance alors sans elle."""
     t0 = maintenant() - dt.timedelta(minutes=1)
     depot = PREVIEW["depot"]
-    rc, out = gh_cmd("workflow", "run", PREVIEW.get("workflow") or WORKFLOW[depot], "-R", DEPOTS[depot], "--ref", branche)
+    cmd = ["workflow", "run", PREVIEW.get("workflow") or WORKFLOW[depot], "-R", DEPOTS[depot], "--ref", branche]
+    entree = PREVIEW.get("entree_deploiement_seul", "deploiement_seul")
+    rc, out = gh_cmd(*cmd, "-f", f"{entree}=true") if entree else (1, "")
+    seul = rc == 0
+    if rc != 0:
+        rc, out = gh_cmd(*cmd)
     dep = {"branche": branche, "lance": iso(), "run": None, "erreur": None if rc == 0 else out[-300:],
-           "relances": [], "vert_a": None}
+           "relances": [], "vert_a": None, "seul": seul}
     if rc == 0:
         for _ in range(6):
             dep["run"] = trouver_run_dispatch(branche, t0)
@@ -788,9 +870,41 @@ def consigne(etat, extra="", agent=None):
     mot = (f"\nMessage de {NOMS.get(dernier['de'], dernier['de'])} ({hm(dernier['heure'])}) : {dernier['texte']}"
            if dernier.get("texte") else "")
     ar = f"aller-retour {etat['aller_retours'] + 1}/{etat['max_aller_retours']}"
-    if e == "revue":
+    reglages = etat.get("reglages") or []
+    if e == "revue" and (etat.get("attente") or {}).get("voie_courte"):
+        rap = etat["rapports"][-1]["fichier"] if etat["rapports"] else None
+        corps = (f"\nVOIE COURTE : correctif d'après merge qui ne touche que la CI, les tests ou la documentation. Hors "
+                 f"compteur d'aller-retours, sans déploiement de preview. PR à revoir :\n"
+                 + "\n".join(ligne_pr(x) for x in etat["prs_lot"]) + f"{mot}"
+                 + (f"\nDernier rapport : {rap}." if rap else "") +
+                 f"\nRelis le diff de chaque PR en entier (`gh pr diff`), vérifie qu'aucun test n'est assoupli ni mis en "
+                 f"quarantaine, qu'aucun code de l'application n'est touché, et rejoue les tests modifiés (rouge avant, "
+                 f"vert après). Pas de parcours Playwright, pas de job de plus de 30 min : fais-le dans ce tour."
+                 f"\nTermine par `cycle-lot verdict {v} --merger --rapport <fichier>` ou `cycle-lot verdict {v} "
+                 f"--a-reprendre --bloquants <n> --rapport <fichier>`.")
+    elif e == "revue":
         dernier_rap = etat["rapports"][-1] if etat["rapports"] else None
         rap = dernier_rap["fichier"] if dernier_rap else None
+        n_revue = etat["aller_retours"] + 1
+        if n_revue < REVUE_REPORT:
+            regle = (f"\nRevue n° {n_revue} : {revues_tout_se_corrige()}, tout se corrige. À REPRENDRE dès qu'il reste un "
+                     f"point bloquant OU non bloquant : `cycle-lot verdict {v} --a-reprendre --bloquants <nombre de points "
+                     f"bloquants> --rapport <fichier> --cartes-ok <n,…> --cartes-ko <n,…>` (chaque carte en Under review "
+                     f"classée). Sinon `cycle-lot verdict {v} --merger --rapport <fichier>`.")
+        else:
+            regle = (f"\nRevue n° {n_revue} : à partir de la {REVUE_REPORT}e revue, seul un point BLOQUANT renvoie le lot à "
+                     f"{N_DEV}. Chaque point NON BLOQUANT devient une carte du lot suivant, que tu crées toi-même : "
+                     f"`cycle-lot carte-report {v} --titre … --appli back|front|back/front --gravite … "
+                     f"--description-fichier <fichier>` (constat, fichier:ligne, correction attendue, tests à écrire). "
+                     f"Puis, s'il ne reste aucun bloquant : `cycle-lot verdict {v} --merger --non-bloquants <n> --rapport "
+                     f"<fichier>` (le lot est mergé). Sinon : `cycle-lot verdict {v} --a-reprendre --bloquants <n> "
+                     f"--non-bloquants <n> --rapport <fichier> --cartes-ok <n,…> --cartes-ko <n,…>` ; {N_DEV} ne corrigera "
+                     f"que les bloquants. Un point découvert maintenant dans du code inchangé depuis ta 1re revue est non "
+                     f"bloquant, sauf s'il touche la sécurité.")
+        if etat.get("preuves_reel") and not rap:
+            regle += (f"\nPreuves en réel de {N_DEV} (services externes joués sur la préproduction) : "
+                      f"{etat['preuves_reel']}. Un critère d'acceptation qui dépend d'un service externe et n'a aucune "
+                      f"preuve en réel est un point bloquant.")
         if rap:  # revue de correction ciblée sur le diff exact depuis la tête revue
             quoi = (f"\nRevue de CORRECTION, ciblée : vérifie chaque point de ton rapport précédent ({rap}), puis relis "
                     f"seulement ce que la reprise a changé :\n" + "\n".join(diff_depuis_revue(x, dernier_rap) for x in etat["prs_lot"])
@@ -809,9 +923,9 @@ def consigne(etat, extra="", agent=None):
                  # sous-agents et de commandes en fond le réveillent
                  f"\nJob de revue : une unit `{REV}-{p}-rev…` avec openclaw-job-done, `claude --print --disallowedTools "
                  f"Monitor` (aucun suivi d'avancement : les sous-agents et les commandes en fond te notifient à leur fin)." +
-                 f"\nTermine par `cycle-lot verdict {v} --merger --rapport <fichier>` ou `cycle-lot verdict {v} "
-                 f"--a-reprendre --rapport <fichier> --cartes-ok <n,…> --cartes-ko <n,…>` (chaque carte en Under review "
-                 f"classée). À REPRENDRE dès qu'il reste un point bloquant OU non bloquant.")
+                 regle +
+                 f"\nRéglages de déploiement (variables, workflows à lancer, données à republier) : ajoute ceux que la "
+                 f"revue révèle avec `cycle-lot reglage {v} --ajouter \"…\"` ; ils seront exigés à la livraison.")
     elif e == "merge-lot":
         # `verdict --merger` merge déjà : on n'arrive ici qu'après un merge refusé
         corps = (f"\nVerdict À MERGER enregistré, mais des PR du lot restent à merger (merge refusé au verdict : le "
@@ -822,11 +936,29 @@ def consigne(etat, extra="", agent=None):
                  "de livraison.")
     elif e == "correction":
         rap = etat["rapports"][-1]["fichier"] if etat["rapports"] else "(pas de rapport)"
-        corps = (f"\nÀ corriger, {ar} : rapport {rap}.{mot}\nCorrige TOUS les points, bloquants et non bloquants, "
+        dernier_rap = etat["rapports"][-1] if etat["rapports"] else {}
+        if dernier_rap.get("voie_courte"):
+            quoi = "Corrige les points du rapport sur la PR de correctif (voie courte : CI, tests, documentation seulement)."
+        elif dernier_rap.get("aller_retour", 0) >= REVUE_REPORT:
+            reportes = [c["nom"] for c in etat.get("cartes_reportees") or [] if c.get("revue") == dernier_rap.get("aller_retour")]
+            quoi = (f"Corrige les points BLOQUANTS du rapport, et eux seuls (à partir de la {REVUE_REPORT}e revue). Les "
+                    "points non bloquants sont déjà des cartes du lot suivant, n'y touche pas"
+                    + (" : " + " ; ".join(reportes) if reportes else "") + ".")
+        else:
+            quoi = f"Corrige TOUS les points, bloquants et non bloquants ({revues_tout_se_corrige()}, tout se corrige)."
+        corps = (f"\nÀ corriger, {ar} : rapport {rap}.{mot}\n{quoi} Travaille "
                  f"sur les PR ouvertes vers release/{v} (les mêmes si le lot n'est pas mergé, de nouvelles sinon), en "
-                 f"reprise run-lot, une passe par carte, avec un test rouge avant chaque correction, le test du cas "
-                 f"voisin et les appelants vérifiés. Quand la CI de fin de reprise est verte : `cycle-lot passe {v} "
-                 f"--vers {REV} --message \"<ce qui a été corrigé, point par point>\"`.")
+                 f"reprise run-lot, une passe par carte."
+                 f"\nCorrige la famille, pas le cas : pour chaque point, énumère d'abord les variantes voisines du défaut "
+                 f"(table de cas dans la PR), écris un test paramétré qui les couvre et qui rougit, puis corrige à la "
+                 f"racine ; cas voisin qui ne doit pas changer testé, appelants vérifiés. Une correction au cas par cas "
+                 f"laisse passer la variante suivante, qui coûte un aller-retour de plus sur le même point."
+                 f"\nAvant de rendre la main, fais relire le diff de la reprise par une passe distincte (contre-relecture "
+                 f"avec {GRILLE}, consigne : « cherche ce que cette correction casse, oublie ou laisse passer »), "
+                 f"corrige ce qu'elle trouve et garde son rapport. Quand la CI de fin de reprise est verte : `cycle-lot "
+                 f"passe {v} --vers {REV} --contre-relecture <rapport> --message \"<ce qui a été corrigé, point par "
+                 f"point>\"`. Un correctif d'après merge qui ne touche que la CI, les tests ou la documentation passe par "
+                 f"la voie courte (ni preview, ni contre-relecture, hors compteur) : `passe` le reconnaît seul.")
     elif e == "livraison":
         attente = [i for i in etat["interventions"] if not i["faite"]]
         corps = (f"\nLes PR du lot sont mergées dans release/{v} et la CI du push sur la release est verte.{mot}"
@@ -845,16 +977,27 @@ def consigne(etat, extra="", agent=None):
                  f"\nRédige la liste des validations visuelles à faire en production ({URL_PROD}) : une entrée par "
                  f"évolution ou correction du lot, avec la carte, le parcours exact et le résultat attendu. Écris-la dans "
                  f"{dossier(v)}/validations-prod.md, poste-la dans ce fil, puis `cycle-lot passe {v} --vers {REV} --etape "
-                 f"validation-prod --fichier {dossier(v)}/validations-prod.md`.")
+                 f"validation-prod --fichier {dossier(v)}/validations-prod.md`."
+                 + ("\nRéglages de déploiement à poser AVANT de passer la main (`passe` refuse tant qu'il en reste un) ; "
+                    f"pose chacun, vérifie-le en production, puis `cycle-lot reglage {v} --fait N --preuve \"…\"` :\n"
+                    + "\n".join(f"  {g['n']}. {g['texte']}" for g in reglages if not g["fait"])
+                    if any(not g["fait"] for g in reglages) else
+                    "\nAucun réglage de déploiement ouvert. Relis quand même la rubrique « À poser sur les déploiements » "
+                    "des PR du lot : un réglage oublié se déclare et se pose maintenant (`cycle-lot reglage`)."))
     elif e == "validation-prod":
         corps = (f"\nTeste en production ({URL_PROD}), avec Playwright, chaque entrée de {etat.get('liste_validation')}."
-                 f"{mot}\nPour chaque défaut : `cycle-lot carte-bug {v} --titre … --appli back|front|back/front --gravite "
+                 f"{mot}"
+                 + ("\nCommence par vérifier en production chaque réglage de déploiement déclaré fait :\n"
+                    + "\n".join(f"  {g['n']}. {g['texte']} (preuve de {N_DEV} : {g.get('preuve') or '-'})" for g in reglages)
+                    if reglages else "") +
+                 f"\nPour chaque défaut : `cycle-lot carte-bug {v} --titre … --appli back|front|back/front --gravite "
                  f"critique|important|normal|faible|cosmetique --description-fichier <fichier>` (carte de la version "
                  f"suivante, en Not Ready). Puis `cycle-lot fin {v} --rapport <fichier>` et le bilan dans ce fil.")
     elif e == "dev":
         corps = (f"\nTu as la main sur le développement du lot.{mot}\nSi ton lanceur run-lot tourne, rien à faire. "
                  f"Sinon reprends le lot là où il s'est arrêté ; quand la CI de fin de lot est verte : `cycle-lot passe "
-                 f"{v} --vers {REV} --message \"<bilan du lot, arbitrages pris>\"`.")
+                 f"{v} --vers {REV} --reel <fichier des preuves en réel | aucun> --message \"<bilan du lot, arbitrages "
+                 f"pris>\"`.")
     else:
         corps = mot
     return tete_msg + corps + (("\n" + extra) if extra else "") + pied(etat, agent)
@@ -869,7 +1012,7 @@ def arreter(etat, par, motif, message, etape_reprise=None):
     qui = NOMS[par] if par in (DEV, REV) else N_DEV
     planifier_avis(etat, f"⛔ cycle arrêté ({motif}). {message} <@{HUMAIN_SLACK}> ta décision est attendue : réponds dans ce fil "
                  f"en mentionnant {qui}, qui relancera le cycle (`cycle-lot reprise`). Sans mention, aucun agent ne se "
-                 f"réveille.")
+                 f"réveille.", dm=True)
 
 
 # ---------------------------------------------------------------- commandes
@@ -904,6 +1047,7 @@ def cmd_debut(a):
                 "aller_retours": 0, "max_aller_retours": MAX_ALLER_RETOURS, "ci_rouges": 0,
                 "cartes": [{"id": c["id"], "num": c["num"], "nom": c["nom"], "url": c["url"]} for c in cartes],
                 "prs_lot": [], "prs_livraison": [], "interventions": [], "rapports": [], "cartes_bugs": [],
+                "cartes_reportees": [], "reglages": [], "voie_courte_tours": 0, "preuves_reel": None,
                 "attente": None, "arret": None, "relances": {}, "reveils": [], "a_reveiller": None, "avis_en_attente": [],
                 "historique": [], "dernier_message": None, "liste_validation": None}
         changer_etape(etat, "dev", agent, f"cycle créé à la demande de {HUMAIN}")
@@ -912,8 +1056,10 @@ def cmd_debut(a):
     print(f"Cycle du lot {v} créé : étape « dev », main à {N_DEV}. Fil {etat['fil']['canal']} {etat['fil']['ts']}.")
     print(f"{len(cartes)} cartes du lot : {', '.join(str(c['num']) for c in cartes)} ; en Work in progress : "
           f"{', '.join(map(str, faits)) or 'aucune'}" + (f" ; ÉCHEC Trello pour {rates}" if rates else ""))
-    print(f"Ensuite : arbitrages et interventions dès maintenant (règles a-d, `cycle-lot arret {v}` si bloquant), "
-          f"puis run-lot impl ; à la CI verte, `cycle-lot passe {v} --vers {REV}`.")
+    print(f"Ensuite : arbitrages et interventions dès maintenant (règles a-d, `cycle-lot arret {v}` si bloquant). Une "
+          f"intervention sans laquelle une carte ne peut pas être vérifiée en réel se déclare avec `--avant revue` : "
+          f"reporte la carte au lot suivant ou attends l'intervention, la revue est refusée sinon. Puis run-lot impl ; à "
+          f"la CI verte, `cycle-lot passe {v} --vers {REV} --reel <fichier | aucun>`.")
 
 
 def cmd_passe(a):
@@ -938,6 +1084,33 @@ def cmd_passe(a):
             if problemes:
                 raise Refus("la CI des PR du lot n'est pas verte. Étape 6 du cycle : corrige avant de demander la "
                             "revue (ou attends la fin de l'étape CI de run-lot).\n" + "\n".join(problemes))
+            premiere = etat["etape"] == "dev" and not etat["rapports"]
+            courte = est_voie_courte(etat, prs)
+            if premiere:
+                # un accès à un service externe qui arrive tard, ou un traitement jamais joué sur le vrai service avant
+                # la revue, repousse la vérification réelle de plusieurs aller-retours : on l'exige avant la 1re revue
+                bloquent = [i for i in etat["interventions"] if not i["faite"] and i.get("avant") == "revue"]
+                if bloquent:
+                    raise Refus(f"interventions de {HUMAIN} nécessaires à la vérification, encore ouvertes : "
+                                + "; ".join(f"{i['n']}. {i['texte']}" for i in bloquent) + ". Fais-les faire "
+                                f"(`cycle-lot intervention {v} --faite N`), ou reporte au lot suivant les cartes qui en "
+                                f"dépendent (renomme-les [V<suivante>-…], remets-les en Not Ready), ou `cycle-lot arret {v} "
+                                f"--motif intervention`.")
+                reel = (a.reel or "").strip()
+                if reel.lower() != "aucun" and not (reel and Path(reel).is_file() and Path(reel).stat().st_size):
+                    raise Refus("--reel : le fichier des preuves en réel (pour chaque carte qui dépend d'un service "
+                                "externe : modèle d'IA, base de données hébergée, e-mail, captcha, source de données, stockage, la "
+                                "commande ou le parcours joué sur la préproduction et son résultat), ou `--reel aucun` si aucune "
+                                "carte du lot ne dépend d'un service externe. Un critère « non tenu faute d'accès » ne "
+                                "passe pas en revue : fais lever le blocage ou reporte la carte.")
+                etat["preuves_reel"] = "aucun" if reel.lower() == "aucun" else str(Path(reel).resolve())
+            elif etat["etape"] == "correction" and not courte:
+                cr = (a.contre_relecture or "").strip()
+                if not (cr and Path(cr).is_file() and Path(cr).stat().st_size):
+                    raise Refus("--contre-relecture : le rapport de la passe distincte qui a relu le diff de la reprise "
+                                f"avec {GRILLE} (ce que la correction casse, oublie ou laisse passer), fichier non vide. "
+                                f"Chaque point que {N_REV} relève coûte un aller-retour complet.")
+                etat.setdefault("contre_relectures", []).append({"heure": iso(), "fichier": str(Path(cr).resolve())})
             etat["prs_lot"] = prs
             ou = ou_sont(etat)
             a_revoir = {n for n, liste in ou.items() if liste in ("waiting", "wip")}
@@ -948,7 +1121,12 @@ def cmd_passe(a):
                                  f"abouti ?) : {', '.join(map(str, encore_wip))}.")
             a_deployer = [p for p in prs if PREVIEW and p["depot"] == PREVIEW["depot"]]
             msg = (a.message or "") + (f"\n{avertissement}" if avertissement else "")
-            if a_deployer:
+            if courte:
+                changer_etape(etat, "revue", agent, msg, attente={"voie_courte": True})
+                planifier_reveil(etat, REV, "revue")
+                suite = ("Voie courte (correctif d'après merge, CI, tests ou documentation seulement) : pas de preview, hors "
+                         f"compteur d'aller-retours. Le relais réveille {N_REV} dans les 2 minutes.")
+            elif a_deployer:
                 dep = lancer_deploiement_preview(etat, a_deployer[0]["branche"])
                 changer_etape(etat, "deploiement-revue", agent, msg, attente={"deploiement": dep})
                 suite = (f"Le back du lot se déploie sur la preview (run {dep['run'] or '?'}) ; le relais réveille "
@@ -958,14 +1136,20 @@ def cmd_passe(a):
                 planifier_reveil(etat, REV, "revue", extra=extra_revue(etat, None))
                 suite = f"Le relais réveille {N_REV} pour la revue dans les 2 minutes."
             ecrire(etat)
-            print(f"Main passée à {N_REV} pour la revue du lot {v} (aller-retour {etat['aller_retours'] + 1}/"
-                  f"{etat['max_aller_retours']}). PR : " + ", ".join(f"{p['depot']}#{p['num']}" for p in prs) + ". " + suite)
+            print(f"Main passée à {N_REV} pour la revue du lot {v} ("
+                  + ("voie courte" if courte else f"aller-retour {etat['aller_retours'] + 1}/{etat['max_aller_retours']}")
+                  + "). PR : " + ", ".join(f"{p['depot']}#{p['num']}" for p in prs) + ". " + suite)
             if avertissement:
                 print(avertissement)
         elif a.vers == REV and a.etape == "validation-prod":
             exiger(etat, agent, ("liste-validation",))
             if not a.fichier or not Path(a.fichier).is_file() or Path(a.fichier).stat().st_size == 0:
                 raise Refus("--fichier : la liste des validations visuelles (fichier non vide)")
+            ouverts = [g for g in etat.get("reglages") or [] if not g["fait"]]
+            if ouverts:  # un réglage écrit seulement dans une PR s'oublie à la livraison
+                raise Refus("réglages de déploiement encore ouverts : " + "; ".join(f"{g['n']}. {g['texte']}" for g in ouverts)
+                            + f". Pose chacun, vérifie-le en production, puis `cycle-lot reglage {v} --fait N --preuve "
+                              f"\"…\"`. Un réglage qui demande {HUMAIN} : `cycle-lot arret {v} --motif intervention`.")
             etat["liste_validation"] = str(Path(a.fichier).resolve())
             changer_etape(etat, "validation-prod", agent, a.message or "")
             planifier_reveil(etat, REV, "validation-prod")
@@ -1011,6 +1195,32 @@ def cmd_verdict(a):
         ok, ko = liste_nums(a.cartes_ok), liste_nums(a.cartes_ko)
         if a.merger and ko:
             raise Refus("--merger avec des cartes refusées : c'est un verdict À REPRENDRE")
+        courte = etat["etape"] == "revue" and bool((etat.get("attente") or {}).get("voie_courte"))
+        n_revue = etat["aller_retours"] + 1
+        if etat["etape"] == "revue" and not courte:
+            # avant la revue REVUE_REPORT, tout se corrige ; à partir d'elle, seul un bloquant renvoie le lot, chaque non
+            # bloquant est une carte du lot suivant créée par `carte-report` pendant cette revue
+            reportes = [c for c in etat.get("cartes_reportees") or [] if c.get("revue") == n_revue]
+            nb = a.non_bloquants or 0
+            if a.a_reprendre and a.bloquants is None:
+                raise Refus("--bloquants N : le nombre de points bloquants de ton rapport (0 s'il n'y en a aucun)")
+            if n_revue < REVUE_REPORT:
+                if a.merger and nb:
+                    raise Refus(f"revue n° {n_revue} : {revues_tout_se_corrige()}, un point non bloquant se corrige. C'est un "
+                                f"verdict À REPRENDRE (`--a-reprendre --bloquants 0`).")
+            else:
+                if a.a_reprendre and a.bloquants == 0:
+                    raise Refus(f"revue n° {n_revue} : à partir de la {REVUE_REPORT}e revue, un lot sans point bloquant se "
+                                f"merge. Crée une carte du lot suivant par point non bloquant (`cycle-lot carte-report "
+                                f"{v} …`), puis `cycle-lot verdict {v} --merger --non-bloquants <n> --rapport <fichier>`.")
+                if a.a_reprendre and a.non_bloquants is None:
+                    raise Refus("--non-bloquants N : le nombre de points non bloquants de ton rapport (0 s'il n'y en a "
+                                "aucun) ; chacun doit avoir sa carte du lot suivant (`cycle-lot carte-report`)")
+                if nb > len(reportes):
+                    raise Refus(f"{nb} point(s) non bloquant(s) annoncé(s), {len(reportes)} carte(s) créée(s) pendant cette "
+                                f"revue : à partir de la {REVUE_REPORT}e revue, chaque point non bloquant devient une carte "
+                                f"du lot suivant (`cycle-lot carte-report {v} --titre … --appli … --gravite … "
+                                f"--description-fichier …`). {N_DEV} ne les corrigera pas dans ce lot.")
         ou = ou_sont(etat)  # avant le contrôle des numéros : une carte reportée n'est plus du lot
         connus = {c["num"] for c in etat["cartes"]}
         if (ok | ko) - connus:
@@ -1020,8 +1230,10 @@ def cmd_verdict(a):
         en_revue = {n for n, liste in ou.items() if liste == "review"}
         etat["rapports"].append({"heure": iso(), "fichier": str(rapport), "verdict": "merger" if a.merger else "a-reprendre",
                                  "etape": etat["etape"], "aller_retour": etat["aller_retours"] + 1,
+                                 "bloquants": a.bloquants, "non_bloquants": a.non_bloquants, "voie_courte": courte,
                                  "tetes": {f"{x['depot']}#{x['num']}": x["sha"] for x in etat["prs_lot"]}})
         if a.merger:
+            etat["voie_courte_tours"] = 0
             restantes = {n for n, liste in ou.items() if liste in LISTES_EN_COURS}
             ailleurs = {n: liste for n, liste in ou.items() if liste not in LISTES_EN_COURS + ("finished",)}
             deplacer(etat, restantes, "finished", haut=True)
@@ -1052,8 +1264,24 @@ def cmd_verdict(a):
                             f"{sorted(manquantes)}")
         deplacer(etat, ok, "finished", haut=True)
         deplacer(etat, ko, "wip")
-        etat["aller_retours"] += 1
         msg = a.message or f"À REPRENDRE, rapport {rapport}"
+        if courte:  # hors compteur d'aller-retours ; garde-fou propre à la voie courte
+            etat["voie_courte_tours"] = etat.get("voie_courte_tours", 0) + 1
+            if etat["voie_courte_tours"] >= MAX_VOIE_COURTE:
+                arreter(etat, agent, "ci",
+                        f"{etat['voie_courte_tours']}e verdict À REPRENDRE de suite sur un correctif de CI ou de tests "
+                        f"d'après merge (rapport {rapport}) : la voie courte s'arrête là.", etape_reprise="correction")
+                ecrire(etat)
+                print(f"Verdict À REPRENDRE enregistré (voie courte). {etat['voie_courte_tours']}e de suite : cycle "
+                      f"ARRÊTÉ, décision de {HUMAIN} attendue. Poste ton rapport dans le fil.")
+                return
+            changer_etape(etat, "correction", agent, msg + " (voie courte)")
+            planifier_reveil(etat, DEV, "correction")
+            ecrire(etat)
+            print(f"Verdict À REPRENDRE enregistré (voie courte, hors compteur : aller-retours {etat['aller_retours']}/"
+                  f"{etat['max_aller_retours']}). Le relais réveille {N_DEV} pour la correction dans les 2 minutes.")
+            return
+        etat["aller_retours"] += 1
         if etat["aller_retours"] >= etat["max_aller_retours"]:
             arreter(etat, agent, "aller-retours",
                     f"{etat['aller_retours']}e verdict À REPRENDRE de {N_REV} (rapport {rapport}) : le cycle s'arrête "
@@ -1127,7 +1355,8 @@ def apres_merges(etat, par):
         return f"Reste à merger : {', '.join(reste)}."
     if etat["etape"] == "merge-lot":
         bascule = basculer_changelog(etat)
-        depots = sorted({x["depot"] for x in ensemble})
+        # un dépôt dont le run de release n'était pas encore vert quand le relais a réagi au rouge de l'autre reste à voir
+        depots = sorted({x["depot"] for x in ensemble} | set(etat.pop("release_a_verifier", None) or []))
         changer_etape(etat, "ci-release", par, f"PR du lot mergées dans {etat['release']}" + (f" ; {bascule}" if bascule else ""),
                       attente={"depots": depots, "relances": []})
         return (f"Toutes les PR du lot sont mergées{' ; ' + bascule if bascule else ''}. Le relais attend la CI du push "
@@ -1375,10 +1604,13 @@ def cmd_intervention(a):
         etat = lire(a.version)
         if a.ajouter:
             n = len(etat["interventions"]) + 1
-            etat["interventions"].append({"n": n, "texte": a.ajouter, "faite": False, "par": agent, "heure": iso()})
-            journal(a.version, f"intervention {n} demandée à {HUMAIN} : {a.ajouter}")
-            print(f"Intervention {n} notée. Demande-la à {HUMAIN} dans le fil dès maintenant ; l'ouverture des PR de "
-                  f"livraison est refusée tant qu'elle n'est pas faite.")
+            etat["interventions"].append({"n": n, "texte": a.ajouter, "faite": False, "par": agent, "heure": iso(),
+                                          "avant": a.avant})
+            journal(a.version, f"intervention {n} demandée à {HUMAIN} (avant {a.avant}) : {a.ajouter}")
+            print(f"Intervention {n} notée. Demande-la à {HUMAIN} dans le fil dès maintenant ; "
+                  + ("le passage en revue est refusé tant qu'elle n'est pas faite (ou que les cartes qui en dépendent ne "
+                     "sont pas reportées)." if a.avant == "revue" else
+                     "l'ouverture des PR de livraison est refusée tant qu'elle n'est pas faite."))
         elif a.faite:
             i = next((x for x in etat["interventions"] if x["n"] == a.faite), None)
             if not i:
@@ -1389,7 +1621,43 @@ def cmd_intervention(a):
             print(f"Intervention {a.faite} marquée faite.")
         else:
             for i in etat["interventions"]:
-                print(f"{i['n']}. [{'faite' if i['faite'] else 'à faire'}] {i['texte']}")
+                print(f"{i['n']}. [{'faite' if i['faite'] else 'à faire'}] {i['texte']}"
+                      + (" (avant la revue)" if i.get("avant") == "revue" else ""))
+        ecrire(etat)
+
+
+def cmd_reglage(a):
+    """Réglages de déploiement du lot (variables d'environnement, workflows à lancer, données à republier, migrations) :
+    déclarés pendant le lot, posés et prouvés par le développeur à la mise en production, vérifiés par le relecteur.
+    Un réglage écrit seulement dans la description d'une PR s'oublie à la livraison."""
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        reglages = etat.setdefault("reglages", [])
+        if a.ajouter:
+            if etat["etape"] == "livre":
+                raise Refus("le lot est livré : un réglage manquant est une carte de bug (`cycle-lot carte-bug`)")
+            n = len(reglages) + 1
+            reglages.append({"n": n, "texte": a.ajouter, "fait": False, "par": agent, "heure": iso()})
+            journal(a.version, f"réglage de déploiement {n} déclaré par {agent} : {a.ajouter}")
+            print(f"Réglage {n} noté. Il sera exigé à la mise en production : `cycle-lot reglage {a.version} --fait {n} "
+                  f"--preuve \"…\"` une fois posé et vérifié.")
+        elif a.fait:
+            g = next((x for x in reglages if x["n"] == a.fait), None)
+            if not g:
+                raise Refus(f"réglage {a.fait} inconnu")
+            if not (a.preuve or "").strip():
+                raise Refus("--preuve : ce que tu as vérifié en production une fois le réglage posé (commande ou "
+                            "parcours, et son résultat)")
+            g.update(fait=True, fait_le=iso(), fait_par=agent, preuve=a.preuve.strip())
+            journal(a.version, f"réglage de déploiement {a.fait} fait par {agent} : {g['texte']} ; preuve : {a.preuve.strip()[:200]}")
+            print(f"Réglage {a.fait} marqué fait.")
+        else:
+            for g in reglages:
+                print(f"{g['n']}. [{'fait' if g['fait'] else 'à faire'}] {g['texte']}"
+                      + (f" ; preuve : {g['preuve']}" if g.get("preuve") else ""))
+            if not reglages:
+                print("Aucun réglage de déploiement déclaré.")
         ecrire(etat)
 
 
@@ -1409,24 +1677,59 @@ def version_suivante(version, toutes):
     return ".".join(parts)
 
 
+def creer_carte(a):
+    """Carte `[V<version>-Fix-<Appli>] n. titre` en Not Ready, avec l'étiquette de gravité. Version : `--version` si elle
+    est donnée (postérieure au lot), sinon la suivante. Rend (nom, carte Trello)."""
+    def cle(x):
+        return tuple(int(k) for k in x.split("."))
+    desc = Path(a.description_fichier)
+    if not desc.is_file() or desc.stat().st_size == 0:
+        raise Refus("--description-fichier : constat, parcours pour reproduire ou fichier:ligne, attendu, carte du lot "
+                    "concernée")
+    toutes = cartes_du_tableau()
+    cible = getattr(a, "version_cible", None)
+    if cible:
+        if not RE_VERSION.match(cible) or cle(cible) <= cle(a.version):
+            raise Refus(f"--version-cible « {cible} » : une version postérieure au lot {a.version}")
+    else:
+        cible = version_suivante(a.version, toutes)
+    nums = [int(m.group("num")) for c in toutes if (m := RE_CARTE.match(c["name"])) and m.group("ver") == cible]
+    n = max(nums, default=0) + 1
+    appli = {"back": "Back", "front": "Front", "back/front": "Back/Front"}[a.appli]
+    nom = f"[V{cible}-Fix-{appli}] {n}. {a.titre.strip()}"
+    carte = trello("POST", "/cards", idList=LISTES["not_ready"], name=nom, desc=desc.read_text()[:16000],
+                   idLabels=GRAVITES[a.gravite], pos="bottom")
+    return nom, carte
+
+
 def cmd_carte_bug(a):
     agent = appelant(a)
     with verrou(a.version):
         etat = lire(a.version)
         exiger(etat, agent, ("validation-prod",))
-        desc = Path(a.description_fichier)
-        if not desc.is_file() or desc.stat().st_size == 0:
-            raise Refus("--description-fichier : constat, parcours pour reproduire, attendu, carte du lot concernée")
-        toutes = cartes_du_tableau()
-        suivante = version_suivante(a.version, toutes)
-        nums = [int(m.group("num")) for c in toutes if (m := RE_CARTE.match(c["name"])) and m.group("ver") == suivante]
-        n = max(nums, default=0) + 1
-        appli = {"back": "Back", "front": "Front", "back/front": "Back/Front"}[a.appli]
-        nom = f"[V{suivante}-Fix-{appli}] {n}. {a.titre.strip()}"
-        carte = trello("POST", "/cards", idList=LISTES["not_ready"], name=nom, desc=desc.read_text()[:16000],
-                       idLabels=GRAVITES[a.gravite], pos="bottom")
+        nom, carte = creer_carte(a)
         etat["cartes_bugs"].append({"id": carte.get("id"), "nom": nom, "url": carte.get("shortUrl"), "heure": iso()})
         journal(a.version, f"carte de bug créée : {nom} {carte.get('shortUrl')}")
+        ecrire(etat)
+    print(f"Carte créée en Not Ready : {nom} {carte.get('shortUrl')}")
+
+
+def cmd_carte_report(a):
+    """Point reporté au lot suivant, à toute étape du lot : point non bloquant d'une revue à partir de la revue
+    REVUE_REPORT, défaut ancien hors périmètre, reste décidé par l'humain. Créée à la main, une telle carte ne laisse
+    aucune trace dans le cycle, et le verdict ne peut pas vérifier que chaque point non bloquant a la sienne."""
+    agent = appelant(a)
+    with verrou(a.version):
+        etat = lire(a.version)
+        if etat["etape"] == "livre":
+            raise Refus("le lot est livré : un défaut vu en production est une carte de bug du lot suivant, à créer "
+                        "directement sur Trello")
+        nom, carte = creer_carte(a)
+        revue = etat["aller_retours"] + 1 if etat["etape"] == "revue" else None
+        etat.setdefault("cartes_reportees", []).append(
+            {"id": carte.get("id"), "nom": nom, "url": carte.get("shortUrl"), "heure": iso(), "par": agent,
+             "etape": etat["etape"], "revue": revue})
+        journal(a.version, f"carte reportée créée par {agent} : {nom} {carte.get('shortUrl')}")
         ecrire(etat)
     print(f"Carte créée en Not Ready : {nom} {carte.get('shortUrl')}")
 
@@ -1490,6 +1793,13 @@ def cmd_etat(a):
     if e["interventions"]:
         print("Interventions : " + "; ".join(f"{i['n']}. [{'faite' if i['faite'] else 'à faire'}] {i['texte']}"
                                               for i in e["interventions"]))
+    if e.get("reglages"):
+        print("Réglages de déploiement : " + "; ".join(f"{g['n']}. [{'fait' if g['fait'] else 'à faire'}] {g['texte']}"
+                                                        for g in e["reglages"]))
+    if e.get("cartes_reportees"):
+        print("Cartes reportées au lot suivant : " + " ; ".join(titre_court(c["nom"]) for c in e["cartes_reportees"]))
+    if e.get("preuves_reel"):
+        print(f"Preuves en réel : {e['preuves_reel']}")
     print("Cartes : " + ", ".join(str(c["num"]) for c in e["cartes"]))
     dans_lot = {c["id"] for c in e["cartes"]}
     sorties = {s["id"]: s for s in e.get("cartes_sorties") or [] if s["id"] not in dans_lot}.values()
@@ -1588,13 +1898,21 @@ def veiller_tour(etat):
             planifier_avis(etat, f"l'étape « {etat['etape']} » dure depuis {hm(etat['depuis'])}, au-delà de son plafond "
                                  f"de {plafond} h, alors que {agent} travaille encore ({quoi}). Rien n'est bloqué côté "
                                  f"relais ; à regarder si ça te semble anormal.")
-    if units:
+    def signe_de_vie():
+        # relances réarmées : un agent qui a répondu à une relance en lançant un job ou un tour n'est plus muet ; sans
+        # ça, les relances de l'étape partent pendant qu'il travaille encore, et il n'en reste plus à la vraie panne
         r["vu_actif"] = iso()
+        if r.get("nb") or r.get("alerte"):
+            r.update(nb=0, alerte=False, rappels=0, alerte_heure=None)
+
+    if units:
+        signe_de_vie()
         plafond_depasse(", ".join(units))
         return
     reperes = [date(etat["depuis"])] + [date(x) for x in (r.get("vu_actif"), r.get("derniere")) if x]
     inactif = (maintenant() - max(reperes)).total_seconds() / 60
-    if inactif < INACTIF_MIN:
+    ciblable = agent == DEV and etat["etape"] in ("dev", "correction")
+    if inactif < (INACTIF_CI_VERTE_MIN if ciblable else INACTIF_MIN):
         return
     if r.get("verif_session") and minutes_depuis(r["verif_session"]) < 10:
         return
@@ -1603,8 +1921,12 @@ def veiller_tour(etat):
     if actif is None:
         return
     if actif:
-        r["vu_actif"] = iso()
+        signe_de_vie()
         plafond_depasse("tour en cours")
+        return
+    if ciblable and signaler_ci_verte(etat, r):
+        return
+    if inactif < INACTIF_MIN:
         return
     if r.get("nb", 0) < NB_RELANCES:
         r["nb"] = r.get("nb", 0) + 1
@@ -1613,11 +1935,59 @@ def veiller_tour(etat):
                    f"cours, ni job `{agent}-{etat['prefixe']}-…` actif. Si l'étape est finie, termine-la par sa "
                    f"commande ; si un job tourne sous un autre nom, dis-le en une ligne.\n")
         planifier_reveil(etat, agent, f"relance {r['nb']}", prefixe=prefixe)
-    elif not r.get("alerte"):
+    elif not r.get("alerte") or (r.get("rappels", 0) < NB_RAPPELS_ALERTE and r.get("alerte_heure")
+                                 and minutes_depuis(r["alerte_heure"]) >= RAPPEL_ALERTE_MIN):
+        # alerte répétée (toutes les RAPPEL_ALERTE_MIN) et envoyée en message direct : une seule ligne dans le fil
+        # peut rester des heures sans être lue
+        rappel = bool(r.get("alerte"))
+        if rappel:
+            r["rappels"] = r.get("rappels", 0) + 1
         r["alerte"] = True
-        planifier_avis(etat, f"{agent} ne répond pas sur l'étape « {etat['etape']} » (main depuis {hm(etat['depuis'])}, "
-                             f"{NB_RELANCES} relances sans effet). <@{HUMAIN_SLACK}> une relance de ta part dans ce fil est "
-                             f"nécessaire.")
+        r["alerte_heure"] = iso()
+        planifier_avis(etat, (f"rappel n° {r['rappels']} : " if rappel else "")
+                       + f"{agent} ne répond pas sur l'étape « {etat['etape']} » (main depuis {hm(etat['depuis'])}, "
+                         f"{NB_RELANCES} relances sans effet). <@{HUMAIN_SLACK}> mentionne {NOMS.get(agent, agent)} dans ce fil pour "
+                         f"le relancer : sans mention, aucun agent ne se réveille.", dm=True)
+
+
+def signaler_ci_verte(etat, r):
+    """La CI des PR du lot est verte sur des têtes que le relecteur n'a pas revues, aucun job ni tour du développeur ne
+    tourne, et la main n'est pas passée : réveil ciblé du développeur, deux fois au plus par jeu de têtes (le second
+    INACTIF_MIN après). Sans lui, un lot prêt pour la revue peut attendre des heures que quelqu'un s'en aperçoive.
+    Rend True si le relais s'en occupe (réveil planifié ou attente de son effet), False pour laisser faire les relances
+    ordinaires."""
+    try:
+        prs = prs_ouvertes(etat["release"])
+        if not prs:
+            return False
+        tetes = {f"{x['depot']}#{x['num']}": x["sha"] for x in prs}
+        revues = (etat["rapports"][-1].get("tetes") or {}) if etat["rapports"] else {}
+        if all(revues.get(k) == sha for k, sha in tetes.items()):
+            return False  # rien de neuf depuis la dernière revue : la correction n'est pas poussée
+        if any(ci_pr(x, REQUIS_LOT[x["depot"]])[0] != "vert" for x in prs):
+            return False
+    except RuntimeError:
+        return False
+    signature = ",".join(sorted(tetes.values()))
+    c = r.get("ci_verte") or {}
+    if c.get("tetes") != signature:
+        c = {"tetes": signature, "nb": 0, "heure": None}
+    if c["nb"] >= 2:
+        r["ci_verte"] = c
+        return False
+    if c["heure"] and minutes_depuis(c["heure"]) < INACTIF_MIN:
+        r["ci_verte"] = c
+        return True
+    c.update(nb=c["nb"] + 1, heure=iso())
+    r["ci_verte"] = c
+    lesquelles = ", ".join(f"{k} (`{sha[:7]}`)" for k, sha in sorted(tetes.items()))
+    prefixe = (f"Réveil ciblé n°{c['nb']} : la CI est verte sur {lesquelles}, aucun job `{DEV}-{etat['prefixe']}-…` ni "
+               f"tour ne tourne, et la main n'est pas passée à {N_REV}. Si l'étape est finie, termine-la maintenant par "
+               f"`cycle-lot passe {etat['version']} --vers {REV} …` ; sinon dis en une ligne ce qui reste à faire et "
+               f"lance-le.\n")
+    planifier_reveil(etat, DEV, f"ci verte {c['nb']}", prefixe=prefixe)
+    journal(etat["version"], f"CI verte sur {lesquelles} sans passage de main : réveil ciblé n°{c['nb']} de {DEV}")
+    return True
 
 
 def url_run(depot, run_id):
@@ -1651,7 +2021,24 @@ def veiller_runs(etat, cibles, requis_par_cible):
         lignes.append(f"{depot}{' ' + branche if branche else ''} `{sha[:7]}` : {verdict}, {resume}")
     att["suivi"] = suivi
     att["suivi_heure"] = iso()
-    return ("attente" if en_cours else "rouge" if rouges else "vert"), lignes, par_cible
+    # rouge immédiat : un run rouge sur du code n'attend pas la fin des autres. Sinon un dépôt encore en file retarde le
+    # verdict d'un rouge déjà connu, jusqu'à un arrêt « sans verdict » au plafond de l'étape.
+    return ("rouge" if rouges else "attente" if en_cours else "vert"), lignes, par_cible
+
+
+def encore_attendre(etat, duree, plafond, quoi):
+    """Attente sans aucun rouge au-delà du plafond de l'étape : des runs en file ou en cours ne sont pas une panne (runner
+    unique, verrou partagé). Un avis au plafond, puis l'attente continue jusqu'au double avant l'arrêt."""
+    if duree < plafond:
+        return True
+    if duree >= 2 * plafond:
+        return False
+    att = etat["attente"]
+    if not att.get("avis_plafond"):
+        att["avis_plafond"] = True
+        planifier_avis(etat, f"{quoi} : pas encore de verdict après {int(duree)} min, mais aucun job rouge (runs en file "
+                             f"ou en cours). J'attends encore, jusqu'à {int(2 * plafond)} min au total.")
+    return True
 
 
 def veiller_attente(etat):
@@ -1695,11 +2082,22 @@ def veiller_attente(etat):
     elif e == "ci-release":
         cibles = [(d, tete(d, etat["release"]), "push", etat["release"]) for d in att["depots"]]
         verdict, lignes, _ = veiller_runs(etat, cibles, [REQUIS_PUSH] * len(cibles))
-        if verdict == "attente" and duree < plafond:
+        if verdict == "attente" and encore_attendre(etat, duree, plafond, f"CI du push sur {etat['release']}"):
             return
         if verdict == "vert":
             etat["ci_rouges"] = 0
             note = ""
+            if not etat.get("marges_verifiees"):  # une fois par lot, sans jamais gêner la livraison
+                etat["marges_verifiees"] = iso()
+                try:
+                    serrees = [x for d in att["depots"] for x in marges_ci(d, etat["release"]) if x["ratio"] > SEUIL_MARGE]
+                    if serrees:
+                        planifier_avis(etat, "délais de CI à relever avant la prochaine livraison (durée mesurée au-delà "
+                                       f"de {int(SEUIL_MARGE * 100)} % du plafond) : " + " ; ".join(
+                                           f"{x['depot']} {x['nom']} {x['max_min']:.0f} min sur {x['plafond']} "
+                                           f"({x['ratio'] * 100:.0f} %)" for x in serrees))
+                except Exception as ex:  # noqa: BLE001 : simple mesure
+                    journal(etat["version"], f"marges de CI : mesure impossible ({type(ex).__name__} : {str(ex)[:150]})")
             if not [i for i in etat["interventions"] if not i["faite"]]:
                 try:  # le relais ouvre lui-même les PR de livraison : pas de tour d'agent pour un geste mécanique
                     prs, _ = ouvrir_prs_livraison(etat)
@@ -1715,6 +2113,7 @@ def veiller_attente(etat):
             planifier_reveil(etat, DEV, "livraison")
         elif verdict == "rouge":
             etat["ci_rouges"] += 1
+            etat["release_a_verifier"] = sorted({x["depot"] for x in att.get("suivi") or [] if x.get("verdict") != "vert"})
             if etat["ci_rouges"] >= MAX_CI_ROUGES:
                 arreter(etat, "veille", "ci", f"CI du push sur {etat['release']} rouge {etat['ci_rouges']} fois de suite : "
                         + " ; ".join(lignes))
@@ -1730,7 +2129,7 @@ def veiller_attente(etat):
         master = [x for x in etat["prs_livraison"] if x["base"] == "master"]
         cibles = [(x["depot"], x["sha"], "pull_request", None) for x in master]
         verdict, lignes, par_cible = veiller_runs(etat, cibles, [REQUIS_MASTER[x["depot"]] for x in master])
-        if verdict == "attente" and duree < plafond:
+        if verdict == "attente" and encore_attendre(etat, duree, plafond, "CI des PR de livraison"):
             return
         for x in etat["prs_livraison"]:
             x["ci"] = par_cible.get((x["depot"], x["sha"]), "?") if x["base"] == "master" else "pas de CI de PR vers develop"
@@ -1754,7 +2153,7 @@ def veiller_attente(etat):
     elif e == "deploiement":
         cibles = [(c["depot"], c["commit"], "push", c["base"]) for c in att["commits"]]
         verdict, lignes, _ = veiller_runs(etat, cibles, [REQUIS_PUSH] * len(cibles))
-        if verdict == "attente" and duree < plafond:
+        if verdict == "attente" and encore_attendre(etat, duree, plafond, "CI de develop et de master (mise en production)"):
             return
         if verdict == "vert":
             changer_etape(etat, "liste-validation", "veille", "CI de develop et de master verte, lot en production :\n"
@@ -1770,6 +2169,79 @@ def veiller_attente(etat):
                 f"en production du lot est en échec :\n" + "\n".join(lignes) +
                 f"\nLe cycle est arrêté pour {HUMAIN}. Diagnostique (code, serveur, Sonar, réseau) et poste dans ce fil ce que "
                 "tu proposes ; ne corrige rien sans sa réponse. Réponse obligatoire, NO_REPLY interdit."))
+
+
+def plafonds_workflow(texte):
+    """Plafonds `timeout-minutes` d'un workflow, lus à l'indentation (pas de dépendance YAML) : {job: minutes} et
+    {(job, étape nommée): minutes}."""
+    jobs, etapes, dans_jobs, job, etape = {}, {}, False, None, None
+    for ligne in texte.split("\n"):
+        if re.match(r"^jobs:\s*$", ligne):
+            dans_jobs = True
+            continue
+        if not dans_jobs:
+            continue
+        if re.match(r"^\S", ligne) and not ligne.startswith("#"):
+            break
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*(#.*)?$", ligne)
+        if m:
+            job, etape = m.group(1), None
+            continue
+        m = re.match(r"^      - (?:name:\s*(.+?)\s*)?(?:#.*)?$", ligne) or re.match(r"^      - \w", ligne)
+        if m:
+            etape = (m.group(1) if m.lastindex else None)
+            etape = etape.strip("'\"") if etape else None
+            continue
+        m = re.match(r"^        name:\s*(.+?)\s*$", ligne)
+        if m and job:
+            etape = m.group(1).strip("'\"")
+            continue
+        m = re.match(r"^( +)timeout-minutes:\s*(\d+)", ligne)
+        if m and job:
+            if len(m.group(1)) == 4:
+                jobs[job] = int(m.group(2))
+            elif len(m.group(1)) == 8 and etape:
+                etapes[(job, etape)] = int(m.group(2))
+    return jobs, etapes
+
+
+def marges_ci(depot, ref, nb_runs=8):
+    """Durée la plus longue de chaque job et de chaque étape plafonnée, sur les derniers runs verts du workflow, face à son
+    `timeout-minutes`. Les suites grossissent à chaque lot : un plafond fixé une fois devient trop court sans prévenir,
+    et la livraison bute dessus."""
+    jobs, etapes = plafonds_workflow(lire_fichier_gh(DEPOTS[depot], f".github/workflows/{WORKFLOW[depot]}", ref))
+    maxi = {}
+    verts = sorted((x for x in runs(depot) if x.get("status") == "completed" and x.get("conclusion") == "success"),
+                   key=lambda x: x["createdAt"], reverse=True)[:nb_runs]
+    for run in verts:
+        detail = gh_json("run", "view", str(run["databaseId"]), "-R", DEPOTS[depot], "--json", "jobs")["jobs"]
+        for j in detail:
+            for cle, obj in [(j["name"], j)] + [((j["name"], st.get("name")), st) for st in j.get("steps") or []]:
+                if obj.get("conclusion") != "success" or not obj.get("startedAt") or not obj.get("completedAt"):
+                    continue
+                try:
+                    d = (date(obj["completedAt"].replace("Z", "+00:00")) - date(obj["startedAt"].replace("Z", "+00:00"))).total_seconds() / 60
+                except ValueError:
+                    continue
+                maxi[cle] = max(maxi.get(cle, 0), d)
+    res = []
+    for cle, plafond in list(jobs.items()) + list(etapes.items()):
+        if cle in maxi and plafond:
+            nom = cle if isinstance(cle, str) else f"{cle[0]} / {cle[1]}"
+            res.append({"depot": depot, "nom": nom, "max_min": maxi[cle], "plafond": plafond, "ratio": maxi[cle] / plafond,
+                        "runs": len(verts)})
+    return sorted(res, key=lambda x: -x["ratio"])
+
+
+def cmd_marges(a):
+    for depot in DEPOTS:
+        lignes = marges_ci(depot, a.ref)
+        print(f"{depot} ({a.ref}, {lignes[0]['runs'] if lignes else 0} derniers runs verts) :")
+        for x in lignes:
+            print(f"  {'!!' if x['ratio'] > SEUIL_MARGE else '  '} {x['nom']} : {x['max_min']:.1f} min sur {x['plafond']} "
+                  f"({x['ratio'] * 100:.0f} %)")
+        if not lignes:
+            print("  aucune durée mesurée")
 
 
 def veiller_lot(etat):
@@ -1877,6 +2349,8 @@ def main():
     p.add_argument("--message")
     p.add_argument("--fichier")
     p.add_argument("--dossier-lot")
+    p.add_argument("--reel", help="1er passage en revue : fichier des preuves en réel (services externes), ou « aucun »")
+    p.add_argument("--contre-relecture", help="après une correction : rapport de la contre-relecture du diff de la reprise")
     p.set_defaults(f=cmd_passe)
 
     p = sp.add_parser("verdict", help=f"{N_REV} : verdict de revue", parents=[commun])
@@ -1887,6 +2361,8 @@ def main():
     p.add_argument("--rapport", required=True)
     p.add_argument("--cartes-ok")
     p.add_argument("--cartes-ko")
+    p.add_argument("--bloquants", type=int, help="nombre de points bloquants du rapport (exigé avec --a-reprendre)")
+    p.add_argument("--non-bloquants", type=int, help=f"nombre de points non bloquants (exigé à partir de la revue {REVUE_REPORT})")
     p.add_argument("--message")
     p.set_defaults(f=cmd_verdict)
 
@@ -1925,7 +2401,17 @@ def main():
     g = p.add_mutually_exclusive_group()
     g.add_argument("--ajouter")
     g.add_argument("--faite", type=int)
+    p.add_argument("--avant", choices=("revue", "livraison"), default="livraison",
+                   help="revue : sans elle, une carte ne peut pas être vérifiée en réel (le passage en revue est refusé)")
     p.set_defaults(f=cmd_intervention)
+
+    p = sp.add_parser("reglage", help="réglages de déploiement à poser et à prouver à la mise en production", parents=[commun])
+    p.add_argument("version")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--ajouter")
+    g.add_argument("--fait", type=int)
+    p.add_argument("--preuve")
+    p.set_defaults(f=cmd_reglage)
 
     p = sp.add_parser("carte-bug", help=f"{N_REV} : carte de bug vu en production, version suivante, Not Ready",
                       parents=[commun])
@@ -1934,7 +2420,22 @@ def main():
     p.add_argument("--appli", required=True, choices=("back", "front", "back/front"))
     p.add_argument("--gravite", required=True, choices=tuple(GRAVITES))
     p.add_argument("--description-fichier", required=True)
+    p.add_argument("--version-cible", help="version de la carte, si ce n'est pas la suivante")
     p.set_defaults(f=cmd_carte_bug)
+
+    p = sp.add_parser("carte-report", help=f"point reporté au lot suivant (non bloquant à partir de la revue {REVUE_REPORT}, hors périmètre)",
+                      parents=[commun])
+    p.add_argument("version")
+    p.add_argument("--titre", required=True)
+    p.add_argument("--appli", required=True, choices=("back", "front", "back/front"))
+    p.add_argument("--gravite", required=True, choices=tuple(GRAVITES))
+    p.add_argument("--description-fichier", required=True)
+    p.add_argument("--version-cible", help="version de la carte, si ce n'est pas la suivante")
+    p.set_defaults(f=cmd_carte_report)
+
+    p = sp.add_parser("marges", help="durées mesurées des jobs de CI face à leurs plafonds", parents=[commun])
+    p.add_argument("--ref", default="develop")
+    p.set_defaults(f=cmd_marges)
 
     p = sp.add_parser("fin", help=f"{N_REV} : lot validé en production", parents=[commun])
     p.add_argument("version")

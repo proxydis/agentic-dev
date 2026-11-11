@@ -166,7 +166,8 @@ MONDE.write_text(json.dumps({
     "urls": {"production": "https://app.example.test", "preview": "https://preview.app.example.test"},
     "trello": {"tableau": "T-test", "listes": L,
                "etiquettes_gravite": {g: f"E-{g}" for g in ("critique", "important", "normal", "faible", "cosmetique")}},
-    "max_aller_retours": 3}))
+    "jobs_sautables": ["quality", "integration", "e2e"],
+    "slack_archives": "https://exemple.slack.test/archives"}))
 ENV = {"PATH": "/usr/bin:/bin", "MONDE": str(MONDE), "CYCLE_LOT_BASE": str(TMP), "CYCLE_LOT_GH": str(ICI / "faux/gh"),
        "OPENCLAW_BIN": str(ICI / "faux/openclaw"), "CYCLE_LOT_SYSTEMCTL": str(ICI / "faux/systemctl"),
        "CYCLE_LOT_TRELLO_API": f"http://127.0.0.1:{serveur.server_port}/1", "TRELLO_API_KEY": "k", "TRELLO_TOKEN": "t",
@@ -230,9 +231,21 @@ av = etat()["avancement"]
 verifier(av["faites"] == 3 and av["total"] == 4 and av["par_liste"] == {"Work in progress": 1, "Waiting for review": 3}
          and av["cartes"] == {"1": "waiting", "2": "waiting", "3": "waiting", "4": "wip"},
          "avancement lu par le relais : 3 cartes faites sur 4 (passes poussées, en Waiting for review)")
-out = lancer("passe", "1.0.0", "--vers", "relecteur", "--message", "lot fini, arbitrages A1-A3 pris", par="dev")
+out = lancer("passe", "1.0.0", "--vers", "relecteur", "--message", "lot fini", par="dev", attendu=2)
+verifier("--reel" in out and etat()["etape"] == "dev", "1er passage en revue refusé sans les preuves en réel (ou « aucun »)")
+lancer("intervention", "1.0.0", "--ajouter", "clé du service externe en préproduction", "--avant", "revue", par="dev")
+out = lancer("passe", "1.0.0", "--vers", "relecteur", "--reel", "aucun", par="dev", attendu=2)
+verifier("nécessaires à la vérification" in out and "clé du service externe" in out,
+         "passage en revue refusé : intervention nécessaire à la vérification encore ouverte")
+lancer("intervention", "1.0.0", "--faite", "2", par="dev")
+reel = TMP / "reel.md"
+reel.write_text("carte 2 : traitement joué sur la préproduction, résultat attendu")
+out = lancer("passe", "1.0.0", "--vers", "relecteur", "--reel", str(reel), "--message", "lot fini, arbitrages A1-A3 pris", par="dev")
 e = etat()
 verifier(e["etape"] == "deploiement-revue" and e["tour"] == "veille", "étape deploiement-revue, le relais attend")
+verifier(e["preuves_reel"] == str(reel) and e["attente"]["deploiement"]["seul"]
+         and any(x[:2] == ["workflow", "run"] and "deploiement_seul=true" in x for x in monde()["appels"]),
+         "preuves en réel notées ; preview demandée en déploiement seul (sans rejouer quality)")
 verifier(all(liste_de(n) == "review" for n in range(1, 5)), "cartes en Under review")
 verifier("encore en Work in progress" in out and "4" in out, "carte 4 signalée encore en WIP")
 disp = [r for r in monde()["runs"]["back"] if r["event"] == "workflow_dispatch"]
@@ -256,15 +269,24 @@ verifier(r["sessionKey"] == "agent:relecteur:slack:channel:c000test:thread:17000
 verifier("front-preview.example.test" in r["message"] and "lot fini" in r["message"], "consigne : URL preview et message du dev")
 verifier("Fais la revue complète" in r["message"] and "--disallowedTools Monitor" in r["message"],
          "1re revue : revue complète, job de revue sans suivi d'avancement")
+verifier("Revue n° 1" in r["message"] and "tout se corrige" in r["message"] and "--bloquants" in r["message"]
+         and str(reel) in r["message"], "1re revue : règle des revues 1 et 2, preuves en réel du dev transmises")
 verifier(not monde().get("resets") and "Contexte neuf" not in r["message"],
          "contexte neuf : le relecteur n'a pas encore de session dans ce fil, rien à remettre à zéro")
 
 print("4. verdict À REPRENDRE")
 rap = TMP / "rapport1.md"
 rap.write_text("points N1 N2")
-out = lancer("verdict", "1.0.0", "--a-reprendre", "--rapport", str(rap), "--cartes-ok", "1,2", par="relecteur", attendu=2)
+out = lancer("verdict", "1.0.0", "--a-reprendre", "--rapport", str(rap), "--cartes-ok", "1,2", "--cartes-ko", "3,4",
+             par="relecteur", attendu=2)
+verifier("--bloquants N" in out, "refus : À REPRENDRE sans le nombre de points bloquants")
+out = lancer("verdict", "1.0.0", "--merger", "--non-bloquants", "2", "--rapport", str(rap), par="relecteur", attendu=2)
+verifier("aux revues 1 et 2, un point non bloquant se corrige" in out, "revue 1 : À MERGER refusé avec des non bloquants")
+out = lancer("verdict", "1.0.0", "--a-reprendre", "--bloquants", "0", "--rapport", str(rap), "--cartes-ok", "1,2", par="relecteur",
+             attendu=2)
 verifier("manquent : [3, 4]" in out, "refus : cartes non classées")
-out = lancer("verdict", "1.0.0", "--a-reprendre", "--rapport", str(rap), "--cartes-ok", "1,2", "--cartes-ko", "3,4", par="relecteur")
+out = lancer("verdict", "1.0.0", "--a-reprendre", "--bloquants", "0", "--non-bloquants", "2", "--rapport", str(rap),
+             "--cartes-ok", "1,2", "--cartes-ko", "3,4", par="relecteur")
 verifier(etat()["a_reveiller"]["agent"] == "dev" and len(monde().get("reveils", [])) == 1, "réveil du dev planifié, pas fait par la commande")
 monde(lambda m: m["sessions"].update(dev=[{"key": FIL, "sessionId": "s-dev-1", "hasActiveRun": True}]))
 lancer("veille")
@@ -276,6 +298,9 @@ rs = monde().get("resets", [])
 verifier(len(rs) == 1 and rs[0]["key"] == FIL and rs[0].get("expectedSessionId") == "s-dev-1" and rs[0]["reason"] == "reset",
          "contexte neuf : session du dev remise à zéro avant l'étape correction, sur le sessionId lu")
 verifier("Contexte neuf" in derniers_reveils()[0]["message"], "consigne : contexte neuf signalé au dev")
+verifier("Corrige TOUS les points" in derniers_reveils()[0]["message"] and "la famille, pas le cas" in derniers_reveils()[0]["message"]
+         and "--contre-relecture" in derniers_reveils()[0]["message"],
+         "revue 1 À REPRENDRE sans bloquant : tout se corrige, par famille, avec contre-relecture")
 e = etat()
 verifier(e["etape"] == "correction" and e["aller_retours"] == 1, "étape correction, aller-retour 1")
 verifier(e["rapports"][-1]["tetes"] == {"back#301": "featback1".ljust(40, "0"), "front#401": "featfront1".ljust(40, "0")},
@@ -320,7 +345,11 @@ def correction(m):
 
 
 monde(correction)
-lancer("passe", "1.0.0", "--vers", "relecteur", "--message", "N1 N2 corrigés", par="dev")
+out = lancer("passe", "1.0.0", "--vers", "relecteur", "--message", "N1 N2 corrigés", par="dev", attendu=2)
+verifier("--contre-relecture" in out and etat()["etape"] == "correction", "correction : passage refusé sans contre-relecture")
+cr = TMP / "contre-relecture.md"
+cr.write_text("diff relu : rien de cassé")
+lancer("passe", "1.0.0", "--vers", "relecteur", "--contre-relecture", str(cr), "--message", "N1 N2 corrigés", par="dev")
 monde(lambda m: m["runs"]["back"][-1].update(status="completed", conclusion="success"))
 lancer("veille")
 modifier_etat("1.0.0", lambda e: e["attente"]["deploiement"].update(vert_a=il_y_a(11)))
@@ -463,22 +492,39 @@ verifier("Relance automatique n°2" in derniers_reveils()[0]["message"], "relanc
 modifier_etat("1.0.1", lambda e: e["relances"].update(derniere=il_y_a(50), verif_session=il_y_a(11)))
 lancer("veille")
 verifier("ne répond pas" in monde()["avis"][-1] and "<@U0TEST>" in monde()["avis"][-1], "alerte postée à l'humain")
+verifier("ne répond pas" in monde()["dm"][-1] and "/archives/C000TEST/p1700000000000200" in monde()["dm"][-1],
+         "alerte envoyée aussi en message direct à l'humain, avec le lien du fil")
+na, nd = len(monde()["avis"]), len(monde()["dm"])
+modifier_etat("1.0.1", lambda e: e["relances"].update(verif_session=il_y_a(11), alerte_heure=il_y_a(60)))
+lancer("veille")
+verifier(len(monde()["avis"]) == na, "pas de rappel avant 2 h")
+modifier_etat("1.0.1", lambda e: e["relances"].update(verif_session=il_y_a(11), alerte_heure=il_y_a(121)))
+lancer("veille")
+verifier(len(monde()["avis"]) == na + 1 and "rappel n° 1" in monde()["avis"][-1] and len(monde()["dm"]) == nd + 1,
+         "alerte répétée au bout de 2 h, dans le fil et en message direct")
+monde(lambda m: m.update(units=["dev-101-impl.service"]))
+lancer("veille")
+rl = etat("1.0.1")["relances"]
+verifier(rl["nb"] == 0 and not rl["alerte"], "signe de vie (job relancé) : relances et alerte réarmées")
 verifier(len(monde().get("resets", [])) == r0, "contexte neuf : aucune remise à zéro pour une relance")
 monde(lambda m: m.update(units=[]))
 
-print("10. arrêt au 3e aller-retour, reprise")
-modifier_etat("1.0.1", lambda e: e.update(etape="revue", tour="relecteur", aller_retours=2))
+print("10. arrêt au 5e aller-retour, reprise")
+verifier(etat("1.0.1")["max_aller_retours"] == 5, "plafond de 5 aller-retours à la création du cycle")
+modifier_etat("1.0.1", lambda e: e.update(etape="revue", tour="relecteur", aller_retours=4))
 monde(lambda m: [c.update(idList=L["review"]) for c in m["cartes"] if c["name"].startswith("[V1.0.1-")])
-out = lancer("verdict", "1.0.1", "--a-reprendre", "--rapport", str(rap), "--cartes-ko", "1,2", par="relecteur")
+out = lancer("verdict", "1.0.1", "--a-reprendre", "--bloquants", "1", "--non-bloquants", "0", "--rapport", str(rap),
+             "--cartes-ko", "1,2", par="relecteur")
 e = etat("1.0.1")
-verifier(e["etape"] == "arret" and e["arret"]["motif"] == "aller-retours", "3e À REPRENDRE : cycle arrêté")
+verifier(e["etape"] == "arret" and e["arret"]["motif"] == "aller-retours", "5e À REPRENDRE : cycle arrêté")
 lancer("veille")
 verifier("cycle arrêté (aller-retours)" in monde()["avis"][-1] and "en mentionnant Relecteur" in monde()["avis"][-1],
          "avis d'arrêt posté pour l'humain par le relais, avec l'agent à mentionner")
+verifier("cycle arrêté (aller-retours)" in monde()["dm"][-1], "arrêt envoyé aussi en message direct à l'humain")
 out = lancer("reprise", "1.0.1", "--decision", "continue", par="dev", attendu=2)
 verifier("--rallonge" in out, "reprise refusée sans rallonge")
 lancer("reprise", "1.0.1", "--decision", "une correction de plus", "--rallonge", par="dev")
-verifier(etat("1.0.1")["etape"] == "correction" and etat("1.0.1")["max_aller_retours"] == 4, "reprise en correction, plafond 4")
+verifier(etat("1.0.1")["etape"] == "correction" and etat("1.0.1")["max_aller_retours"] == 6, "reprise en correction, plafond 6")
 
 print("11. gateway en panne : nouveaux essais puis avis")
 monde(lambda m: m.update(gateway_en_panne=True))
@@ -602,12 +648,12 @@ out = lancer("etat", "1.0.4")
 verifier("Cartes : 1, 2, 4" in out and "Sorties du lot : 3 -> [V1.0.5-Back] 1" in out, "etat : la carte reportée est listée à part")
 lancer("veille")
 verifier(J4.read_text().count("sortie du lot") == 1, "sortie notée une seule fois")
-lancer("passe", "1.0.4", "--vers", "relecteur", par="dev")
+lancer("passe", "1.0.4", "--vers", "relecteur", "--reel", "aucun", par="dev")
 verifier([liste_de(n, "1.0.4") for n in (1, 2, 4)] == ["review", "review", "not_ready"]
          and carte("k43")["idList"] == L["not_ready"], "passage en revue : les cartes en Not Ready ne bougent pas")
 modifier_etat("1.0.4", lambda e: e.update(etape="revue", tour="relecteur"))
-out = lancer("verdict", "1.0.4", "--a-reprendre", "--rapport", str(rap), "--cartes-ok", "1,2", "--cartes-ko", "3",
-             par="relecteur", attendu=2)
+out = lancer("verdict", "1.0.4", "--a-reprendre", "--bloquants", "1", "--rapport", str(rap), "--cartes-ok", "1,2",
+             "--cartes-ko", "3", par="relecteur", attendu=2)
 verifier("cartes inconnues du lot : [3]" in out, "verdict : une carte reportée ne peut plus être classée")
 renommer("k43", "[V1.0.4-Back] 3. carte 3")
 lancer("veille")
@@ -627,6 +673,236 @@ lancer("veille")
 verifier([c["num"] for c in etat("1.0.4")["cartes"]] == [1, 2, 4], "après le verdict À MERGER, la liste du lot ne suit plus le tableau")
 verifier("sortie du lot" not in (TMP / "cycles" / "1.0.0" / "journal.log").read_text(),
          "lot 1.0.0 du banc : aucune sortie de carte sans renommage (carte annulée comprise)")
+
+
+print("16. règle de revue : à partir de la 3e revue, non bloquants en cartes du lot suivant")
+F6 = FIL.replace("000100", "000600")
+
+
+def nouveau_lot(v, nb, npr, cartes=2):
+    def maj(m):
+        for i in range(1, cartes + 1):
+            m["cartes"].append({"id": f"k{v}-{i}", "name": f"[V{v}-Back] {i}. carte {i}", "idList": L["not_ready"]})
+        for d, n in (("back", nb), ("front", npr)):
+            sha = f"feat{d}{v}".ljust(40, "0")
+            m["prs"][d][str(n)] = pr(d, n, f"feat/{v}-lot", f"release/{v}", sha)
+            m["runs"][d].append(run(d, 2000 + n, sha, "pull_request", f"feat/{v}-lot",
+                                    jobs={"quality": "success", "integration": "success", "e2e": "success"}))
+            m["refs"][d][f"release/{v}"] = f"rel{d}{v}".ljust(40, "0")
+            m["refs"][d][f"feat/{v}-lot"] = sha
+            m["fichiers"][d][f"release/{v}"] = {"CHANGELOG.md": CL}
+            m["compare"][d].update({f"develop...release/{v}": 2, f"master...release/{v}": 3})
+        m["fichiers"]["front"][f"release/{v}"]["package.json"] = PK
+    monde(maj)
+
+
+def en_revue(v, nb, npr, aller_retours):
+    monde(lambda m: [c.update(idList=L["review"]) for c in m["cartes"] if c["name"].startswith(f"[V{v}-")])
+    modifier_etat(v, lambda e: e.update(etape="revue", tour="relecteur", aller_retours=aller_retours, attente=None, prs_lot=[
+        {"depot": d, "num": n, "branche": f"feat/{v}-lot", "sha": f"feat{d}{v}".ljust(40, "0"), "labels": [],
+         "url": f"https://github.com/exemple/app-{d}/pull/{n}"} for d, n in (("back", nb), ("front", npr))]))
+
+
+nouveau_lot("2.0.6", 821, 921)
+lancer("debut", "2.0.6", "--session-key", F6, par="dev")
+en_revue("2.0.6", 821, 921, 2)
+modifier_etat("2.0.6", lambda e: e.update(seq=e["seq"] + 1))
+lancer("reveiller", "2.0.6", "--agent", "relecteur", par="relecteur")
+out = lancer("verdict", "2.0.6", "--a-reprendre", "--bloquants", "0", "--non-bloquants", "2", "--rapport", str(rap),
+             "--cartes-ko", "1,2", par="relecteur", attendu=2)
+verifier("un lot sans point bloquant se merge" in out, "3e revue : À REPRENDRE refusé sans point bloquant")
+out = lancer("verdict", "2.0.6", "--a-reprendre", "--bloquants", "1", "--rapport", str(rap), "--cartes-ko", "1,2",
+             par="relecteur", attendu=2)
+verifier("--non-bloquants N" in out, "3e revue : nombre de points non bloquants exigé")
+out = lancer("verdict", "2.0.6", "--a-reprendre", "--bloquants", "1", "--non-bloquants", "2", "--rapport", str(rap),
+             "--cartes-ko", "1,2", par="relecteur", attendu=2)
+verifier("2 point(s) non bloquant(s) annoncé(s), 0 carte(s)" in out, "3e revue : chaque non bloquant doit avoir sa carte")
+lancer("carte-report", "2.0.6", "--titre", "Libellé tronqué", "--appli", "front", "--gravite", "faible",
+       "--description-fichier", str(desc), par="relecteur")
+out = lancer("carte-report", "2.0.6", "--titre", "Journal incomplet", "--appli", "back", "--gravite", "normal",
+             "--description-fichier", str(desc), "--version-cible", "2.0.9", par="relecteur")
+noms = [c["name"] for c in monde()["cartes"][-2:]]
+verifier(noms == ["[V2.0.7-Fix-Front] 1. Libellé tronqué", "[V2.0.9-Fix-Back] 1. Journal incomplet"]
+         and all(c["idList"] == L["not_ready"] for c in monde()["cartes"][-2:]),
+         "carte-report : cartes du lot suivant (ou de la version demandée), en Not Ready")
+out = lancer("carte-report", "2.0.6", "--titre", "x", "--appli", "back", "--gravite", "normal", "--description-fichier",
+             str(desc), "--version-cible", "2.0.5", par="relecteur", attendu=2)
+verifier("postérieure au lot" in out, "carte-report : version antérieure au lot refusée")
+lancer("verdict", "2.0.6", "--a-reprendre", "--bloquants", "1", "--non-bloquants", "2", "--rapport", str(rap),
+       "--cartes-ok", "1", "--cartes-ko", "2", par="relecteur")
+lancer("veille")
+e, msg = etat("2.0.6"), derniers_reveils()[0]["message"]
+verifier(e["etape"] == "correction" and e["aller_retours"] == 3 and "points BLOQUANTS" in msg and "eux seuls" in msg
+         and "[V2.0.7-Fix-Front] 1. Libellé tronqué" in msg and "Corrige TOUS" not in msg,
+         "3e revue À REPRENDRE : le dev ne corrige que les bloquants, les cartes reportées lui sont nommées")
+en_revue("2.0.6", 821, 921, 3)
+lancer("veille")
+lancer("reveiller", "2.0.6", "--agent", "relecteur", par="relecteur")
+lancer("veille")
+msg = derniers_reveils()[0]["message"]
+verifier("Revue n° 4" in msg and "seul un point BLOQUANT" in msg and "carte-report" in msg,
+         "consigne de la 4e revue : seul un bloquant renvoie le lot, non bloquants en cartes")
+lancer("carte-report", "2.0.6", "--titre", "Reste mineur", "--appli", "back", "--gravite", "faible",
+       "--description-fichier", str(desc), par="relecteur")
+out = lancer("verdict", "2.0.6", "--merger", "--non-bloquants", "2", "--rapport", str(rap2), par="relecteur", attendu=2)
+verifier("1 carte(s) créée(s)" in out, "4e revue : À MERGER refusé tant qu'un non bloquant n'a pas sa carte")
+out = lancer("verdict", "2.0.6", "--merger", "--non-bloquants", "1", "--rapport", str(rap2), par="relecteur")
+e = etat("2.0.6")
+verifier(e["etape"] == "ci-release" and len(e["cartes_reportees"]) == 3 and "Cartes reportées" in lancer("etat", "2.0.6"),
+         "4e revue sans bloquant : lot mergé, non bloquants en cartes du lot suivant")
+
+print("17. voie courte : correctif d'après merge sur la CI ou les tests, sans preview et hors compteur")
+
+
+def pr_correctif(n, fichiers, sha):
+    def maj(m):
+        p = pr("front", n, "fix/2.0.6-ci-release", "release/2.0.6", sha.ljust(40, "0"))
+        p["files"] = [{"path": f} for f in fichiers]
+        m["prs"]["front"][str(n)] = p
+        m["runs"]["front"].append(run("front", 3000 + n, sha.ljust(40, "0"), "pull_request", "fix/2.0.6-ci-release",
+                                      jobs={"quality": "success", "e2e": "success"}))
+    monde(maj)
+
+
+monde(lambda m: [m["runs"][d].append(run(d, 2100, m["refs"][d]["release/2.0.6"], "push", "release/2.0.6",
+                                         concl="success" if d == "back" else "failure",
+                                         jobs={"quality": "success" if d == "back" else "failure",
+                                               "deploy": "success" if d == "back" else "skipped"})) for d in ("back", "front")])
+monde(lambda m: m["runs"]["back"][-1].update(status="in_progress", conclusion=None))
+lancer("veille")
+e = etat("2.0.6")
+verifier(e["etape"] == "correction" and e["release_a_verifier"] == ["back", "front"],
+         "rouge immédiat : front rouge sur la release, back encore en cours, dev réveillé sans attendre le plafond")
+pr_correctif(931, [".github/workflows/front.yml", "tests/unit/workflowE2e.test.ts", "docs/release.md"], "fix1")
+nd = sum(1 for x in monde()["appels"] if x[:2] == ["workflow", "run"])
+out = lancer("passe", "2.0.6", "--vers", "relecteur", "--message", "délai e2e relevé", par="dev")
+lancer("veille")
+e, msg = etat("2.0.6"), derniers_reveils()[0]["message"]
+verifier(e["etape"] == "revue" and e["attente"].get("voie_courte") and "voie courte" in out.lower()
+         and sum(1 for x in monde()["appels"] if x[:2] == ["workflow", "run"]) == nd and "VOIE COURTE" in msg,
+         "voie courte reconnue : pas de contre-relecture exigée, pas de déploiement de preview, consigne dédiée")
+ar = e["aller_retours"]
+lancer("verdict", "2.0.6", "--a-reprendre", "--bloquants", "1", "--rapport", str(rap), par="relecteur")
+e = etat("2.0.6")
+verifier(e["etape"] == "correction" and e["aller_retours"] == ar and e["voie_courte_tours"] == 1,
+         "À REPRENDRE en voie courte : hors compteur d'aller-retours")
+monde(lambda m: m["prs"]["front"]["931"].update(headRefOid="fix2".ljust(40, "0")))
+monde(lambda m: m["runs"]["front"].append(run("front", 3999, "fix2".ljust(40, "0"), "pull_request", "fix/2.0.6-ci-release",
+                                              jobs={"quality": "success", "e2e": "success"})))
+lancer("passe", "2.0.6", "--vers", "relecteur", par="dev")
+lancer("verdict", "2.0.6", "--merger", "--rapport", str(rap2), par="relecteur")
+e = etat("2.0.6")
+verifier(e["etape"] == "ci-release" and e["attente"]["depots"] == ["back", "front"] and e["voie_courte_tours"] == 0,
+         "correctif mergé : la CI de la release est attendue sur le front et sur le back, pas encore vu vert")
+modifier_etat("2.0.6", lambda e: e.update(etape="correction", tour="dev"))
+pr_correctif(932, ["tests/unit/a.test.ts", "src/app/calcul.ts"], "fix3")
+monde(lambda m: m["prs"]["front"].pop("931"))
+out = lancer("passe", "2.0.6", "--vers", "relecteur", par="dev", attendu=2)
+verifier("--contre-relecture" in out, "un fichier d'application dans le correctif : voie normale, contre-relecture exigée")
+
+print("18. relais : réveil ciblé quand la CI est verte et que la main n'est pas passée")
+F7 = FIL.replace("000100", "000700")
+nouveau_lot("2.0.8", 841, 941)
+lancer("debut", "2.0.8", "--session-key", F7, par="dev")
+lancer("veille")
+n0 = len(monde().get("reveils", []))
+modifier_etat("2.0.8", lambda e: e.update(depuis=il_y_a(20)))
+lancer("veille")
+r = derniers_reveils()[0]
+verifier(len(monde()["reveils"]) == n0 + 1 and "Réveil ciblé n°1" in r["message"] and "cycle-lot passe 2.0.8" in r["message"]
+         and r["sessionKey"] == F7, "CI verte depuis 20 min sans job ni tour : réveil ciblé du dev, sans attendre 45 min")
+modifier_etat("2.0.8", lambda e: e["relances"].update(verif_session=il_y_a(11), derniere=il_y_a(20)))
+lancer("veille")
+verifier(len(monde()["reveils"]) == n0 + 1, "pas de second réveil ciblé avant 45 min, ni de relance ordinaire")
+modifier_etat("2.0.8", lambda e: (e["relances"].update(verif_session=il_y_a(11), derniere=il_y_a(50)),
+                                  e["relances"]["ci_verte"].update(heure=il_y_a(50))))
+lancer("veille")
+verifier("Réveil ciblé n°2" in derniers_reveils()[0]["message"], "second réveil ciblé 45 min plus tard")
+modifier_etat("2.0.8", lambda e: (e.update(depuis=il_y_a(60)),
+                                  e["relances"].update(verif_session=il_y_a(11), derniere=il_y_a(50)),
+                                  e["relances"]["ci_verte"].update(heure=il_y_a(50))))
+lancer("veille")
+verifier("Relance automatique n°1" in derniers_reveils()[0]["message"], "puis les relances ordinaires prennent le relais")
+monde(lambda m: m["runs"]["front"].append(run("front", 4000, "featfront2.0.8".ljust(40, "0"), "pull_request", "feat/2.0.8-lot",
+                                              concl="failure", jobs={"quality": "failure", "e2e": "success"})))
+monde(lambda m: m["runs"]["front"][-1].update(createdAt="2099-01-01T00:00:00Z"))
+modifier_etat("2.0.8", lambda e: e.update(depuis=il_y_a(20), relances={"nb": 0, "derniere": None, "alerte": False}))
+n1 = len(monde()["reveils"])
+lancer("veille")
+verifier(len(monde()["reveils"]) == n1, "CI rouge sur une PR : pas de réveil ciblé")
+
+print("19. promotion du même contenu : jobs de test sautés par décision, marqueur contenu-deja-valide")
+modifier_etat("2.0.8", lambda e: e.update(etape="ci-release", tour="veille", depuis=il_y_a(1),
+                                          attente={"depots": ["back"], "relances": []}))
+monde(lambda m: m["runs"]["back"].append(run("back", 4100, m["refs"]["back"]["release/2.0.8"], "push", "release/2.0.8",
+                                             jobs={"quality": "skipped", "integration": "skipped", "deploy": "success"})))
+lancer("veille")
+verifier(etat("2.0.8")["etape"] == "correction", "quality sauté sans marqueur : le run n'a rien testé, il est rouge")
+modifier_etat("2.0.8", lambda e: e.update(etape="ci-release", tour="veille", depuis=il_y_a(1), ci_rouges=0,
+                                          attente={"depots": ["back"], "relances": []}))
+monde(lambda m: m["runs"]["back"][-1]["jobs"].update({"contenu-deja-valide": "success"}))
+lancer("veille")
+verifier(etat("2.0.8")["etape"] == "ci-livraison", "quality sauté avec le marqueur contenu-deja-valide : run vert")
+
+print("20. attente sans rouge au-delà du plafond : un avis, puis l'attente continue jusqu'au double")
+modifier_etat("2.0.8", lambda e: e.update(etape="deploiement", tour="veille", depuis=il_y_a(250),
+                                          attente={"commits": [{"depot": "back", "base": "master", "commit": "prod108".ljust(40, "0")}],
+                                                   "relances": []}))
+monde(lambda m: m["runs"]["back"].append(run("back", 4200, "prod108".ljust(40, "0"), "push", "master", statut="queued", concl=None)))
+na = len(monde()["avis"])
+lancer("veille")
+lancer("veille")
+e = etat("2.0.8")
+verifier(e["etape"] == "deploiement" and len(monde()["avis"]) == na + 1 and "aucun job rouge" in monde()["avis"][-1],
+         "250 min sans verdict ni rouge : un seul avis, pas d'arrêt")
+modifier_etat("2.0.8", lambda e: e.update(depuis=il_y_a(490)))
+lancer("veille")
+verifier(etat("2.0.8")["etape"] == "arret", "au double du plafond : arrêt")
+
+print("21. réglages de déploiement : exigés avant les validations en production")
+lancer("reprise", "2.0.8", "--decision", "essai", "--etape", "liste-validation", par="dev")
+lancer("reglage", "2.0.8", "--ajouter", "FOO_URL sur backend-prod", par="dev")
+lancer("reglage", "2.0.8", "--ajouter", "lancer republier-donnees.yml sur master", par="relecteur")
+lancer("veille")
+lancer("reveiller", "2.0.8", par="dev")
+lancer("veille")
+verifier("FOO_URL sur backend-prod" in derniers_reveils()[0]["message"] and "AVANT de passer la main" in derniers_reveils()[0]["message"],
+         "liste-validation : les réglages ouverts sont dans la consigne du dev")
+out = lancer("passe", "2.0.8", "--vers", "relecteur", "--etape", "validation-prod", "--fichier", str(liste), par="dev", attendu=2)
+verifier("réglages de déploiement encore ouverts" in out and "republier-donnees" in out, "validation-prod refusée : réglages ouverts")
+out = lancer("reglage", "2.0.8", "--fait", "1", par="dev", attendu=2)
+verifier("--preuve" in out, "réglage refusé sans preuve")
+lancer("reglage", "2.0.8", "--fait", "1", "--preuve", "/health : front_url présent", par="dev")
+lancer("reglage", "2.0.8", "--fait", "2", "--preuve", "run 123 vert, 42 entrées", par="dev")
+lancer("passe", "2.0.8", "--vers", "relecteur", "--etape", "validation-prod", "--fichier", str(liste), par="dev")
+lancer("veille")
+verifier(etat("2.0.8")["etape"] == "validation-prod" and "run 123 vert" in derniers_reveils()[0]["message"],
+         "réglages faits et prouvés : le relecteur les vérifie en premier")
+
+print("22. marges de CI : durée mesurée face au plafond")
+WF = ("name: Back\non:\n  push:\njobs:\n  quality:\n    runs-on: x\n    timeout-minutes: 90\n    steps:\n"
+      "      - name: Tests\n        timeout-minutes: 50\n        run: pytest\n  deploy:\n    timeout-minutes: 10\n    steps:\n"
+      "      - uses: actions/checkout@v4\n      - name: Deploy\n        run: curl\n")
+
+
+def mesures(m):
+    for d in ("back", "front"):
+        m["fichiers"][d].setdefault("develop", {})[f".github/workflows/{d}.yml"] = WF
+    r = run("back", 5000, "mesure".ljust(40, "0"), "push", "release/2.0.8", jobs={"quality": "success", "deploy": "success"})
+    r["createdAt"] = "2099-02-01T00:00:00Z"
+    r["detail"] = [{"name": "quality", "conclusion": "success", "startedAt": "2030-01-10T10:00:00Z",
+                    "completedAt": "2030-01-10T10:53:00Z",
+                    "steps": [{"name": "Tests", "conclusion": "success", "startedAt": "2030-01-10T10:02:00Z",
+                               "completedAt": "2030-01-10T10:47:00Z"}]},
+                   {"name": "deploy", "conclusion": "success", "startedAt": "2030-01-10T10:53:00Z",
+                    "completedAt": "2030-01-10T10:54:00Z", "steps": []}]
+    m["runs"]["back"].append(r)
+
+
+monde(mesures)
+out = lancer("marges", "--ref", "develop", par="mainteneur")
+verifier("!! quality / Tests : 45.0 min sur 50 (90 %)" in out and "   quality : 53.0 min sur 90 (59 %)" in out
+         and "deploy : 1.0 min sur 10" in out, "marges : étape à 90 % de son plafond signalée, job à 59 % non")
 
 print("13. aucune commande d'agent n'a tenté de réveil direct")
 verifier(not monde().get("refus_exec"), "aucun `gateway call agent` depuis l'exec d'un agent")

@@ -81,6 +81,8 @@ def main():
             r = next(x for x in m["runs"][d] if str(x["databaseId"]) == a[2])
             if "--log-failed" in a:
                 print(r.get("log", ""))
+            elif r.get("detail"):
+                print(json.dumps({"jobs": r["detail"]}))
             else:
                 print(json.dumps({"jobs": [{"name": k, "conclusion": v} for k, v in r["jobs"].items()]}))
         elif a[:2] == ["run", "rerun"]:

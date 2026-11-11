@@ -349,7 +349,10 @@ CI ne part en fin de lot. Mets alors ta branche à jour avec \`origin/$REL\` et 
 Avant ta dernière poussée, relis aussi le diff complet du lot sur cette appli (\`git diff origin/$REL...HEAD\`) avec la
 grille de revue, \`$GRILLE\`, celle qu'utilise $NOM_REV : chaque carte conforme à son texte et aux arbitrages, un test qui
 échoue sans chaque correction et le test du cas voisin, les appelants vérifiés, rien hors du périmètre. Corrige ce que
-tu trouves : chaque point que $NOM_REV relèvera coûte un aller-retour, et le cycle s'arrête au troisième.
+tu trouves : chaque point que $NOM_REV relèvera coûte un aller-retour complet. Si ce lot est une reprise de correction,
+applique la section « Corriger la famille, pas le cas » de la grille : pour chaque point corrigé, la table des variantes
+voisines et son test paramétré existent, et le diff de la reprise est relu avec pour seule question « qu'est-ce que
+cette correction casse, oublie ou laisse passer ? ».
 
 CI : pousse, puis termine. Ne la déclenche pas, ne l'attends pas, ne relance aucun run, même si l'étape le demande
 plus haut : la PR porte l'étiquette \`$PAUSE\` jusqu'à la fin du lot, puis le lanceur lance la CI des PR sur leurs
