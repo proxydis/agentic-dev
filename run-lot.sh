@@ -4,14 +4,17 @@
 # ou le fichier désigné par RUN_LOT_CONFIG.
 #
 #   run-lot.sh <dossier-du-lot> pre    phase PRE seule (études, mesures, questions d'arbitrage), puis s'arrête
-#   run-lot.sh <dossier-du-lot> impl   voies A et B en parallèle, phase FIN (fusion + suite complète), puis CI
-#                                      des PR du lot, une fois, sur leurs têtes finales
+#   run-lot.sh <dossier-du-lot> impl   voies A, B et C en parallèle, phase FIN (fusion, relecture, puis suite
+#                                      complète et contrôles joués en script, sans Claude), puis CI des PR du
+#                                      lot, une fois, sur leurs têtes finales
 #
 # Le dossier du lot contient lot.conf, etapes.txt, step-<nom>.md, card-<nn>.md, arbitrages.md,
 # common-back.md, common-front.md (et common-<suffixe de branche>.md s'il le faut).
 # Ligne d'etapes.txt :  <nom> <phase> <repo> <cartes|-> <branche> <base> [opt]
-#   phase = PRE | A | B | FIN ; une étape FUSION (nom commençant par FUSION) fusionne la branche de la voie B
-#   dans celle de la voie A, la résolution des conflits passant par Claude si git n'y arrive pas seul.
+#   phase = PRE | A | B | C | FIN ; une étape FUSION (nom commençant par FUSION) fusionne la branche d'une voie
+#   (-vB, -vC) dans celle du lot, la résolution des conflits passant par Claude si git n'y arrive pas seul.
+#   Une étape FIN sans carte est la fin d'une application : relecture par Claude si step-<nom>.md existe, puis
+#   partie mécanique (fin-mecanique.sh), puis une passe de correction seulement s'il y a du rouge.
 set -uo pipefail
 
 LOT=$(realpath "${1:?dossier du lot}")
@@ -23,10 +26,24 @@ HERE=$(dirname "$(realpath "$0")")
 source "$LOT/lot.conf"
 : "${VERSION:?}" "${REL:?}" "${PREFIX:?}" "${REPO_BACK:?}" "${REPO_FRONT:?}" "${LOGS:?}"
 declare -p CARTE >/dev/null 2>&1 || declare -A CARTE=()
-MAX_VOIES=${MAX_VOIES:-2}
-SEUIL_MIO=${SEUIL_MIO:-3072}
-WORKERS_SEUL=${WORKERS_SEUL:-8}
+# Au plus MAX_VOIES passes Claude Code à la fois, SEUIL_MIO de mémoire disponible exigés au démarrage de chaque passe.
+# À trois voies, chaque voie n'a que WORKERS_3VOIES workers de tests ciblés.
+MAX_VOIES=${MAX_VOIES:-3}
+SEUIL_MIO=${SEUIL_MIO:-2560}
 WORKERS_VOIE=${WORKERS_VOIE:-4}
+WORKERS_3VOIES=${WORKERS_3VOIES:-2}
+# Fin de lot : WORKERS_FIN workers pour la suite complète (trop de workers font passer la machine en swap, et la suite
+# dure plus longtemps qu'avec moins) ; partie mécanique jouée en script par MECA (MECA vide : la passe Claude de fin
+# lance elle-même la suite) ; au plus MAX_TOURS_FIN passages de cette partie.
+WORKERS_FIN=${WORKERS_FIN:-4}
+MECA=${MECA-$HERE/fin-mecanique.sh}
+MAX_TOURS_FIN=${MAX_TOURS_FIN:-3}
+# Reprise : tête de la branche du lot avant la reprise (la relecture de fin se limite au diff depuis cette tête).
+# Dans un cycle de lot, elle est notée toute seule au premier lancement d'un PREFIX quand le cycle est en correction
+# (un verdict À REPRENDRE a été rendu) ; hors cycle, la donner dans lot.conf. « - » force la relecture du lot entier.
+CYCLES=${CYCLES:-$HERE/cycles}
+REPRISE_DEPUIS_BACK=${REPRISE_DEPUIS_BACK:-}
+REPRISE_DEPUIS_FRONT=${REPRISE_DEPUIS_FRONT:-}
 CLAUDE=${CLAUDE:-claude}
 export PATH="${PATH_LOT:-$PATH}"
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
@@ -61,6 +78,7 @@ TITRE_DECISIONS=${TITRE_DECISIONS:-"Décisions de l'agent"}
 TITRE_REPONSES=${TITRE_REPONSES:-"Réponses de l'humain"}
 E2E_PORT_A=${E2E_PORT_A:-3123}
 E2E_PORT_B=${E2E_PORT_B:-3124}
+E2E_PORT_C=${E2E_PORT_C:-3125}
 # Attente avant de rejouer une passe qui a échoué en moins de 10 min (panne de quota, réseau…).
 ATTENTE_ECHEC_S=${ATTENTE_ECHEC_S:-1200}
 
@@ -124,13 +142,13 @@ rendre_creneau() { [ -n "${FD_SLOT:-}" ] && { flock -u "$FD_SLOT"; exec {FD_SLOT
 
 workflow_de() { if [ "$1" = front ]; then echo "$WORKFLOW_FRONT"; else echo "$WORKFLOW_BACK"; fi; }
 
-# PR du lot : une par application, de la branche des étapes A, B et FIN vers $REL (la branche -vB n'en a pas,
-# son contenu arrive par FUSION). Une ligne par PR ouverte : <dossier du dépôt> <numéro> <branche> <workflow>.
+# PR du lot : une par application, de la branche des étapes A, B, C et FIN vers $REL (une branche -vB ou -vC n'en
+# a pas, son contenu arrive par FUSION). Une ligne par PR ouverte : <dossier du dépôt> <numéro> <branche> <workflow>.
 prs_du_lot() {
   local repo br dir n
-  grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 == "A" || $2 == "B" || $2 == "FIN" {print $3, $5}' | sort -u \
+  grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 ~ /^(A|B|C|FIN)$/ {print $3, $5}' | sort -u \
     | while read -r repo br; do
-        case $br in *-vB) continue ;; esac
+        case $br in *-v[B-Z]) continue ;; esac
         dir=$REPO_BACK; [ "$repo" = front ] && dir=$REPO_FRONT
         n=$(cd "$dir" && gh pr list --head "$br" --base "$REL" --state open --json number --jq '.[0].number // empty' 2>/dev/null)
         if [ -n "$n" ]; then echo "$dir $n $br $(workflow_de "$repo")"; fi
@@ -245,7 +263,7 @@ trello_wip() { trello_vers "$1" "$LISTE_WIP" "Work in progress"; }
 # Une branche -vB n'a pas de PR : ses cartes attendent le balayage d'après la FUSION.
 trello_attente() {  # <cartes> <repo> <branche>
   local dir=$REPO_BACK n c
-  case $3 in *-vB) return 0 ;; esac
+  case $3 in *-v[B-Z]) return 0 ;; esac
   [ "$1" = - ] && return 0  # étape de FIN sans carte (fusion, suites complètes) : rien à déplacer
   [ "$2" = front ] && dir=$REPO_FRONT
   n=$(cd "$dir" && gh pr list --head "$3" --base "$REL" --state open --json number --jq '.[0].number // empty' 2>/dev/null)
@@ -259,23 +277,37 @@ balayer_cartes() {
   local nom phase repo cartes br reste avec
   avec=$(prs_du_lot | awk '{print $4}')
   grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | while read -r nom phase repo cartes br reste; do
-    { [ "$phase" = A ] || [ "$phase" = B ] || [ "$phase" = FIN ]; } && [ "$cartes" != "-" ] || continue
+    case $phase in A|B|C|FIN) ;; *) continue ;; esac
+    [ "$cartes" != "-" ] || continue
     grep -qx "$nom" "$LOGS/$PREFIX-ok.txt" 2>/dev/null || continue
     grep -qx "$(workflow_de "$repo")" <<<"$avec" || continue
     for c in ${cartes//,/ }; do trello_vers "$c" "$LISTE_ATTENTE" "Waiting for review"; done
   done
 }
 
-# Répertoire de travail d'une étape : quand la voie A a aussi des étapes sur ce dépôt, la voie B travaille
-# dans son propre worktree pour ne jamais partager l'arbre de la voie A.
+# Les voies partagent le .git de chaque dépôt : deux `git fetch` ou `worktree add` au même instant butent sur les
+# verrous de références. Les gestes git du lanceur passent donc un par un, par dépôt.
+git_seul() {  # <repo> <commande…>
+  local repo=$1 rc; shift
+  (
+    exec 8>"$LOGS/$PREFIX-git-$repo.lock"
+    flock 8
+    "$@"
+  ); rc=$?
+  return $rc
+}
+
+# Répertoire de travail d'une étape : quand une voie d'avant (A pour B, A ou B pour C) a aussi des étapes sur ce
+# dépôt, la voie travaille dans son propre worktree pour ne jamais partager l'arbre d'une autre.
 dossier() {
   local repo=$1 phase=$2 base_dir
   base_dir=$REPO_BACK; [ "$repo" = front ] && base_dir=$REPO_FRONT
-  if [ "$phase" = B ] && grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk -v r="$repo" '$2 == "A" && $3 == r {f = 1} END {exit !f}'; then
-    local wt="$base_dir-wt-$PREFIX-vB"
+  if { [ "$phase" = B ] || [ "$phase" = C ]; } && grep -vE '^[[:space:]]*(#|$)' "$ETAPES" \
+       | awk -v r="$repo" -v p="$phase" '$2 ~ /^[ABC]$/ && $2 < p && $3 == r {f = 1} END {exit !f}'; then
+    local wt="$base_dir-wt-$PREFIX-v$phase"
     if [ ! -d "$wt" ]; then
-      git -C "$base_dir" fetch -q origin
-      git -C "$base_dir" worktree add -q --detach "$wt" "refs/remotes/origin/$REL" >>"$CHAIN" 2>&1 || return 1
+      git_seul "$repo" git -C "$base_dir" fetch -q origin
+      git_seul "$repo" git -C "$base_dir" worktree add -q --detach "$wt" "refs/remotes/origin/$REL" >>"$CHAIN" 2>&1 || return 1
       note "worktree $wt créé" >/dev/null
       if [ "$repo" = back ]; then (cd "$wt" && bash -c "$INSTALL_BACK" >>"$CHAIN" 2>&1); else (cd "$wt" && bash -c "$INSTALL_FRONT" >>"$CHAIN" 2>&1); fi
     fi
@@ -311,7 +343,77 @@ preparer() {
   fi
 }
 
+# Fin de lot jouée en script ? (MECA vide ou absent : comme avant, la passe FIN lance elle-même la suite complète.)
+meca_active() { [ -n "$MECA" ] && [ -x "$MECA" ]; }
+# Une étape FIN sans carte (la fin de l'application) vient-elle après l'étape <nom> pour ce dépôt ?
+fin_appli_suit() {  # <repo> <nom>
+  grep -vE '^[[:space:]]*(#|$)' "$ETAPES" \
+    | awk -v r="$1" -v n="$2" '$1 == n {vu = 1; next} vu && $2 == "FIN" && $3 == r && $4 == "-" && $1 !~ /^FUSION/ {f = 1} END {exit !f}'
+}
+nb_voies() { grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 ~ /^[ABC]$/ {print $2}' | sort -u | wc -l; }
+
+# Tête de la branche du lot avant ce lancement si le lot est une reprise, vide sinon.
+depart_de() {  # <repo>
+  local v=$REPRISE_DEPUIS_BACK
+  [ "$1" = front ] && v=$REPRISE_DEPUIS_FRONT
+  [ -n "$v" ] || v=$(cat "$LOGS/$PREFIX-depart-$1" 2>/dev/null)
+  [ "$v" = - ] && v=
+  echo "$v"
+}
+# Le cycle de cette version a-t-il déjà reçu un verdict À REPRENDRE ? (Sans cycle : non, la reprise se déclare.)
+cycle_en_reprise() {
+  local f=$CYCLES/$VERSION/etat.json
+  [ -f "$f" ] || return 1
+  python3 -I -c 'import json, sys
+e = json.load(open(sys.argv[1]))
+sys.exit(0 if e.get("aller_retours", 0) >= 1 or e.get("etape") == "correction" else 1)' "$f" 2>/dev/null
+}
+# Au premier lancement d'un PREFIX, si le cycle est en reprise : la tête de la branche du lot, celle que la revue a
+# vue, est notée (une relance du même PREFIX ne la réécrit pas). Un premier lot relit toujours tout son diff.
+noter_departs() {
+  local repo br dir sha f
+  grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 ~ /^(A|B|C|FIN)$/ {print $3, $5}' | sort -u \
+    | while read -r repo br; do
+        case $br in *-v[B-Z]) continue ;; esac
+        f=$LOGS/$PREFIX-depart-$repo
+        [ -s "$f" ] && continue
+        dir=$REPO_BACK; [ "$repo" = front ] && dir=$REPO_FRONT
+        sha=""
+        cycle_en_reprise && sha=$(git -C "$dir" ls-remote --heads origin "$br" 2>/dev/null | head -n 1 | cut -f1)
+        echo "${sha:--}" >"$f"
+      done
+  for repo in back front; do
+    sha=$(depart_de "$repo")
+    [ -n "$sha" ] && note "reprise ($repo) : tête d'avant ${sha:0:9}, la relecture de fin se limite au diff depuis cette tête (REPRISE_DEPUIS_${repo^^}=- dans lot.conf pour relire tout le lot)"
+  done
+  return 0
+}
+
+# Relecture demandée à la passe de fin : le lot entier la première fois, le diff de la reprise ensuite (relire tout
+# le lot pour corriger quelques cartes coûte cher et disperse la relecture).
+relecture() {  # <repo>
+  local depart; depart=$(depart_de "$1")
+  if [ -n "$depart" ]; then cat <<EOF
+Ce lot est une reprise de correction : la tête d'avant la reprise est \`${depart:0:12}\`. Avant ta dernière poussée,
+relis le diff de la reprise, et lui seul (\`git diff $depart..HEAD\`), avec la grille de revue, \`$GRILLE\`,
+celle qu'utilise $NOM_REV, section « Corriger la famille, pas le cas » : pour chaque point corrigé, la table des
+variantes voisines et son test paramétré existent, les appelants des fonctions modifiées sont vérifiés, et une seule
+question guide la relecture : « qu'est-ce que cette correction casse, oublie ou laisse passer ? ». Ne relis pas le
+reste du lot : les cartes que la reprise ne touche pas ont déjà été relues, et tu ne sors de ce diff que pour suivre
+un appelant ou une variante de la même famille. Corrige ce que tu trouves.
+EOF
+  else cat <<EOF
+Avant ta dernière poussée, relis le diff complet du lot sur cette appli (\`git diff origin/$REL...HEAD\`) avec la
+grille de revue, \`$GRILLE\`, celle qu'utilise $NOM_REV : chaque carte conforme à son texte et aux arbitrages, un test qui
+échoue sans chaque correction et le test du cas voisin, les appelants vérifiés, rien hors du périmètre. Corrige ce que
+tu trouves : chaque point que $NOM_REV relèvera coûte un aller-retour complet.
+EOF
+  fi
+}
+
 # Cadre ajouté à chaque prompt : il prime sur common-*.md pour les tests et le parallélisme.
+# <mode> = PRE | VOIE (une carte : voies A, B, C, carte ou fusion placée en FIN avant la fin de l'application) |
+#          FIN (fin d'application sans script : la passe lance la suite) | RELECTURE | CORRECTION (fin en script)
 cadre() {
   local phase=$1 repo=$2 workers=$3 verif="" regles
   echo; echo "## Cadre d'exécution de cette passe (prime sur toute consigne de test ou de CI contraire plus haut)"; echo
@@ -346,23 +448,49 @@ la CI ($SUITE_FIN), avec au plus $workers workers. Corrige tout ce qui rougit av
 ${verif}Vérifie aussi que la PR n'est pas en conflit avec \`origin/$REL\` (\`gh pr view --json mergeable\`) : en conflit, aucune
 CI ne part en fin de lot. Mets alors ta branche à jour avec \`origin/$REL\` et rejoue les tests touchés avant de pousser.
 
-Avant ta dernière poussée, relis aussi le diff complet du lot sur cette appli (\`git diff origin/$REL...HEAD\`) avec la
-grille de revue, \`$GRILLE\`, celle qu'utilise $NOM_REV : chaque carte conforme à son texte et aux arbitrages, un test qui
-échoue sans chaque correction et le test du cas voisin, les appelants vérifiés, rien hors du périmètre. Corrige ce que
-tu trouves : chaque point que $NOM_REV relèvera coûte un aller-retour complet. Si ce lot est une reprise de correction,
-applique la section « Corriger la famille, pas le cas » de la grille : pour chaque point corrigé, la table des variantes
-voisines et son test paramétré existent, et le diff de la reprise est relu avec pour seule question « qu'est-ce que
-cette correction casse, oublie ou laisse passer ? ».
+$(relecture "$repo")
 
 CI : pousse, puis termine. Ne la déclenche pas, ne l'attends pas, ne relance aucun run, même si l'étape le demande
 plus haut : la PR porte l'étiquette \`$PAUSE\` jusqu'à la fin du lot, puis le lanceur lance la CI des PR sur leurs
 têtes finales, attend les verdicts et les remet à l'agent.
 EOF
       ;;
+    RELECTURE) cat <<EOF
+Passe de fin, relecture. La suite complète, le lint, le typage, le build, les e2e complets et les autres contrôles
+de la liste de fin (vérification avant poussée, audit des dépendances) ne se lancent PAS dans cette passe : le
+lanceur les joue lui-même, en script, juste après elle, sur la tête que tu auras poussée, et ne rappelle une passe
+que s'il y a du rouge, avec son rapport. Si l'étape te les demande plus haut, ne les lance pas : c'est fait après toi.
+Dans cette passe : uniquement les tests ciblés de ce que tu modifies (fichiers de test des modules touchés, et ceux
+qui les importent), au plus $workers workers (\`-n $workers\` pour pytest, \`--maxWorkers=$workers\` pour vitest).
+
+$(relecture "$repo")
+
+Vérifie aussi que la PR n'est pas en conflit avec \`origin/$REL\` (\`gh pr view --json mergeable\`) : en conflit, aucune
+CI ne part en fin de lot. Mets alors ta branche à jour avec \`origin/$REL\` et rejoue les tests touchés avant de pousser.
+
+CI : pousse, puis termine. Ne la déclenche pas, ne l'attends pas, ne relance aucun run, même si l'étape le demande
+plus haut : la PR porte l'étiquette \`$PAUSE\` jusqu'à la fin du lot, puis le lanceur lance la CI des PR sur leurs
+têtes finales, attend les verdicts et les remet à l'agent.
+EOF
+      ;;
+    CORRECTION) cat <<EOF
+Passe de fin, correction. Le lanceur vient de jouer en script, sans Claude, la partie mécanique de la fin de lot
+(suite complète, lint, typage, build, e2e, contrôles de la liste de fin) : son rapport est en tête de ce prompt, avec le
+journal de chaque commande rouge. Corrige chaque rouge à la racine, sans affaiblir un test ni une règle. Ne rejoue
+que les commandes rouges, telles que le rapport les écrit, et les tests ciblés de ce que tu touches, au plus
+$workers workers : le lanceur rejoue toute la partie mécanique après ta poussée (passage ${FIN_TOUR:-1} sur $MAX_TOURS_FIN, le dernier
+rouge arrête le lot). Un rouge qui ne vient pas du code (machine chargée, test instable, service injoignable) :
+rejoue la commande seule une fois ; si elle passe, ne change rien et dis-le en une ligne dans ta conclusion.
+Ne relis pas le lot : la relecture est faite, tu ne touches qu'à ce que le rapport montre rouge.
+
+CI : pousse, puis termine. Ne la déclenche pas, ne l'attends pas, ne relance aucun run : la PR porte l'étiquette
+\`$PAUSE\` jusqu'à la fin du lot, puis le lanceur lance la CI des PR sur leurs têtes finales.
+EOF
+      ;;
     *) cat <<EOF
 Tests pendant cette passe : uniquement les tests ciblés de ce que tu touches (fichiers de test des modules
 modifiés, et ceux qui les importent) plus le lint et le typage, jamais la suite complète : elle tourne une seule
-fois par application dans la passe FIN. Au plus $workers workers (\`-n $workers\` pour pytest, \`--maxWorkers=$workers\`
+fois par application, en fin de lot. Au plus $workers workers (\`-n $workers\` pour pytest, \`--maxWorkers=$workers\`
 pour vitest). Une autre voie peut travailler en même temps sur la machine.${E2E_PORT:+ Si tu lances des e2e ciblés, avec \`E2E_PORT=$E2E_PORT\`.}
 
 ${verif}CI : ne la déclenche pas et ne l'attends pas. Ni fermeture-réouverture de la PR, ni \`gh run rerun\`, ni attente d'un
@@ -395,13 +523,21 @@ claude_passe() {
 
 etape() {
   local nom=$1 phase=$2 repo=$3 carte=$4 br=$5 base=$6 opt=${7:-}
-  local dir log=$LOGS/$PREFIX-$nom.log prompt=$LOGS/$PREFIX-$nom.prompt.md workers=$WORKERS_SEUL common
+  local dir log=$LOGS/$PREFIX-$nom.log prompt=$LOGS/$PREFIX-$nom.prompt.md workers=$WORKERS_FIN common mode=$phase
   dir=$(dossier "$repo" "$phase") || { note "ÉCHEC worktree $nom"; return 1; }
-  [ "$MODE" = impl ] && [ "$phase" != FIN ] && workers=$WORKERS_VOIE
+  if [ "$MODE" = impl ] && [ "$phase" != FIN ]; then
+    workers=$WORKERS_VOIE
+    [ "$(nb_voies)" -ge 3 ] && [ "$workers" -gt "$WORKERS_3VOIES" ] && workers=$WORKERS_3VOIES
+  fi
+  case $phase in
+    A|B|C) mode=VOIE ;;
+    FIN) if [ -n "${FIN_MODE:-}" ]; then mode=$FIN_MODE
+         elif meca_active && fin_appli_suit "$repo" "$nom"; then mode=VOIE; fi ;;
+  esac
   common=$LOT/common-$repo.md
   [ "${nom#FIN}" != "$nom" ] && common="$LOT/common-back.md $LOT/common-front.md"
   [ -f "$LOT/common-${br##*-}.md" ] && common="$common $LOT/common-${br##*-}.md"
-  { cat "$LOT/step-$nom.md"; echo
+  { if [ -n "${FIN_RAPPORT:-}" ]; then cat "$FIN_RAPPORT"; else cat "$LOT/step-$nom.md"; fi; echo
     for c in ${carte//,/ }; do [ "$c" = "-" ] || cat "$LOT/card-$c.md"; done
     [ -f "$LOT/arbitrages.md" ] && cat "$LOT/arbitrages.md"; echo
     for f in $common; do [ -f "$f" ] && cat "$f"; done
@@ -411,25 +547,25 @@ etape() {
       echo; echo "## Note de passation de l'étape précédente de ta voie ($prec)"; echo
       cat "$LOGS/$PREFIX-passation-$prec.md"
     fi
-    PASSATION=$LOGS/$PREFIX-passation-$nom.md cadre "$phase" "$repo" "$workers"; } >"$prompt"
+    PASSATION=$LOGS/$PREFIX-passation-$nom.md cadre "$mode" "$repo" "$workers"; } >"$prompt"
   prendre_creneau || return 2
   for c in ${carte//,/ }; do [ "$c" = "-" ] || trello_wip "$c"; done
   local essai rc
   for essai in 1 2 3; do
     note "=== étape $nom ($phase, $repo, $br) : préparation (essai $essai)"
-    if ! preparer "$dir" "$nom" "$br" "$base" >>"$CHAIN" 2>&1; then note "ÉCHEC préparation $nom"; rendre_creneau; return 1; fi
+    if ! git_seul "$repo" preparer "$dir" "$nom" "$br" "$base" >>"$CHAIN" 2>&1; then note "ÉCHEC préparation $nom"; rendre_creneau; return 1; fi
     note "=== étape $nom : run Claude Code, créneau $CRENEAU, $workers workers (log $log)"
     local t0=$SECONDS
     claude_passe "$dir" "$prompt" "$log" "$essai"; rc=$?
     local duree=$((SECONDS - t0)) loc dist
-    cd "$dir" && git fetch -q origin
+    cd "$dir" && git_seul "$repo" git fetch -q origin
     loc=$(git rev-parse "refs/heads/$br" 2>/dev/null); dist=$(git rev-parse "refs/remotes/origin/$br" 2>/dev/null)
     if [ "$rc" -eq 0 ] && [ -n "$dist" ] && [ "$loc" = "$dist" ]; then
       note "OK étape $nom : $repo $br poussée en ${dist:0:7} (${duree}s)"; rendre_creneau
       echo "$nom" >"$LOGS/$PREFIX-derniere-$phase"
       echo "$nom" >>"$LOGS/$PREFIX-ok.txt"
-      { [ "$phase" = A ] || [ "$phase" = B ] || [ "$phase" = FIN ]; } && trello_attente "$carte" "$repo" "$br"
-      [ "$phase" = A ] || [ "$phase" = B ] && { [ -s "$LOGS/$PREFIX-passation-$nom.md" ] || note "$nom : pas de note de passation écrite"; }
+      case $phase in A|B|C|FIN) trello_attente "$carte" "$repo" "$br" ;; esac
+      case $phase in A|B|C) [ -s "$LOGS/$PREFIX-passation-$nom.md" ] || note "$nom : pas de note de passation écrite" ;; esac
       return 0
     fi
     if [ "$rc" -eq 0 ] && { [ "$opt" = opt ] || [ "$phase" = PRE ]; }; then
@@ -443,11 +579,62 @@ etape() {
   return 1
 }
 
-# FUSION <phase FIN> <repo> - <branche cible (voie A)> <branche source (voie B)>
+# Partie mécanique de la fin d'une application, jouée par $MECA sans Claude : les commandes de
+# fin-mecanique-<app>.txt (suite complète, lint, typage, build, e2e, audit…), puis l'état de la PR face à la release. Le rapport va dans <rapport>.
+# Retour : 0 vert, 1 rouge, 2 ni créneau ni mémoire, 3 n'a pas pu tourner (préparation, script).
+mecanique() {  # <nom> <repo> <branche> <base> <rapport>
+  local nom=$1 repo=$2 br=$3 base=$4 rapport=$5 dir liste j rc n t0
+  dir=$(dossier "$repo" FIN) || return 3
+  prendre_creneau || return 2
+  if ! git_seul "$repo" preparer "$dir" "$nom" "$br" "$base" >>"$CHAIN" 2>&1; then
+    note "ÉCHEC préparation $nom (partie mécanique)"; rendre_creneau; return 3
+  fi
+  liste=$LOT/fin-mecanique-$repo.txt; [ -f "$liste" ] || liste=""
+  j=$LOGS/$PREFIX-$nom-meca
+  note "=== étape $nom : partie mécanique sans Claude ($repo, $br, $WORKERS_FIN workers, créneau $CRENEAU, journaux $j)"
+  t0=$SECONDS
+  WORKERS=$WORKERS_FIN VERIF=$VERIF_FIN "$MECA" "$repo" "$dir" "origin/$REL" "$j" ${liste:+"$liste"} >"$rapport" 2>>"$CHAIN"; rc=$?
+  # PR en conflit avec la release : aucun run de PR ne partirait en fin de lot
+  n=$(cd "$dir" && gh pr list --head "$br" --base "$REL" --state open --json number --jq '.[0].number // empty' 2>/dev/null)
+  if [ "$rc" -le 1 ] && [ -n "$n" ] && [ "$(cd "$dir" && gh pr view "$n" --json mergeable --jq .mergeable 2>/dev/null)" = CONFLICTING ]; then
+    { echo; echo "- ROUGE   **conflit** : la PR $n est en conflit avec \`origin/$REL\`, aucune CI ne partirait en fin de lot. Mets \`$br\` à jour avec \`origin/$REL\`, résous les conflits, rejoue les tests des fichiers touchés et pousse."; } >>"$rapport"
+    rc=1
+  fi
+  rendre_creneau
+  case $rc in
+    0) note "OK étape $nom : partie mécanique verte sur $(git -C "$dir" rev-parse --short HEAD) ($((SECONDS - t0))s)" ;;
+    1) note "étape $nom : partie mécanique ROUGE en $((SECONDS - t0))s, $(sed -n 's/^Verdict : //p' "$rapport" | head -n 1) (rapport $rapport)" ;;
+    *) note "ÉCHEC étape $nom : la partie mécanique n'a pas pu tourner (rc=$rc, voir $CHAIN)"; rc=3 ;;
+  esac
+  return $rc
+}
+
+# Fin d'une application (étape FIN sans carte) quand la partie mécanique se joue en script : relecture par Claude si
+# l'étape a son step-<nom>.md, puis le script, puis une passe de correction seulement s'il y a du rouge, et le
+# script de nouveau. La relecture vient d'abord : la suite complète ne tourne ainsi qu'une fois quand tout est vert.
+fin_appli() {  # <nom> FIN <repo> - <branche> <base> [opt]
+  local nom=$1 repo=$3 br=$5 base=$6 tour r rapport
+  if [ -f "$LOT/step-$nom.md" ]; then
+    FIN_MODE=RELECTURE etape "$@" || return $?
+  else
+    note "étape $nom : pas de step-$nom.md, donc pas de passe de relecture ; partie mécanique seule"
+  fi
+  for ((tour = 1; tour <= MAX_TOURS_FIN; tour++)); do
+    rapport=$LOGS/$PREFIX-$nom-meca-$tour.md
+    mecanique "$nom" "$repo" "$br" "$base" "$rapport"; r=$?
+    case $r in 0) return 0 ;; 2) return 2 ;; 3) return 1 ;; esac
+    [ "$tour" -lt "$MAX_TOURS_FIN" ] || break
+    FIN_MODE=CORRECTION FIN_RAPPORT=$rapport FIN_TOUR=$((tour + 1)) etape "$nom-c$tour" FIN "$repo" - "$br" "$base" || return $?
+  done
+  note "ÉCHEC étape $nom : partie mécanique encore rouge après $MAX_TOURS_FIN passage(s), dernier rapport $rapport"
+  return 1
+}
+
+# FUSION <phase FIN> <repo> - <branche cible (celle du lot)> <branche source (-vB ou -vC)>
 fusion() {
   local nom=$1 repo=$3 cible=$5 source=$6 dir
   dir=$(dossier "$repo" A)
-  preparer "$dir" "$nom" "$cible" "$REL" >>"$CHAIN" 2>&1 || { note "ÉCHEC préparation $nom"; return 1; }
+  git_seul "$repo" preparer "$dir" "$nom" "$cible" "$REL" >>"$CHAIN" 2>&1 || { note "ÉCHEC préparation $nom"; return 1; }
   git -C "$dir" ls-remote --exit-code --heads origin "$source" >/dev/null 2>&1 || { note "OK $nom : $source absente, rien à fusionner"; return 0; }
   if git -C "$dir" merge -q --no-ff --no-edit "refs/remotes/origin/$source" >>"$CHAIN" 2>&1; then
     git -C "$dir" push -q origin "$cible" >>"$CHAIN" 2>&1 && { note "OK $nom : $source fusionnée dans $cible sans conflit"; return 0; }
@@ -457,9 +644,9 @@ fusion() {
   git -C "$dir" merge --abort
   note "$nom : conflits sur $conflits, résolution confiée à Claude"
   [ -f "$LOT/step-$nom.md" ] || cat >"$LOT/step-$nom.md" <<EOF
-# $nom — fusion des deux voies
+# $nom : fusion de deux voies
 
-Fusionne \`origin/$source\` (voie B) dans \`$cible\` (voie A) : \`git merge --no-ff origin/$source\`.
+Fusionne \`origin/$source\` (l'autre voie) dans \`$cible\` (la branche du lot) : \`git merge --no-ff origin/$source\`.
 Fichiers en conflit au premier essai : $conflits
 Résous chaque conflit en gardant le comportement voulu par les DEUX voies (relis leurs commits et leurs cartes),
 jamais en écrasant l'une par l'autre. Lance les tests ciblés des fichiers en conflit, commite la fusion et pousse
@@ -484,7 +671,9 @@ phase() {
     ligne=$(prochaine "$ph")
     [ -z "$ligne" ] && break
     set -- $ligne
-    if [ "${1#FUSION}" != "$1" ]; then fusion "$@"; else etape "$@"; fi
+    if [ "${1#FUSION}" != "$1" ]; then fusion "$@"
+    elif [ "$ph" = FIN ] && [ "$4" = - ] && meca_active; then fin_appli "$@"
+    else etape "$@"; fi
     r=$?
     # une passe qui vient d'ouvrir la PR du lot a déclenché sa CI : étiquette posée, run annulé
     [ "$MODE" = impl ] && ci_pause
@@ -493,7 +682,7 @@ phase() {
     case $r in
       0) ok=$((ok + 1)) ;;
       2) note "##### phase $ph arrêtée à $1 (créneau ou mémoire)"; echo "$ok:$ko $1" >"$LOGS/$PREFIX-bilan-$ph"; return 2 ;;
-      *) ko="$ko $1"; note "##### étape $1 en échec après 3 essais, la phase continue" ;;
+      *) ko="$ko $1"; note "##### étape $1 en échec, la phase continue" ;;
     esac
   done
   note "##### phase $ph terminée : $ok étapes OK, en échec :${ko:- aucune}"
@@ -519,34 +708,43 @@ case $MODE in
     if grep -q "\[BLOQUANTE\]" "$LOT/questions-arbitrage.md" 2>/dev/null && ! grep -qF "$TITRE_REPONSES" "$LOT/arbitrages.md" 2>/dev/null; then
       note "ABANDON : question [BLOQUANTE] sans « $TITRE_REPONSES » dans arbitrages.md (cycle-lot arret)"; exit 1
     fi
-    # une carte = une passe : refuser une étape A ou B qui en porte plusieurs
-    multi=$(grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '($2 == "A" || $2 == "B") && $4 ~ /,/ {print $1 "(" $4 ")"}' | tr '\n' ' ')
+    # une carte = une passe : refuser une étape de voie (A, B ou C) qui en porte plusieurs
+    multi=$(grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 ~ /^[ABC]$/ && $4 ~ /,/ {print $1 "(" $4 ")"}' | tr '\n' ' ')
     [ -n "$multi" ] && { note "ABANDON : étapes à plusieurs cartes, une carte = une passe : $multi"; exit 1; }
+    # chaque voie a son arbre de travail sur un dépôt, donc sa branche : feat/<ver>-lot, puis -vB et -vC
+    memes=$(grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 ~ /^[ABC]$/ {print $3, $5, $2}' | sort -u \
+            | awk '{k = $1 " " $2; n[k]++; v[k] = v[k] $3} END {for (k in n) if (n[k] > 1) printf "%s (voies %s) ", k, v[k]}')
+    [ -n "$memes" ] && { note "ABANDON : deux voies sur la même branche du même dépôt, chacune a son worktree donc sa branche (-vB, -vC, fusionnée par une étape FUSION en FIN) : $memes"; exit 1; }
     # CI pendant un lot : aucun prompt du lot ne déclenche, n'attend ni ne relance la CI. Une consigne de CI recopiée
     # d'un ancien prompt ferait attendre une passe sur des runs en pause.
     vieux=$(grep -nHE 'gh pr (close|reopen)|close/reopen|gh run rerun|suis la CI' "$LOT"/common-*.md "$LOT"/step-*.md 2>/dev/null | head -n 5)
     [ -n "$vieux" ] && { note "ABANDON : consignes de CI dans les prompts du lot (la CI ne tourne qu'en fin de lot, voir README) : $(echo "$vieux" | sed "s#$LOT/##" | cut -c1-140 | tr '\n' ' ')"; exit 1; }
     rm -f "$LOT/.ci-fin"  # laissée par un lanceur mort pendant son étape CI
-    for c in $(grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '($2 == "A" || $2 == "B") && $4 != "-" {print $4}' | tr ',' ' '); do
+    noter_departs
+    for c in $(grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 ~ /^[ABC]$/ && $4 != "-" {print $4}' | tr ',' ' '); do
       trello_wip "$c"
     done
     ci_pause
+    # la voie C est facultative : elle ne part que si etapes.txt lui donne des étapes au lancement
+    avec_c=""; [ -n "$(prochaine C)" ] && avec_c=1
     E2E_PORT=$E2E_PORT_A phase A & pa=$!
     E2E_PORT=$E2E_PORT_B phase B & pb=$!
+    [ -n "$avec_c" ] && { E2E_PORT=$E2E_PORT_C phase C & pc=$!; }
     wait $pa; ra=$?; wait $pb; rb=$?
+    rvc=0; [ -n "$avec_c" ] && { wait $pc; rvc=$?; }
     VOIE=
-    note "##### voies terminées : A rc=$ra, B rc=$rb"
-    if [ "$ra" -eq 2 ] || [ "$rb" -eq 2 ]; then note "##### lot arrêté avant FIN (créneau ou mémoire)"; ci_reprise; exit 1; fi
+    note "##### voies terminées : A rc=$ra, B rc=$rb${avec_c:+, C rc=$rvc}"
+    if [ "$ra" -eq 2 ] || [ "$rb" -eq 2 ] || [ "$rvc" -eq 2 ]; then note "##### lot arrêté avant FIN (créneau ou mémoire)"; ci_reprise; exit 1; fi
     phase FIN; rf=$?
     VOIE=
     balayer_cartes
-    if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rf" -eq 0 ]; then
+    if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rvc" -eq 0 ] && [ "$rf" -eq 0 ]; then
       ci_fin; rc=$?
     else
       ci_reprise; rc=1
     fi
-    note "##### $PREFIX terminé : A rc=$ra, B rc=$rb, FIN rc=$rf, CI rc=$rc"
-    [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rf" -eq 0 ] && [ "$rc" -eq 0 ]
+    note "##### $PREFIX terminé : A rc=$ra, B rc=$rb${avec_c:+, C rc=$rvc}, FIN rc=$rf, CI rc=$rc"
+    [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rvc" -eq 0 ] && [ "$rf" -eq 0 ] && [ "$rc" -eq 0 ]
     ;;
   *) echo "mode inconnu : $MODE" >&2; exit 64 ;;
 esac

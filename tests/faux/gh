@@ -13,11 +13,21 @@ MONDE = os.environ["MONDE"]
 def charger():
     f = open(MONDE + ".lock", "w")
     fcntl.flock(f, fcntl.LOCK_EX)
-    return f, json.load(open(MONDE))
+    with open(MONDE) as x:
+        return f, json.load(x)
+
+
+def ecrire_monde(m):
+    """Écriture atomique (fichier temporaire puis os.replace), sous le verrou : un lecteur voit l'ancien monde ou le
+    nouveau, jamais un fichier à moitié écrit (JSONDecodeError du banc sous charge)."""
+    tmp = f"{MONDE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as t:
+        json.dump(m, t, indent=1)
+    os.replace(tmp, MONDE)
 
 
 def sauver(m, f):
-    json.dump(m, open(MONDE, "w"), indent=1)
+    ecrire_monde(m)
     fcntl.flock(f, fcntl.LOCK_UN)
 
 
@@ -88,8 +98,16 @@ def main():
         elif a[:2] == ["run", "rerun"]:
             d = depot_de(a)
             r = next(x for x in m["runs"][d] if str(x["databaseId"]) == a[2])
+            if r["status"] != "completed":  # comme GitHub : on ne relance pas un run qui tourne encore
+                print(f"run {a[2]} cannot be rerun; its workflow run is still in progress", file=sys.stderr)
+                sys.exit(1)
             r["status"], r["conclusion"] = "in_progress", None
             r["relance"] = r.get("relance", 0) + 1
+            r.setdefault("reruns", []).append("failed" if "--failed" in a else "tout")
+        elif a[:2] == ["run", "cancel"]:
+            d = depot_de(a)
+            r = next(x for x in m["runs"][d] if str(x["databaseId"]) == a[2])
+            r["status"], r["conclusion"], r["annule"] = "completed", "cancelled", True
         elif a[:2] == ["workflow", "run"]:
             d = depot_de(a)
             br = opt(a, "--ref")
@@ -102,7 +120,15 @@ def main():
             methode, chemin = (a[2], a[3]) if a[1] == "-X" else ("GET", a[1])
             corps = json.loads(sys.stdin.read() or "{}") if "--input" in a else {}
             d = chemin.split("/")[2].rsplit("-", 1)[-1]
-            if "/compare/" in chemin:
+            if "/actions/runs/" in chemin and "/jobs" in chemin:  # jobs d'un run : étiquettes, statut, heure de mise en file
+                rid = chemin.split("/actions/runs/")[1].split("/")[0]
+                r = next((x for x in m["runs"][d] if str(x["databaseId"]) == rid), {})
+                print(json.dumps({"jobs": r.get("api_jobs", [])}))
+            elif "/actions/runners" in chemin:
+                print(json.dumps({"runners": m.get("runners", {}).get(d, [])}))
+            elif "/check-runs/" in chemin and chemin.split("?")[0].endswith("/annotations"):
+                print(json.dumps(m.get("annotations", {}).get(chemin.split("/check-runs/")[1].split("/")[0], [])))
+            elif "/compare/" in chemin:
                 cle = chemin.split("/compare/")[1]
                 if "--jq" in a:
                     print(m["compare"][d].get(cle, 0))

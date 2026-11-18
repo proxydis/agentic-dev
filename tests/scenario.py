@@ -27,14 +27,24 @@ PK = '{\n  "name": "web",\n  "version": "0.9.0",\n  "private": true\n}\n'
 ECHECS = []
 
 
+def ecrire_atomique(p, texte):
+    """Fichier temporaire puis os.replace : un lecteur concurrent (faux gh, openclaw, systemctl, serveur Trello) voit
+    l'ancien contenu ou le nouveau, jamais un JSON tronqué (JSONDecodeError « Unterminated string »)."""
+    tmp = Path(f"{p}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(texte)
+    os.replace(tmp, p)
+
+
 def monde(maj=None):
     with open(str(MONDE) + ".lock", "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        m = json.load(open(MONDE))
-        if maj:
-            maj(m)
-            json.dump(m, open(MONDE, "w"), indent=1)
-        fcntl.flock(f, fcntl.LOCK_UN)
+        try:
+            m = json.loads(MONDE.read_text())
+            if maj:
+                maj(m)
+                ecrire_atomique(MONDE, json.dumps(m, indent=1))
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
     return m
 
 
@@ -104,9 +114,11 @@ def etat(v="1.0.0"):
 
 def modifier_etat(v, maj):
     p = TMP / "cycles" / v / "etat.json"
-    e = json.loads(p.read_text())
-    maj(e)
-    p.write_text(json.dumps(e))
+    with open(p.parent / ".verrou", "w") as f:  # même verrou que cycle-lot
+        fcntl.flock(f, fcntl.LOCK_EX)
+        e = json.loads(p.read_text())
+        maj(e)
+        ecrire_atomique(p, json.dumps(e))
 
 
 def il_y_a(minutes):
@@ -142,7 +154,7 @@ cartes = [{"id": f"k{i}", "name": f"[V1.0.0-{'Back' if i % 2 else 'Front'}] {i}.
 cartes += [{"id": "k9", "name": "[V1.0.1-Back] 1. carte suivante", "idList": L["not_ready"]},
            {"id": "k8", "name": "[V1.0.0-Back] 7. carte annulée", "idList": L["canceled"]},
            {"id": "k7", "name": "[1.0.0][Marketing] hors format", "idList": L["not_ready"]}]
-MONDE.write_text(json.dumps({
+ecrire_atomique(MONDE, json.dumps({
     "cartes": cartes, "prs": {"back": {}, "front": {}}, "runs": {"back": [], "front": []},
     "refs": {"back": {"release/1.0.0": "relback0".ljust(40, "0"), "feat/1.0.0-lot": "featback1".ljust(40, "0")},
              "front": {"release/1.0.0": "relfront0".ljust(40, "0"), "feat/1.0.0-lot": "featfront1".ljust(40, "0")}},
@@ -167,6 +179,9 @@ MONDE.write_text(json.dumps({
     "trello": {"tableau": "T-test", "listes": L,
                "etiquettes_gravite": {g: f"E-{g}" for g in ("critique", "important", "normal", "faible", "cosmetique")}},
     "jobs_sautables": ["quality", "integration", "e2e"],
+    "ci_aiguillage": {"job": "routage", "jobs_requis": {"back": ["analyse"], "front": ["analyse"]},
+                      "motif_tranches": "^tests-\\d+$"},
+    "motif_machine_refusee": "RESSOURCES-INSUFFISANTES",
     "slack_archives": "https://exemple.slack.test/archives"}))
 ENV = {"PATH": "/usr/bin:/bin", "MONDE": str(MONDE), "CYCLE_LOT_BASE": str(TMP), "CYCLE_LOT_GH": str(ICI / "faux/gh"),
        "OPENCLAW_BIN": str(ICI / "faux/openclaw"), "CYCLE_LOT_SYSTEMCTL": str(ICI / "faux/systemctl"),
@@ -349,7 +364,16 @@ out = lancer("passe", "1.0.0", "--vers", "relecteur", "--message", "N1 N2 corrig
 verifier("--contre-relecture" in out and etat()["etape"] == "correction", "correction : passage refusé sans contre-relecture")
 cr = TMP / "contre-relecture.md"
 cr.write_text("diff relu : rien de cassé")
-lancer("passe", "1.0.0", "--vers", "relecteur", "--contre-relecture", str(cr), "--message", "N1 N2 corrigés", par="dev")
+out = lancer("passe", "1.0.0", "--vers", "relecteur", "--contre-relecture", str(cr), "--message", "N1 N2 corrigés", par="dev",
+             attendu=2)
+verifier("--reel" in out and "inchange" in out and etat()["etape"] == "correction",
+         "retour en revue : refusé sans preuves en réel rejouées (la 1re passe avait un fichier de preuves)")
+out = lancer("passe", "1.0.0", "--vers", "relecteur", "--contre-relecture", str(cr), "--reel", "inchange", par="dev", attendu=2)
+verifier("--motif" in out and etat()["etape"] == "correction", "--reel inchange refusé sans motif")
+reel2 = TMP / "reel-reprise1.md"
+reel2.write_text("carte 2 : traitement rejoué sur la préproduction, tête featback2, résultat attendu")
+lancer("passe", "1.0.0", "--vers", "relecteur", "--contre-relecture", str(cr), "--reel", str(reel2), "--message", "N1 N2 corrigés",
+       par="dev")
 monde(lambda m: m["runs"]["back"][-1].update(status="completed", conclusion="success"))
 lancer("veille")
 modifier_etat("1.0.0", lambda e: e["attente"]["deploiement"].update(vert_a=il_y_a(11)))
@@ -359,6 +383,8 @@ verifier(e["etape"] == "revue" and "rapport1.md" in derniers_reveils()[0]["messa
 msg = derniers_reveils()[0]["message"]
 verifier("Revue de CORRECTION" in msg and "git diff featback1000..featback2000" in msg
          and "Fais la revue complète" not in msg, "2e revue ciblée : diff exact depuis la tête revue, pas de revue complète")
+verifier(f"Preuves en réel rejouées par Dev sur la tête de la reprise : {reel2}" in msg,
+         "2e revue : la consigne du relecteur cite les preuves en réel rejouées")
 verifier([liste_de(n) for n in range(1, 5)] == ["finished", "finished", "review", "review"], "seules 3-4 repassent en revue")
 
 print("5. verdict À MERGER : merges gardés dans la même commande, puis commit de release")
@@ -799,6 +825,13 @@ pr_correctif(932, ["tests/unit/a.test.ts", "src/app/calcul.ts"], "fix3")
 monde(lambda m: m["prs"]["front"].pop("931"))
 out = lancer("passe", "2.0.6", "--vers", "relecteur", par="dev", attendu=2)
 verifier("--contre-relecture" in out, "un fichier d'application dans le correctif : voie normale, contre-relecture exigée")
+# un script de CI, ses exceptions, un test et la doc : rien que la CI exécute
+pr_correctif(933, ["docs/EXCEPTIONS.json", "docs/CONFIGURATION.md", "scripts/ci/parite-env-exceptions.json",
+                   "tests/unit/pariteEnv.test.ts"], "fix4")
+monde(lambda m: m["prs"]["front"].pop("932"))
+out = lancer("passe", "2.0.6", "--vers", "relecteur", par="dev")
+verifier(etat("2.0.6")["etape"] == "revue" and (etat("2.0.6")["attente"] or {}).get("voie_courte") and "voie courte" in out.lower(),
+         "scripts/ci/ : voie courte, sans contre-relecture ni preview")
 
 print("18. relais : réveil ciblé quand la CI est verte et que la main n'est pas passée")
 F7 = FIL.replace("000100", "000700")
@@ -844,6 +877,37 @@ monde(lambda m: m["runs"]["back"][-1]["jobs"].update({"contenu-deja-valide": "su
 lancer("veille")
 verifier(etat("2.0.8")["etape"] == "ci-livraison", "quality sauté avec le marqueur contenu-deja-valide : run vert")
 
+print("19 bis. CI avec aiguillage (job routage) : analyse et tranches tests-N requis, sautables avec le marqueur")
+
+
+def run_release_108(rid, jobs, quand, concl="success"):
+    def maj(m):
+        r = run("back", rid, m["refs"]["back"]["release/2.0.8"], "push", "release/2.0.8", concl=concl, jobs=jobs)
+        r["createdAt"] = quand
+        m["runs"]["back"].append(r)
+    monde(maj)
+    modifier_etat("2.0.8", lambda e: e.update(etape="ci-release", tour="veille", depuis=il_y_a(1), ci_rouges=0,
+                                              attente={"depots": ["back"], "relances": []}))
+    lancer("veille")
+    return etat("2.0.8")
+
+
+NOUVELLE = {"routage": "success", "tests-1": "success", "tests-2": "success", "tests-3": "success", "quality": "success",
+            "integration": "success", "analyse": "success", "deploy": "success"}
+e = run_release_108(4101, dict(NOUVELLE, analyse="skipped"), "2099-03-01T00:00:01Z")
+verifier(e["etape"] == "correction" and "analyse" in e["historique"][-1]["message"],
+         "nouvelle CI : gate analyse sautée sans marqueur, run conclu success : rouge (analyse requis)")
+e = run_release_108(4102, dict(NOUVELLE, **{"tests-2": "skipped"}), "2099-03-01T00:00:02Z")
+verifier(e["etape"] == "correction" and "tests-2" in e["historique"][-1]["message"],
+         "nouvelle CI : tranche tests-2 sautée sans marqueur : rouge (tranches requises)")
+e = run_release_108(4103, {"routage": "success", "verif-contenu": "success", "contenu-deja-valide": "success",
+                           "tests-1": "skipped", "tests-2": "skipped", "tests-3": "skipped", "quality": "skipped",
+                           "integration": "skipped", "analyse": "skipped", "deploy": "success"}, "2099-03-01T00:00:03Z")
+verifier(e["etape"] == "ci-livraison", "nouvelle CI : tranches, quality, integration et analyse sautés avec contenu-deja-valide : vert")
+e = run_release_108(4104, {"quality": "success", "integration": "success", "analyse": "skipped", "deploy": "success"},
+                    "2099-03-01T00:00:04Z")
+verifier(e["etape"] == "ci-livraison", "ancienne CI (sans aiguillage) : règles d'avant, analyse n'est pas requis")
+
 print("20. attente sans rouge au-delà du plafond : un avis, puis l'attente continue jusqu'au double")
 modifier_etat("2.0.8", lambda e: e.update(etape="deploiement", tour="veille", depuis=il_y_a(250),
                                           attente={"commits": [{"depot": "back", "base": "master", "commit": "prod108".ljust(40, "0")}],
@@ -880,8 +944,13 @@ verifier(etat("2.0.8")["etape"] == "validation-prod" and "run 123 vert" in derni
          "réglages faits et prouvés : le relecteur les vérifie en premier")
 
 print("22. marges de CI : durée mesurée face au plafond")
-WF = ("name: Back\non:\n  push:\njobs:\n  quality:\n    runs-on: x\n    timeout-minutes: 90\n    steps:\n"
-      "      - name: Tests\n        timeout-minutes: 50\n        run: pytest\n  deploy:\n    timeout-minutes: 10\n    steps:\n"
+WF = ("name: Back\non:\n  push:\njobs:\n  routage:\n    timeout-minutes: 3\n    steps:\n      - run: echo\n"
+      "  tests:\n    name: tests-${{ matrix.tranche }}\n    runs-on: ${{ needs.routage.outputs.runner }}\n"
+      "    timeout-minutes: 110\n    strategy:\n      fail-fast: false\n      matrix:\n        tranche: [1, 2, 3]\n    steps:\n"
+      "      - name: Tests unitaires + couverture (tranche)\n        timeout-minutes: 60\n        run: pytest\n"
+      "  quality:\n    runs-on: x\n    timeout-minutes: 90\n    steps:\n"
+      "      - name: Tests\n        timeout-minutes: 50\n        run: pytest\n  analyse:\n    needs: quality\n    timeout-minutes: 65\n"
+      "    steps:\n      - run: scan\n  deploy:\n    timeout-minutes: 10\n    steps:\n"
       "      - uses: actions/checkout@v4\n      - name: Deploy\n        run: curl\n")
 
 
@@ -895,7 +964,13 @@ def mesures(m):
                     "steps": [{"name": "Tests", "conclusion": "success", "startedAt": "2030-01-10T10:02:00Z",
                                "completedAt": "2030-01-10T10:47:00Z"}]},
                    {"name": "deploy", "conclusion": "success", "startedAt": "2030-01-10T10:53:00Z",
-                    "completedAt": "2030-01-10T10:54:00Z", "steps": []}]
+                    "completedAt": "2030-01-10T10:54:00Z", "steps": []},
+                   {"name": "analyse", "conclusion": "success", "startedAt": "2030-01-10T10:53:00Z",
+                    "completedAt": "2030-01-10T11:48:00Z", "steps": []}] + [
+                   {"name": f"tests-{k}", "conclusion": "success", "startedAt": "2030-01-10T09:00:00Z",
+                    "completedAt": f"2030-01-10T{9 + (k == 2):02d}:{(40, 35, 20)[k - 1]:02d}:00Z",
+                    "steps": [{"name": "Tests unitaires + couverture (tranche)", "conclusion": "success",
+                               "startedAt": "2030-01-10T09:01:00Z", "completedAt": "2030-01-10T09:30:00Z"}]} for k in (1, 2, 3)]
     m["runs"]["back"].append(r)
 
 
@@ -903,6 +978,318 @@ monde(mesures)
 out = lancer("marges", "--ref", "develop", par="mainteneur")
 verifier("!! quality / Tests : 45.0 min sur 50 (90 %)" in out and "   quality : 53.0 min sur 90 (59 %)" in out
          and "deploy : 1.0 min sur 10" in out, "marges : étape à 90 % de son plafond signalée, job à 59 % non")
+verifier("!! tests : 95.0 min sur 110 (86 %)" in out and "tests / Tests unitaires + couverture (tranche) : 29.0 min sur 60" in out
+         and "!! analyse : 55.0 min sur 65 (85 %)" in out,
+         "marges, CI avec matrice : tranches tests-1 à tests-3 lues sous le plafond du job tests (la plus longue), analyse mesuré")
+
+print("23. banc sous charge : le monde n'est jamais lu à moitié écrit (écritures atomiques)")
+
+
+def lecteur_sans_verrou(stop, erreurs, lectures):
+    # comme le faux systemctl : il lit le monde sans prendre le verrou
+    while not stop.is_set():
+        try:
+            json.loads(MONDE.read_text())
+            lectures.append(1)
+        except ValueError as ex:
+            erreurs.append(str(ex)[:80])
+
+
+def ecrivain_gh(n):
+    for _ in range(n):
+        subprocess.run([str(ICI / "faux/gh"), "pr", "close", "1", "-R", "exemple/app-back"], env=ENV,
+                       capture_output=True, timeout=60)
+
+
+def ecrivain_banc(n):
+    for i in range(n):
+        monde(lambda m: m.update(charge=i))
+
+
+stop, erreurs_lues, lectures = threading.Event(), [], []
+lecteurs = [threading.Thread(target=lecteur_sans_verrou, args=(stop, erreurs_lues, lectures)) for _ in range(3)]
+ecrivains = [threading.Thread(target=ecrivain_gh, args=(15,)) for _ in range(3)] + [threading.Thread(target=ecrivain_banc, args=(30,))]
+for t in lecteurs + ecrivains:
+    t.start()
+for t in ecrivains:
+    t.join()
+stop.set()
+for t in lecteurs:
+    t.join()
+out = subprocess.run([str(ICI / "faux/systemctl"), "--user", "list-units", "dev-*"], env=ENV, capture_output=True, text=True)
+verifier(not erreurs_lues and len(lectures) > 50 and out.returncode == 0,
+         f"lectures sans verrou pendant 75 écritures concurrentes : {len(lectures)} lectures, "
+         f"{len(erreurs_lues)} JSON tronqué(s){' (' + erreurs_lues[0] + ')' if erreurs_lues else ''}")
+verifier(not list(TMP.glob("monde.json.*.tmp")), "aucun fichier temporaire laissé derrière")
+
+print("24. rouge de CI : la main au dev à chaque rouge, diagnostic exigé à partir du 3e, jamais d'arrêt du relais")
+F10 = FIL.replace("000100", "001000")
+nouveau_lot("2.1.0", 861, 961)
+lancer("debut", "2.1.0", "--session-key", F10, par="dev")
+REL110 = {d: f"rel{d}2.1.0".ljust(40, "0") for d in ("back", "front")}
+monde(lambda m: (m["runs"]["back"].append(run("back", 6000, REL110["back"], "push", "release/2.1.0",
+                                              jobs={"quality": "success", "deploy": "success"})),
+                 m["runs"]["front"].append(run("front", 6001, REL110["front"], "push", "release/2.1.0", concl="failure",
+                                               jobs={"quality": "failure", "deploy": "skipped"},
+                                               log="AssertionError: vueCarteMobile"))))
+modifier_etat("2.1.0", lambda e: e.update(etape="ci-release", tour="veille", depuis=il_y_a(1),
+                                          attente={"depots": ["back", "front"], "relances": []}))
+na110 = sum("lot 2.1.0" in x for x in monde().get("avis", []))
+for n in (1, 2, 3):
+    if n > 1:  # le dev a relancé le run rouge, puis rendu l'attente au relais ; le run rougit de nouveau
+        monde(lambda m: m["runs"]["front"][-1].update(status="in_progress", conclusion=None))
+        out = lancer("attendre-ci", "2.1.0", "--message", "e2e instable, relancé", par="dev")
+        verifier(etat("2.1.0")["etape"] == "ci-release" and etat("2.1.0")["attente"]["depots"] == ["back", "front"],
+                 f"rouge n° {n - 1} : le dev rend l'attente au relais par attendre-ci, sans l'humain")
+        lancer("veille")
+        monde(lambda m: m["runs"]["front"][-1].update(status="completed", conclusion="failure"))
+    lancer("veille")
+    e = etat("2.1.0")
+    if e.get("a_reveiller"):
+        lancer("veille")
+    msg = derniers_reveils()[0]["message"]
+    verifier(e["etape"] == "correction" and e["tour"] == "dev" and e["ci_rouges"] == n and derniers_reveils()[0]["sessionKey"] == F10
+             and f"rouge n° {n} de suite" in msg and "actions/runs/6001" in msg and "jobs rouges : quality" in msg
+             and "attendre-ci" in msg and ("diagnostic écrit" in msg) == (n >= 3),
+             f"CI de la release rouge n° {n} : le dev réveillé avec le run, les jobs rouges et le compteur"
+             + (", diagnostic écrit exigé avant toute relance" if n >= 3 else ""))
+
+
+def arrets_110():
+    m = monde()
+    return [x for x in m.get("avis", []) + m.get("dm", []) if "lot 2.1.0" in x and "⛔" in x]
+
+
+verifier(sum("lot 2.1.0" in x for x in monde().get("avis", [])) == na110 and not arrets_110(),
+         "3 rouges de suite : aucun arrêt du relais, aucun avis ni message direct à l'humain")
+monde(lambda m: m["runs"]["front"][-1].update(status="in_progress", conclusion=None))
+out = lancer("attendre-ci", "2.1.0", "--message", "relance", par="dev", attendu=2)
+verifier("diagnostic" in out and etat("2.1.0")["etape"] == "correction", "3e rouge : attendre-ci refusé sans diagnostic écrit")
+lancer("attendre-ci", "2.1.0", "--message", "vueCarteMobile rouge 3 fois sur 4 : délai du clic sous charge, mesuré et "
+       "corrigé par la PR #970", par="dev")
+monde(lambda m: m["runs"]["front"][-1].update(status="completed", conclusion="success", jobs={"quality": "success", "deploy": "success"}))
+lancer("veille")
+e = etat("2.1.0")
+verifier(e["etape"] == "ci-livraison" and e["ci_rouges"] == 0, "CI de la release verte : compteur de rouges remis à zéro")
+modifier_etat("2.1.0", lambda e: e.update(etape="deploiement", tour="veille", depuis=il_y_a(1), attente={
+    "commits": [{"depot": "back", "base": "master", "commit": "prod110".ljust(40, "0")}], "relances": []}))
+monde(lambda m: m["runs"]["back"].append(run("back", 6100, "prod110".ljust(40, "0"), "push", "master", concl="failure",
+                                             jobs={"quality": "success", "deploy": "failure"}, log="deploy: HTTP 500")))
+lancer("veille")
+e, msg = etat("2.1.0"), derniers_reveils()[0]["message"]
+verifier(e["etape"] == "diagnostic-deploiement" and e["tour"] == "dev" and "rouge n° 1 de suite" in msg
+         and "actions/runs/6100" in msg and "jobs rouges : deploy" in msg and "cycle-lot arret 2.1.0 --motif deploiement" in msg
+         and not arrets_110(),
+         "mise en production rouge : le dev diagnostique (étape diagnostic-deploiement), pas d'arrêt ni d'avis à l'humain")
+monde(lambda m: m["runs"]["back"][-1].update(status="in_progress", conclusion=None))
+lancer("attendre-ci", "2.1.0", "--message", "hébergeur indisponible 2 min, relancé", par="dev")
+verifier(etat("2.1.0")["etape"] == "deploiement" and etat("2.1.0")["attente"]["commits"][0]["commit"].startswith("prod110"),
+         "attendre-ci : le relais reprend l'attente de la mise en production sur les mêmes commits")
+monde(lambda m: m["runs"]["back"][-1].update(status="completed", conclusion="success", jobs={"quality": "success", "deploy": "success"}))
+lancer("veille")
+verifier(etat("2.1.0")["etape"] == "liste-validation" and etat("2.1.0")["ci_rouges"] == 0,
+         "mise en production verte après la relance : liste des validations, compteur remis à zéro")
+
+print("25. mise en production : le deploy du front attend le back au lieu d'arrêter le cycle")
+REFUS_FRONT = ("##[error]ATTENTE-BACK : back de la branche 'develop' pas encore déployé (back courant: 'release/2.1.0'). Relance le pipeline "
+               "front une fois le back déployé.")
+
+
+def livraison_110(m):
+    m["runs"]["back"].append(run("back", 6200, "dev110b".ljust(40, "0"), "push", "develop", statut="queued", concl=None))
+    m["runs"]["front"].append(run("front", 6201, "dev110f".ljust(40, "0"), "push", "develop", concl="failure",
+                                  jobs={"quality": "success", "e2e": "success", "deploy": "failure", "perf": "skipped"},
+                                  log=REFUS_FRONT))
+
+
+monde(livraison_110)
+modifier_etat("2.1.0", lambda e: e.update(etape="deploiement", tour="veille", depuis=il_y_a(1), ci_rouges=0, attente={
+    "commits": [{"depot": "back", "base": "develop", "commit": "dev110b".ljust(40, "0")},
+                {"depot": "front", "base": "develop", "commit": "dev110f".ljust(40, "0")}], "relances": []}))
+n0 = len(monde().get("reveils", []))
+lancer("veille")
+e = etat("2.1.0")
+suivi = {s["depot"]: s for s in e["attente"]["suivi"]}
+verifier(e["etape"] == "deploiement" and len(monde()["reveils"]) == n0 and suivi["front"]["verdict"] == "en cours"
+         and "attente du back" in suivi["front"]["resume"],
+         "deploy du front refusé tant que le back de develop n'est pas déployé, back en file : pas un rouge, le relais attend")
+monde(lambda m: m["runs"]["back"][-1].update(status="completed", conclusion="success", jobs={"quality": "success", "deploy": "success"}))
+lancer("veille")
+reruns = lambda: [x for x in monde()["appels"] if x[:3] == ["run", "rerun", "6201"]]
+verifier(etat("2.1.0")["etape"] == "deploiement" and not reruns(),
+         "back vert : le front n'est relancé qu'après le délai de bascule du back (10 min)")
+modifier_etat("2.1.0", lambda e: e["front_attend_back"]["6201"].update(back_vert=il_y_a(11)))
+lancer("veille")
+verifier(etat("2.1.0")["etape"] == "deploiement" and len(reruns()) == 1 and "--failed" in reruns()[0]
+         and len(monde()["reveils"]) == n0, "back déployé : le relais relance une fois les jobs rouges du front, sans réveiller le dev")
+monde(lambda m: m["runs"]["front"][-1].update(status="completed", conclusion="failure"))
+lancer("veille")
+e = etat("2.1.0")
+verifier(e["etape"] == "diagnostic-deploiement" and len(reruns()) == 1 and "rouge n° 1" in derniers_reveils()[0]["message"],
+         "le front rougit de nouveau après la relance : c'est un rouge, le dev est réveillé")
+modifier_etat("2.1.0", lambda e: e.update(etape="deploiement", tour="veille", depuis=il_y_a(1), ci_rouges=0, attente={
+    "commits": [{"depot": "back", "base": "develop", "commit": "dev110b".ljust(40, "0")},
+                {"depot": "front", "base": "develop", "commit": "dev110f2".ljust(40, "0")}], "relances": []}))
+monde(lambda m: (m["runs"]["back"][-1].update(conclusion="failure", jobs={"quality": "failure", "deploy": "skipped"}),
+                 m["runs"]["front"].append(run("front", 6202, "dev110f2".ljust(40, "0"), "push", "develop", concl="failure",
+                                               jobs={"quality": "success", "e2e": "success", "deploy": "failure"},
+                                               log=REFUS_FRONT))))
+lancer("veille")
+verifier(etat("2.1.0")["etape"] == "diagnostic-deploiement" and not [x for x in monde()["appels"] if x[:3] == ["run", "rerun", "6202"]],
+         "back rouge : le refus du front n'est plus une attente, rouge réveillant le dev, aucune relance")
+
+print("26. machine du run disparue : relance du run EN ENTIER, une fois (aiguillage rejoué)")
+
+
+def il_y_a_gh(minutes):
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def job_api(i, nom, statut, concl=None, labels=("machine-distante",), age=0):
+    return {"id": i, "name": nom, "status": statut, "conclusion": concl, "labels": list(labels), "created_at": il_y_a_gh(age)}
+
+
+RUNNERS_BACK = [{"name": "distant-back", "status": "offline", "busy": False, "labels": [{"name": "machine-distante"}]},
+                {"name": "local-back", "status": "online", "busy": False, "labels": [{"name": "machine-locale"}]}]
+monde(lambda m: m.setdefault("runners", {}).update(back=RUNNERS_BACK))
+
+
+def en_release_110(rid, **kw):
+    def maj(m):
+        r = run("back", rid, REL110["back"], "push", "release/2.1.0", **kw)
+        r["createdAt"] = f"2099-04-01T00:00:{rid % 60:02d}Z"
+        m["runs"]["back"].append(r)
+    monde(maj)
+    modifier_etat("2.1.0", lambda e: e.update(etape="ci-release", tour="veille", depuis=il_y_a(1), ci_rouges=0,
+                                              attente={"depots": ["back"], "relances": []}))
+
+
+def run_de(d, rid, m=None):
+    """Run du monde ; dans un monde(lambda m: …), passer m (le verrou du monde n'est pas réentrant)."""
+    return next(x for x in (m or monde())["runs"][d] if x["databaseId"] == rid)
+
+
+NOUV_ROUGE = {"routage": "success", "tests-1": "failure", "tests-2": "success", "tests-3": "success", "quality": "skipped",
+              "analyse": "skipped", "integration": "success", "deploy": "skipped"}
+en_release_110(6301, concl="failure", jobs=NOUV_ROUGE, log="tests-1 : RESSOURCES-INSUFFISANTES, mémoire libre sous le seuil")
+monde(lambda m: run_de("back", 6301, m).update(api_jobs=[job_api(1, "tests-1", "completed", "failure", ("machine-locale",)),
+                                                       job_api(2, "deploy", "completed", "skipped", ("machine-legere",))]))
+n0 = len(monde()["reveils"])
+lancer("veille")
+verifier(etat("2.1.0")["etape"] == "ci-release" and run_de("back", 6301).get("reruns") == ["tout"] and len(monde()["reveils"]) == n0
+         and "relancé EN ENTIER" in (TMP / "cycles" / "2.1.0" / "journal.log").read_text(),
+         "machine locale sans ressources (marque du workflow) : run relancé en entier (sans --failed), noté au journal")
+monde(lambda m: run_de("back", 6301, m).update(status="completed", conclusion="failure"))
+lancer("veille")
+verifier(etat("2.1.0")["etape"] == "correction" and run_de("back", 6301).get("reruns") == ["tout"],
+         "même refus après la relance entière : une seule relance par run, puis rouge pour le dev")
+
+en_release_110(6302, concl="failure", jobs=dict(NOUV_ROUGE, **{"tests-1": "success", "tests-2": "failure"}), log="")
+monde(lambda m: (run_de("back", 6302, m).update(api_jobs=[job_api(21, "tests-2", "completed", "failure")]),
+                 m.setdefault("annotations", {}).update({"21": [{"message": "The self-hosted runner: distant-back lost "
+                                                                 "communication with the server. Verify the machine is running."}]})))
+lancer("veille")
+verifier(etat("2.1.0")["etape"] == "ci-release" and run_de("back", 6302).get("reruns") == ["tout"],
+         "machine distante éteinte en plein run (« lost communication with the server ») : relance entière")
+
+en_release_110(6303, statut="in_progress", concl=None, jobs={})
+monde(lambda m: run_de("back", 6303, m).update(api_jobs=[job_api(31, "routage", "completed", "success", ("machine-legere",), 30),
+                                                       job_api(32, "tests-1", "queued", age=5)]))
+lancer("veille")
+verifier(not run_de("back", 6303).get("annule"), "jobs en file depuis 5 min sur une machine hors ligne : on attend encore")
+monde(lambda m: run_de("back", 6303, m)["api_jobs"][1].update(created_at=il_y_a_gh(12)))
+lancer("veille")
+verifier(run_de("back", 6303).get("annule") and not run_de("back", 6303).get("reruns") and etat("2.1.0")["etape"] == "ci-release",
+         "jobs en file depuis 12 min sur machine-distante, hors ligne : run annulé")
+lancer("veille")
+verifier(run_de("back", 6303).get("reruns") == ["tout"] and etat("2.1.0")["etape"] == "ci-release" and len(monde()["reveils"]) == n0 + 1,
+         "run annulé : relancé en entier au passage suivant, sans réveiller le dev")
+
+en_release_110(6304, statut="in_progress", concl=None, jobs={})
+monde(lambda m: run_de("back", 6304, m).update(api_jobs=[job_api(41, "deploy", "in_progress", None, ("machine-legere",), 20),
+                                                       job_api(42, "perf", "queued", age=15)]))
+lancer("veille")
+msg = derniers_reveils()[0]["message"]
+verifier(not run_de("back", 6304).get("annule") and "deploy est déjà parti" in msg and "distant-back (hors ligne" in msg,
+         "deploy en cours : jamais d'annulation automatique, le dev est prévenu une fois")
+
+print("27. job requis en file alors qu'un runner de son étiquette est libre : signalé une fois au dev")
+F11 = FIL.replace("000100", "001100")
+nouveau_lot("2.1.1", 871, 971)
+lancer("debut", "2.1.1", "--session-key", F11, par="dev")
+monde(lambda m: (m.setdefault("runners", {}).update(front=[
+    {"name": "local-front", "status": "online", "busy": False, "labels": [{"name": "self-hosted"}, {"name": "machine-locale"}]},
+    {"name": "autre-front", "status": "online", "busy": True, "labels": [{"name": "autre"}]}]),
+    run_de("front", 2971, m).update(status="in_progress", conclusion=None, api_jobs=[
+        job_api(51, "quality", "queued", labels=("machine-locale",), age=10),
+        job_api(52, "perf", "queued", labels=("machine-locale",), age=40)])))
+n1 = len(monde()["reveils"])
+lancer("veille")
+verifier(len(monde()["reveils"]) == n1, "dev : quality en file depuis 10 min (moins de 15), perf non requis : rien")
+monde(lambda m: run_de("front", 2971, m)["api_jobs"][0].update(created_at=il_y_a_gh(101)))
+lancer("veille")
+r = derniers_reveils()[0]
+verifier(len(monde()["reveils"]) == n1 + 1 and r["sessionKey"] == F11 and "« quality »" in r["message"]
+         and "actions/runs/2971" in r["message"] and "étiquette attendue : machine-locale" in r["message"]
+         and "local-front (en ligne, libre" in r["message"] and "« perf »" not in r["message"]
+         and not [x for x in monde().get("avis", []) if "lot 2.1.1" in x],
+         "dev : quality en file depuis 101 min, local-front en ligne et libre : le dev prévenu (run, job, étiquette, runners)")
+lancer("veille")
+verifier(len(monde()["reveils"]) == n1 + 1 and not [x for x in monde()["appels"] if x[:3] == ["run", "cancel", "2971"]],
+         "signalé une seule fois, sans action automatique sur le run")
+
+print("28. réglages de déploiement contrôlés avant d'ouvrir les PR de livraison")
+lancer("reglage", "2.1.1", "--ajouter", "FRONT_URL sur backend-prod", par="dev")
+lancer("reglage", "2.1.1", "--ajouter", "lancer republier-catalogue.yml sur master", par="relecteur")
+lancer("reglage", "2.1.1", "--ajouter", "clé API du service externe de production", "--qui", "humain", par="dev")
+monde(lambda m: m["runs"]["back"].append(run("back", 6400, m["refs"]["back"]["release/2.1.1"], "push", "release/2.1.1",
+                                             jobs={"quality": "success", "deploy": "success"})))
+modifier_etat("2.1.1", lambda e: e.update(etape="ci-release", tour="veille", depuis=il_y_a(1),
+                                          attente={"depots": ["back"], "relances": []}))
+nprs = sum(len(v) for v in monde()["prs"].values())
+lancer("veille")
+e, msg = etat("2.1.1"), derniers_reveils()[0]["message"]
+verifier(e["etape"] == "livraison" and sum(len(v) for v in monde()["prs"].values()) == nprs
+         and "AVANT d'ouvrir les PR de livraison" in msg and "FRONT_URL sur backend-prod" in msg
+         and "à faire par Camille, déclaré par Dev" in msg and "déclaré par Relecteur" in msg,
+         "CI de la release verte, réglages à faire : le relais n'ouvre pas les PR, le dev reçoit la liste (qui doit les faire)")
+out = lancer("ouvrir-livraison", "2.1.1", par="dev", attendu=2)
+verifier("3 réglage(s) de déploiement encore à faire" in out and "à faire par Dev" in out and "--sans-reglages" in out
+         and etat("2.1.1")["etape"] == "livraison", "ouvrir-livraison refusé : réglages listés avec qui doit les faire")
+lancer("reglage", "2.1.1", "--classer", "2", "--apres-deploiement", par="dev")
+lancer("reglage", "2.1.1", "--fait", "1", "--preuve", "hébergeur : FRONT_URL enregistrée, relue par l'API", par="dev")
+out = lancer("ouvrir-livraison", "2.1.1", par="dev", attendu=2)
+verifier("1 réglage(s)" in out and "clé API du service" in out and "republier-catalogue" not in out,
+         "réglage fait et réglage d'après déploiement : seul le réglage restant bloque encore")
+lancer("ouvrir-livraison", "2.1.1", "--sans-reglages", "clé posée par Camille, preuve dans le fil", par="dev")
+e = etat("2.1.1")
+verifier(e["etape"] == "ci-livraison" and e["livraison_sans_reglages"]["reglages"] == [3]
+         and "SANS les réglages 3 : clé posée par Camille" in (TMP / "cycles" / "2.1.1" / "journal.log").read_text(),
+         "--sans-reglages : PR ouvertes, motif et réglages passés outre notés au journal")
+out = lancer("reglage", "2.1.1", par="dev")
+verifier("après le déploiement" in out and "[fait] 1." in out, "reglage : liste avec le moment de pose et l'état")
+
+print("29. preuves en réel à chaque retour en revue : --reel inchange avec motif, cité au relecteur")
+F12 = FIL.replace("000100", "001200")
+nouveau_lot("2.1.2", 881, 981)
+lancer("debut", "2.1.2", "--session-key", F12, par="dev")
+reel3 = TMP / "reel112.md"
+reel3.write_text("carte 1 : service externe joué sur la préproduction, 200")
+lancer("passe", "2.1.2", "--vers", "relecteur", "--reel", str(reel3), par="dev")
+modifier_etat("2.1.2", lambda e: e.update(etape="correction", tour="dev", aller_retours=2, rapports=[
+    {"heure": il_y_a(30), "fichier": str(rap), "verdict": "a-reprendre", "aller_retour": 2,
+     "tetes": {"back#881": "ancien".ljust(40, "0")}}]))
+out = lancer("passe", "2.1.2", "--vers", "relecteur", "--contre-relecture", str(cr), "--reel", "inchange", "--motif",
+             "reprise limitée au libellé du bouton de la carte 2 (front), aucun appel au service externe touché", par="dev")
+monde(lambda m: [r.update(status="completed", conclusion="success") for r in m["runs"]["back"]
+                 if r["event"] == "workflow_dispatch" and r["headBranch"] == "feat/2.1.2-lot"])
+lancer("veille")
+modifier_etat("2.1.2", lambda e: e["attente"]["deploiement"].update(vert_a=il_y_a(11)))
+lancer("veille")
+msg = derniers_reveils()[0]["message"]
+verifier(etat("2.1.2")["etape"] == "revue" and "Revue n° 3" in msg and "Preuves en réel non rejouées" in msg
+         and "libellé du bouton de la carte 2" in msg and str(reel3) in msg,
+         "3e revue : la consigne du relecteur cite le motif du dev et les preuves de référence, à vérifier contre le diff")
 
 print("13. aucune commande d'agent n'a tenté de réveil direct")
 verifier(not monde().get("refus_exec"), "aucun `gateway call agent` depuis l'exec d'un agent")

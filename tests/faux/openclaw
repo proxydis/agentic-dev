@@ -10,7 +10,8 @@ MONDE = os.environ["MONDE"]
 a = sys.argv[1:]
 f = open(MONDE + ".lock", "w")
 fcntl.flock(f, fcntl.LOCK_EX)
-m = json.load(open(MONDE))
+with open(MONDE) as x:
+    m = json.load(x)
 rc = 0
 if a[:3] == ["gateway", "call", "agent"]:
     params = json.loads(a[a.index("--params") + 1])
@@ -46,6 +47,10 @@ elif a[:2] == ["message", "send"]:
 else:
     print("faux openclaw : " + " ".join(a), file=sys.stderr)
     rc = 1
-json.dump(m, open(MONDE, "w"), indent=1)
+# écriture atomique sous le verrou : jamais de monde à moitié écrit pour un autre lecteur
+tmp = f"{MONDE}.{os.getpid()}.tmp"
+with open(tmp, "w") as t:
+    json.dump(m, t, indent=1)
+os.replace(tmp, MONDE)
 fcntl.flock(f, fcntl.LOCK_UN)
 sys.exit(rc)

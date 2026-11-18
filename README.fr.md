@@ -7,8 +7,8 @@ relecteur, de « lance le lot 1.0.0 » jusqu'à la validation en production. L'h
 pour les décisions qu'il est seul à pouvoir prendre.
 
 - **`run-lot.sh`** : le lanceur du développement. Il découpe le lot en passes [Claude Code](https://docs.claude.com/en/docs/claude-code)
-  non interactives, une carte par passe, sur deux voies parallèles. Il fait tourner la suite complète une seule fois
-  en fin de lot, puis lance la CI des pull requests du lot.
+  non interactives, une carte par passe, sur deux ou trois voies parallèles. Il fait tourner la suite complète une
+  seule fois en fin de lot, en script et sans Claude, puis lance la CI des pull requests du lot.
 - **`cycle-lot`** : le cycle complet, de la revue à la mise en production. Une machine à états par lot, que les agents
   font avancer par des commandes, et un relais systemd qui les réveille à leur tour et tient seul toutes les attentes
   (CI, déploiements).
@@ -27,13 +27,15 @@ fichiers de configuration non versionnés.
 | 4 | Arbitrage bloquant | dev → humain | Une question que les règles ne tranchent pas arrête le cycle (`cycle-lot arret`) |
 | 5 | CI de fin de lot | `run-lot.sh` | Tests unitaires et e2e, qualité et sécurité, une fois, sur les têtes finales des PR |
 | 6 | CI rouge | dev | Le dev corrige avant de demander la revue : `cycle-lot passe` refuse une CI qui n'est pas verte |
-| 7 | Revue | relecteur | Relecture, tests, parcours Playwright sur la version déployée du lot ; verdict À MERGER ou À REPRENDRE. La 1re revue exige les preuves en réel du dev (`passe --reel`). Une revue de correction ne relit que le diff depuis la tête revue |
+| 7 | Revue | relecteur | Relecture, tests, parcours Playwright sur la version déployée du lot ; verdict À MERGER ou À REPRENDRE. La 1re revue exige les preuves en réel du dev (`passe --reel`), et chaque revue suivante les exige de nouveau sur la tête de la reprise. Une revue de correction ne relit que le diff depuis la tête revue |
 | 8 | Correction | dev | Revues 1 et 2 : tous les points, bloquants et non bloquants. À partir de la 3e revue : les bloquants seuls, chaque non bloquant devient une carte du lot suivant. Le dev corrige la famille de chaque défaut, pas le seul cas, et une passe distincte relit le diff de la reprise (`passe --contre-relecture`) |
 | 9 | 7 ↔ 8 | | Automatique jusqu'à À MERGER ; arrêt au 5e À REPRENDRE |
 | 10 | Merge du lot | relecteur, relais | Le verdict À MERGER merge aussitôt chaque PR dans la release (squash, back d'abord) ; le relais pose le commit de release (CHANGELOG, version) |
-| 11 | Livraison | relais | Release verte : le relais ouvre les 4 PR, release vers `develop` et `master`, back et front. Le dev ne s'en charge que si une intervention de l'humain reste ouverte |
+| 10b | CI de la release rouge | dev | Chaque rouge rend la main au dev avec les runs, les jobs rouges et le compteur de rouges de suite : correctif par une PR, ou relance puis `cycle-lot attendre-ci`. À partir du 3e rouge de suite, un diagnostic écrit précède toute relance |
+| 11 | Livraison | relais | Release verte : le relais ouvre les 4 PR, release vers `develop` et `master`, back et front. Le dev ne s'en charge que si une intervention de l'humain ou un réglage de déploiement d'avant livraison reste ouvert |
 | 12 | Revue de livraison | relais ou relecteur | CI verte et contenu limité au lot revu : le relais merge les 4 PR. Sinon le relecteur vérifie et merge |
-| 13 | Mise en production | relais, puis dev | CI de `develop` et `master` (déploiement compris), puis réglages de déploiement déclarés pendant le lot, posés et prouvés par le dev, et liste des validations visuelles à faire en production |
+| 13 | Mise en production | relais, puis dev | CI de `develop` et `master` (déploiement compris), puis réglages de déploiement restants (ceux qui ne se posent qu'après le déploiement), posés et prouvés par le dev, et liste des validations visuelles à faire en production |
+| 13b | Diagnostic de déploiement | dev | CI de mise en production rouge (étape `diagnostic-deploiement`) : le dev diagnostique, relance, puis `cycle-lot attendre-ci --message "<diagnostic>"` rend l'attente au relais |
 | 14 | Validation en production | relecteur | Playwright sur la production, une carte Trello par défaut, dans la version suivante, en Not Ready |
 
 Trello suit le cycle : Work in progress au démarrage, Waiting for review dès qu'une passe est poussée dans la PR du
@@ -63,20 +65,43 @@ intervention de l'humain sans laquelle une carte ne peut pas être vérifiée en
 --ajouter … --avant revue` : la revue est refusée tant qu'elle n'est pas faite, ou que les cartes qui en dépendent ne
 sont pas reportées. Après une correction, `passe` exige le rapport d'une contre-relecture (`--contre-relecture
 <fichier>`) : une passe distincte qui a relu le diff de la reprise avec la grille de revue, avec pour seule question
-ce que la correction casse, oublie ou laisse passer.
+ce que la correction casse, oublie ou laisse passer. Quand le premier passage a donné un fichier de preuves, chaque
+retour en revue apporte les siennes : `--reel <fichier>` avec les preuves rejouées sur la tête de la reprise, ou
+`--reel inchange --motif "<pourquoi la reprise ne touche aucun critère joué en réel>"` (20 caractères au moins). La
+consigne du relecteur cite le fichier, ou le motif à vérifier contre le diff ; un motif faux est un point bloquant. La
+voie courte en est exemptée.
 
 **Voie courte.** Après le merge du lot, un correctif qui ne touche que la CI, les tests ou la documentation est reconnu
-à ses fichiers (`motif_voie_courte`) : relu sur son diff, sans déploiement de preview ni contre-relecture, hors
+à ses fichiers (`motif_voie_courte`, qui comprend les scripts que seule la CI exécute, `scripts/ci/`) : relu sur son diff, sans déploiement de preview ni contre-relecture, hors
 compteur d'aller-retours. Le 3e À REPRENDRE de suite en voie courte arrête le cycle (`max_voie_courte`).
 
 **Réglages de déploiement.** Les variables d'environnement, workflows à lancer, données à republier ou migrations
-qu'une carte suppose se déclarent pendant le lot (`cycle-lot reglage <v> --ajouter …`), par le dev ou le relecteur. Un
-réglage écrit seulement dans une PR s'oublie à la livraison : le passage aux validations en production est refusé tant
-que chaque réglage n'est pas marqué fait avec sa preuve (`reglage <v> --fait N --preuve …`), et le relecteur les
-vérifie en premier.
+qu'une carte suppose se déclarent pendant le lot (`cycle-lot reglage <v> --ajouter …`), par le dev ou le relecteur,
+avec qui doit les poser (`--qui dev`, par défaut, ou `--qui humain`). Un réglage écrit seulement dans une PR s'oublie à
+la livraison, et la CI de livraison les découvre alors un par un, un rouge chacun. `ouvrir-livraison`, et le relais
+quand il ouvre lui-même les PR de livraison, refusent donc tant qu'un réglage à poser avant la livraison reste à faire,
+et listent chacun avec qui doit le poser ; le relais réveille alors le dev avec cette liste au lieu d'ouvrir les PR. Un
+réglage qui ne peut se poser qu'après le déploiement (workflow à lancer sur `master`, données à publier sur la version
+servie) se déclare `--apres-deploiement`, ou se reclasse (`reglage <v> --classer N --apres-deploiement`) : il
+n'empêche pas la livraison. `ouvrir-livraison <v> --sans-reglages "<motif>"` passe outre, motif et réglages passés
+outre notés au journal du lot ; le relais ne passe jamais outre. Tous les réglages, ceux d'après déploiement compris,
+doivent être marqués faits avec leur preuve (`reglage <v> --fait N --preuve …`) avant le passage aux validations en
+production, et le relecteur les vérifie en premier.
+
+**Rouge de CI.** Chaque rouge de la CI de la release ou de la mise en production rend la main au dev, avec le run, les
+jobs rouges et le compteur de rouges de suite (`relais.diagnostic_ci_rouges`, remis à zéro au vert de ces CI). À partir
+du 3e rouge de suite, la consigne exige un diagnostic écrit dans le fil avant toute relance : la cause de chaque job
+rouge, en quoi elle diffère des rouges précédents, et pourquoi la suite passera ; `attendre-ci` refuse sans lui. Un
+défaut de code passe par une PR et `passe` ; un rouge sans rapport avec le code se relance (`gh run rerun <id>
+--failed`, ou sans `--failed` si sa machine a disparu), puis `cycle-lot attendre-ci <v> --message "<diagnostic>"` rend
+l'attente au relais, sur la CI de la release (depuis l'étape de correction) ou sur celle de la mise en production
+(depuis `diagnostic-deploiement`, mêmes commits). Le relais n'arrête jamais le cycle pour un rouge : seul le dev
+l'arrête (`cycle-lot arret --motif ci|deploiement`) s'il lui faut une décision ou une action de l'humain.
 
 **Arrêts.** Le cycle s'arrête sur un arbitrage bloquant, sur une intervention nécessaire de l'humain (variable
-d'environnement, jeton, compte…), au 5e verdict À REPRENDRE et au 3e À REPRENDRE de suite en voie courte. Les
+d'environnement, jeton, compte…), au 5e verdict À REPRENDRE, au 3e À REPRENDRE de suite en voie courte, et quand une
+CI de release ou de mise en production n'a aucun verdict au double du plafond de l'étape. Une CI rouge ne l'arrête
+jamais. Les
 arbitrages et les interventions se signalent dès le démarrage du lot, pas au milieu. À l'arrêt, le relais poste un
 avis dans le fil, nomme l'agent à mentionner et l'envoie aussi à l'humain en message direct ; l'humain répond dans le
 fil en mentionnant cet agent, qui relance le cycle (`cycle-lot reprise`).
@@ -98,9 +123,32 @@ silence. Ici, aucun agent n'attend jamais :
 - un run rouge sur du code est traité aussitôt, sans attendre les runs de l'autre dépôt. Sans aucun rouge, une attente
   au-delà du plafond de l'étape ne donne qu'un avis ; l'arrêt vient au double du plafond (des runs en file sur un
   runner unique ne sont pas une panne) ;
+- un déploiement du front refusé parce que le back de la même branche n'est pas encore déployé est l'ordre normal
+  d'une livraison, pas un rouge. Il se reconnaît aux messages que le workflow du front écrit (`motif_front_attend_back`)
+  quand le job de déploiement est le seul rouge et que le run du back de la même branche est en cours, pas encore
+  créé, ou vert. Le relais attend le back, relance une fois les jobs rouges du front `relais.attente_back_min` après le
+  vert du back, et ne réveille le dev que si le front rougit de nouveau ;
+- quand la machine d'un run a disparu, relancer les seuls jobs rouges les renverrait vers la même machine : le relais
+  relance le run en entier (`gh run rerun <id>` sans `--failed`), une fois par run, et le note au journal.
+  Déclencheurs : runner perdu en plein run (« lost communication with the server », dans le journal ou les annotations
+  des jobs), machine locale qui refuse le run faute de ressources (marque écrite par le workflow,
+  `motif_machine_refusee`), ou jobs en file depuis `relais.file_hors_ligne_min` sur des étiquettes dont tous les
+  runners sont hors ligne (le run est annulé, puis relancé en entier au passage suivant). Jamais quand un job de
+  déploiement (`jobs_deploiement`) est déjà parti : le dev est prévenu une fois à la place ;
+- un job requis en file depuis `relais.file_runner_libre_min` alors qu'un runner portant ses étiquettes est en ligne
+  et libre est signalé une fois au dev (run, job, étiquette attendue, runners vus), sans action automatique ni message à
+  l'humain. Cette surveillance couvre les attentes du relais et la CI des PR du lot pendant le dev et la correction ;
+  elle lit `actions/runs/<id>/jobs` et `actions/runners`, ce qui demande un jeton autorisé à lister les runners du dépôt
+  (sinon la lecture échoue sans bruit et rien n'est signalé) ;
+- avec une CI qui aiguille ses runs (un job d'aiguillage en tête de run choisit la machine, les tests peuvent être
+  découpés en tranches dans une matrice, un job d'analyse statique peut porter la gate), un run qui a le job
+  d'aiguillage (`ci_aiguillage.job`, même sauté) exige en plus les `ci_aiguillage.jobs_requis` de son application et
+  toutes les tranches de tests présentes (`ci_aiguillage.motif_tranches`) ; le job marqueur peut les faire sauter
+  légitimement. Un run sans aiguillage garde les règles ci-dessus ;
 - à la première CI de release verte d'un lot, le relais compare la plus longue durée mesurée de chaque job et de
   chaque étape plafonnée de la CI à son `timeout-minutes`, et poste un avis pour celles qui dépassent 80 % (`cycle-lot
-  marges` donne le même tableau à la demande).
+  marges` donne le même tableau à la demande). Les jobs d'une matrice (`tests-1`, `tests-2`… d'un job nommé
+  `tests-${{ matrix.tranche }}`) sont mesurés face au plafond de leur job.
 
 Le réveil passe par le RPC `agent` du gateway OpenClaw, dans la session de l'agent pour le fil Slack du lot, et sa
 réponse y est postée. Il part du service systemd et non de l'exec d'un agent : le gateway refuse qu'un agent réveille
@@ -138,7 +186,7 @@ contexte en cache : c'est l'essentiel du coût d'un tour, bien plus que le trava
 
 ```
 run-lot.sh <dossier-du-lot> pre    # phase PRE seule : études, mesures, questions d'arbitrage
-run-lot.sh <dossier-du-lot> impl   # voies A et B en parallèle, phase FIN, puis CI des PR du lot
+run-lot.sh <dossier-du-lot> impl   # voies A, B (et C) en parallèle, phase FIN, puis CI des PR du lot
 ```
 
 Le lanceur tourne dans une unit systemd dont le nom commence par l'identifiant de l'agent (`dev-100-impl`), avec un
@@ -161,23 +209,39 @@ systemd-run --user --unit dev-100-impl --property=MemoryHigh=6G --property=Memor
 | `card-<n>.md` | Le texte de la carte |
 | `common-back.md`, `common-front.md` | Le cadre commun des passes de chaque application |
 | `arbitrages.md` | Les décisions de l'agent et les réponses de l'humain, jointes à chaque passe |
+| `fin-mecanique-<app>.txt` | Facultatif : la liste propre au lot des commandes de fin de lot, à la place de celle qui est à côté de `fin-mecanique.sh` |
 
 **Phases.**
 
 - **PRE** : études et mesures en tête de lot, sans implémentation. Les questions d'arbitrage vont dans
   `questions-arbitrage.md`. `impl` refuse de démarrer tant qu'elles ne sont pas tranchées dans `arbitrages.md`, ou
   qu'une question `[BLOQUANTE]` n'a pas de réponse de l'humain.
-- **A et B** : deux voies en parallèle, une carte par passe. Une passe ne reçoit de la précédente que sa note de
-  passation. Tests ciblés seulement. Quand les deux voies touchent le même dépôt, la voie B travaille dans son propre
-  worktree, sur une branche `-vB`.
-- **FIN** : fusion de la branche `-vB` (Claude résout les conflits si git n'y arrive pas seul), puis suite complète de
-  chaque application touchée, et relecture du diff avec la grille de revue.
+- **A, B et C** : deux ou trois voies en parallèle, une carte par passe. Une passe ne reçoit de la précédente que sa
+  note de passation. Tests ciblés seulement (`WORKERS_VOIE` workers, `WORKERS_3VOIES` à trois voies). La voie C est
+  facultative : une troisième file de cartes indépendantes des deux autres, qui ne part que si `etapes.txt` lui donne
+  des étapes. Quand une voie touche un dépôt déjà pris par une voie d'avant, elle travaille dans son propre worktree,
+  sur sa propre branche (`-vB`, `-vC`) ; `impl` refuse deux voies sur la même branche du même dépôt. Les gestes git du
+  lanceur (fetch, worktree, checkout) passent un par un par dépôt, car les voies partagent le `.git` de chaque dépôt.
+- **FIN** : fusion des branches `-vB` et `-vC` (étapes `FUSION…` ; Claude résout les conflits si git n'y arrive pas
+  seul), cartes placées en fin de lot, puis fin de chaque application : une étape FIN sans carte.
+- **Fin d'une application, en script** (quand `MECA`, par défaut `fin-mecanique.sh`, est exécutable) : d'abord une
+  passe de relecture par Claude si l'étape a son `step-<nom>.md`, avec des tests ciblés seulement ; puis la partie
+  mécanique, jouée par `fin-mecanique.sh` sans Claude : la liste de commandes `fin-mecanique-<app>.txt` (suite
+  complète, lint, typage, build, e2e, audit…, `WORKERS_FIN` workers), plus l'état de conflit de la PR face à la
+  release ; puis, seulement s'il y a du rouge, une passe de correction qui reçoit le rapport, et de nouveau le script,
+  `MAX_TOURS_FIN` fois au plus. La suite complète ne tourne ainsi qu'une fois quand tout est vert, et une passe Claude
+  ne garde plus pour elle des heures de commandes. Avec `MECA` vide, la passe FIN lance elle-même la suite, comme avant.
+- **Relecture d'une reprise** : la relecture de fin d'application lit le diff complet du lot la première fois, et
+  seulement le diff de la reprise (`git diff <tête d'avant>..HEAD`) quand le lot est une reprise. Dans un cycle
+  `cycle-lot`, la tête d'avant est notée toute seule au premier lancement d'un `PREFIX` quand le cycle est en
+  correction ; sinon, la donner dans `lot.conf` (`REPRISE_DEPUIS_BACK`, `REPRISE_DEPUIS_FRONT` ; `-` force la relecture
+  du lot entier).
 - **CI** : pendant le lot, une étiquette (`ci-en-pause`) fait sauter les jobs de PR et les runs déjà partis sont
   annulés. Les workflows doivent tester cette étiquette dans le `if:` de leurs jobs de PR. En fin de lot, le lanceur
   retire l'étiquette, rouvre les PR, attend les verdicts et les écrit dans son journal. Un rouge sans rapport avec le
   code (tâche Sonar tombée, coupure réseau) est relancé une fois.
 
-**Créneaux.** Au plus `MAX_VOIES` passes Claude Code à la fois sur la machine, tous lots et tous agents confondus
+**Créneaux.** Au plus `MAX_VOIES` (3) passes Claude Code à la fois sur la machine, tous lots et tous agents confondus
 (verrous `flock` dans `slots/`). Chaque passe exige `SEUIL_MIO` de mémoire disponible au démarrage. Un job lourd d'un
 agent (unit dont le nom correspond à `AGENTS_RE`, et qui charge vraiment la machine) occupe un créneau.
 
@@ -186,19 +250,34 @@ compte dédiés aux agents.
 
 Réglages de la machine : [`run-lot.example.conf`](run-lot.example.conf), à copier en `run-lot.conf`.
 
+**`fin-mecanique.sh`.** `fin-mecanique.sh <back|front> <dépôt> <base> <dossier des journaux> [<liste>]` joue toutes les
+commandes de la liste dans l'ordre, dans le dépôt, même après un rouge (la passe de correction reçoit la liste entière
+d'un coup), et écrit un rapport Markdown sur sa sortie standard ; chaque commande a son journal. Une ligne par
+commande : `<nom> [apres=<nom>] [sortie2=non-joue] | <commande shell>` : `apres=` saute la commande quand celle qui est
+nommée n'est pas verte (e2e après build), `sortie2=non-joue` lit la sortie 2 comme « n'a pas pu tourner » et non comme
+un rouge. Les commandes reçoivent `$W` (workers), `$J` (dossier des journaux), `$T` (dossier temporaire du passage),
+`$BASE`, `$E2E_PORT` et `$VERIF`. `$T` vit sous `MECA_TMP` (par défaut `~/.cache/run-lot/meca`), hors de `/tmp`
+(souvent un petit tmpfs) et hors de tout dépôt git (des tests qui lancent `git ls-files` dans leur dossier temporaire
+verraient le dépôt englobant) : le script refuse de tourner dans un dépôt git, et efface `$T` à la sortie. Il ne part
+pas non plus quand le disque de `$T` a moins de `MECA_DISQUE_MIO` libres (sortie 2 : rien n'est joué), car un disque
+plein donnerait de faux rouges. Chaque commande est plafonnée à `MECA_DELAI_S` secondes. Sortie 0 : tout est vert ;
+1 : au moins un rouge ; 2 : rien n'a pu être joué. Listes d'exemple pour un back Python et un front Node :
+[`fin-mecanique-back.txt`](fin-mecanique-back.txt), [`fin-mecanique-front.txt`](fin-mecanique-front.txt).
+
 ## `cycle-lot`
 
 | Commande | Qui | Effet |
 |---|---|---|
 | `debut <v> --session-key <clé>` | dev, sur demande de l'humain | Crée l'état du lot, cartes en Work in progress |
-| `passe <v> --vers <relecteur> --message … [--reel <f>\|aucun] [--contre-relecture <f>]` | dev | Fin du dev ou d'une correction : CI verte exigée, preuves en réel à la 1re revue, contre-relecture après une correction, back du lot déployé sur la preview (si `deploiement_preview` est configuré), puis revue. Un correctif en voie courte se passe de preview et de contre-relecture |
+| `passe <v> --vers <relecteur> --message … [--reel <f>\|aucun\|inchange --motif …] [--contre-relecture <f>]` | dev | Fin du dev ou d'une correction : CI verte exigée, preuves en réel à la 1re revue et de nouveau à chaque retour en revue (`--reel <f>`, ou `--reel inchange --motif "<motif>"`), contre-relecture après une correction, back du lot déployé sur la preview (si `deploiement_preview` est configuré), puis revue. Un correctif en voie courte se passe de preview et de contre-relecture |
 | `verdict <v> --merger\|--a-reprendre --rapport <f> [--bloquants N] [--non-bloquants N] [--cartes-ok …] [--cartes-ko …]` | relecteur | Fin de revue ; `--merger` merge aussitôt les PR du lot ; verdicts incohérents refusés ; arrêt automatique au 5e À REPRENDRE |
 | `merge <v> --pr back#N` | relecteur | Merge gardé : tête inchangée depuis la revue, CI verte, back avant front ; après un merge refusé au verdict, ou en revue de livraison |
-| `ouvrir-livraison <v>` | dev | Les 4 PR de livraison, quand le relais n'a pas pu les ouvrir ; refusé tant qu'une intervention de l'humain reste à faire |
+| `ouvrir-livraison <v> [--sans-reglages "<motif>"]` | dev | Les 4 PR de livraison, quand le relais n'a pas pu les ouvrir ; refusé tant qu'une intervention de l'humain ou un réglage de déploiement d'avant livraison reste à faire (`--sans-reglages` passe outre le contrôle des réglages, avec un motif gardé au journal) |
+| `attendre-ci <v> --message "<diagnostic>"` | dev ou relecteur | Après une relance, rend l'attente de la CI au relais : le relecteur en revue de livraison ; le dev après un rouge de la CI de la release (étape de correction) ou de la mise en production (`diagnostic-deploiement`). À partir du 3e rouge de suite, le diagnostic est exigé |
 | `passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>` | dev | Liste des validations visuelles en production |
 | `carte-bug <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | relecteur | Carte de bug dans la version suivante (ou celle donnée, postérieure), en Not Ready |
 | `carte-report <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | relecteur ou dev | Point reporté à un lot suivant, à toute étape : non bloquant à partir de la 3e revue, défaut ancien hors périmètre, reste décidé par l'humain |
-| `reglage <v> [--ajouter … \| --fait N --preuve …]` | dev ou relecteur | Réglages de déploiement : déclarés pendant le lot, exigés avant les validations en production ; sans option, la liste |
+| `reglage <v> [--ajouter … [--apres-deploiement] [--qui dev\|humain] \| --fait N --preuve … \| --classer N [--apres-deploiement] [--qui …]]` | dev ou relecteur | Réglages de déploiement : déclarés pendant le lot, exigés avant l'ouverture des PR de livraison (ou, déclarés `--apres-deploiement`, avant les validations en production) ; `--classer` en reclasse un ; sans option, la liste avec qui pose chacun et quand |
 | `marges [--ref develop]` | tous | Plus longue durée mesurée de chaque job et de chaque étape plafonnée de la CI sur les derniers runs verts, face à son `timeout-minutes` |
 | `fin <v> --rapport <f>` | relecteur | Lot livré et validé |
 | `arret`, `reprise`, `intervention [--avant revue]`, `programmer`, `reveiller` | | Arrêt et reprise, interventions de l'humain (exigées avant la revue avec `--avant revue`, avant la livraison par défaut), lancement différé, réveil manuel |
@@ -236,6 +315,16 @@ comme une erreur du relais.
    | `relais.ci_verte_min` | 15 | Minutes de CI verte sans passage de main avant le réveil ciblé du dev |
    | `relais.rappel_alerte_min`, `relais.nb_rappels_alerte` | 120, 5 | Rappels d'une alerte restée sans réponse, dans le fil et en message direct |
    | `relais.seuil_marge` | 0.8 | Part d'un `timeout-minutes` au-delà de laquelle une durée de CI donne un avis |
+   | `relais.diagnostic_ci_rouges` | 3 | Rouges de suite de la CI de la release ou de la mise en production à partir desquels un diagnostic écrit est exigé avant toute relance |
+   | `relais.attente_back_min` | 10 | Minutes après le vert du back avant de relancer le déploiement du front qui l'attendait |
+   | `relais.file_hors_ligne_min` | 10 | Minutes de jobs en file sur des machines hors ligne avant d'annuler le run et de le relancer en entier |
+   | `relais.file_runner_libre_min` | 15 | Minutes qu'un job requis peut rester en file alors qu'un runner qui lui convient est libre, avant de prévenir le dev |
+   | `jobs_deploiement` | `["deploy"]` | Jobs qui déploient : un run où l'un d'eux est parti n'est jamais annulé ni relancé en entier ; seul job rouge admis quand le front attend le back |
+   | `motif_front_attend_back` | `ATTENTE-BACK` | Expression régulière sur le journal des jobs rouges du front : déploiement refusé parce que le back de la même branche n'est pas encore déployé |
+   | `motif_machine_refusee` | aucun | Expression régulière sur le journal des jobs rouges : la machine du run l'a refusé faute de ressources (relance entière) |
+   | `ci_aiguillage.job` | aucun | Job d'aiguillage d'une CI qui choisit la machine de chaque run ; absent, les règles d'une CI aiguillée ne s'appliquent pas |
+   | `ci_aiguillage.jobs_requis` | `{}` | Par application, jobs requis (et sautables avec le job marqueur) dans un run aiguillé |
+   | `ci_aiguillage.motif_tranches` | aucun | Expression régulière des noms de tranches de tests (`^tranche-\d+$`) : toute tranche présente dans un run aiguillé est requise |
    | `slack_archives` | aucun | `https://<espace>.slack.com/archives` : lien du fil dans les messages directs ; absent, le message part sans lien (`CYCLE_LOT_SLACK_ARCHIVES` prime) |
 2. Rendre la commande accessible aux agents : `ln -s ~/agentic-dev/cycle-lot ~/.local/bin/cycle-lot`.
 3. Installer le relais : copier [`systemd/`](systemd) dans `~/.config/systemd/user/`, adapter le chemin, puis
@@ -251,7 +340,12 @@ comme une erreur du relais.
    - la session du fil est remise à zéro à chaque étape : ce qui doit servir à une étape suivante s'écrit dans le
      dossier du lot ou dans un rapport, jamais seulement dans le fil ;
    - à partir du seuil de report de la règle de revue, le relecteur crée une `carte-report` par point non bloquant
-     avant le verdict, et le dev ne corrige que les bloquants.
+     avant le verdict, et le dev ne corrige que les bloquants ;
+   - après une CI rouge, le dev diagnostique, corrige par une PR ou relance, puis rend l'attente avec `cycle-lot
+     attendre-ci --message "<diagnostic>"` ; à partir du 3e rouge de suite, le diagnostic écrit est d'abord posté dans
+     le fil, et `cycle-lot arret` ne sert que pour une décision ou une action de l'humain ;
+   - chaque retour en revue apporte ses preuves en réel (`--reel <fichier>` ou `--reel inchange --motif …`), et un
+     réglage de déploiement qui ne peut se poser qu'après le déploiement se déclare `--apres-deploiement`.
 5. La grille de revue commune est [`GRILLE-REVUE.md`](GRILLE-REVUE.md), et les règles d'arbitrage
    [`regles-arbitrage.example.md`](regles-arbitrage.example.md), à copier en `regles-arbitrage.md`.
 
@@ -264,8 +358,9 @@ Slack pour `cycle-lot`. Les deux dépôts suivent un flux `develop` / `release/<
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, panne du gateway (134 vérifications)
-bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux (26 vérifications, ~1 min)
+python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, CI rouge, panne du gateway (177 vérifications)
+bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux : trois voies, fin de lot en
+                                 # script, reprise relue sur son diff (47 vérifications, ~2 min)
 ```
 
 Aucun des deux n'appelle un vrai service : de faux `gh`, `openclaw`, `systemctl`, `claude` et une fausse API Trello

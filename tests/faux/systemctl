@@ -5,7 +5,9 @@ import json
 import os
 import sys
 
-m = json.load(open(os.environ["MONDE"]))
+# lecture sans verrou : les écrivains remplacent le monde d'un bloc (os.replace), on lit l'ancien ou le nouveau
+with open(os.environ["MONDE"]) as x:
+    m = json.load(x)
 motif = next((x for x in sys.argv[1:] if not x.startswith("-") and x != "list-units"), "*")
 for u in m.get("units", []):
     if fnmatch.fnmatch(u, motif):

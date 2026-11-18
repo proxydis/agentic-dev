@@ -1,4 +1,4 @@
-# <nom> <phase> <repo> <carte|-> <branche> <base> [opt]   une carte par étape A ou B
+# <nom> <phase> <repo> <carte|-> <branche> <base> [opt]   une carte par étape A, B ou C
 # PRE : études et mesures avant tout développement (run-lot.sh <lot> pre). Une étape PRE peut ne rien pousser.
 P1 PRE back - etude/1.0.0 release/1.0.0
 #
@@ -6,8 +6,12 @@ P1 PRE back - etude/1.0.0 release/1.0.0
 A1 A back 1 feat/1.0.0-lot release/1.0.0
 B2 B front 2 feat/1.0.0-lot release/1.0.0
 B3 B back 3 feat/1.0.0-lot-vB release/1.0.0
+# Voie C, facultative : une troisième file de cartes indépendantes, ici sur le back (branche -vC, son worktree).
+# C4 C back 4 feat/1.0.0-lot-vC release/1.0.0
 #
-# FIN : fusion de la branche -vB dans celle de la voie A, puis suite complète de chaque appli et PR (une par appli).
+# FIN : fusion des branches -vB (et -vC) dans celle du lot, puis fin de chaque appli (étape sans carte) : relecture si
+# step-<nom>.md existe, suite complète et contrôles joués en script (fin-mecanique.sh), correction s'il y a du rouge.
 FUSIONB FIN back - feat/1.0.0-lot feat/1.0.0-lot-vB
+# FUSIONC FIN back - feat/1.0.0-lot feat/1.0.0-lot-vC
 FINB FIN back - feat/1.0.0-lot release/1.0.0
 FINF FIN front - feat/1.0.0-lot release/1.0.0

@@ -21,14 +21,18 @@ et mergées par le relais quand elles n'apportent que le lot revu).
 
   cycle-lot debut <v> --session-key <clé du dev>        le dev, sur demande de l'humain : crée le cycle, cartes en WIP
   cycle-lot passe <v> --vers <relecteur> [--message …]  le dev : fin du dev ou d'une correction, CI verte exigée
-                    [--reel <fichier>|aucun] [--contre-relecture <rapport>]   1re revue / après une correction
+                    [--reel <fichier>|aucun|inchange --motif …] [--contre-relecture <rapport>]
+                                                        1re revue / après une correction
   cycle-lot verdict <v> --merger|--a-reprendre …        le relecteur : fin de revue ; --merger merge aussitôt le lot
   cycle-lot merge <v> --pr back#N                       le relecteur : merge gardé (tête revue, CI verte, back d'abord)
   cycle-lot ouvrir-livraison <v>                        le dev : les 4 PR release -> develop/master (si le relais n'a pu)
+  cycle-lot attendre-ci <v> --message …                 après une relance de CI : le relais reprend l'attente
   cycle-lot passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>   le dev : validations en prod
   cycle-lot carte-bug <v> --titre … --appli … --gravite … --description-fichier …   le relecteur : bug vu en prod
   cycle-lot carte-report <v> --titre … --appli … --gravite … --description-fichier …   point reporté au lot suivant
-  cycle-lot reglage <v> --ajouter … | --fait N --preuve …   réglages de déploiement à poser à la livraison
+  cycle-lot reglage <v> --ajouter … [--apres-deploiement] [--qui humain] | --fait N --preuve … | --classer N …
+                                                        réglages de déploiement, avant la livraison (ou après le
+                                                        déploiement)
   cycle-lot marges [--ref develop]                      durées mesurées des jobs de CI face à leurs plafonds
   cycle-lot fin <v> --rapport <fichier>                 le relecteur : lot livré et validé
   cycle-lot arret <v> --motif … --message …             l'un ou l'autre : arbitrage bloquant, intervention humaine
@@ -96,6 +100,17 @@ REQUIS_PUSH = tuple(CONF.get("jobs_requis_push") or ("quality", "deploy"))
 # dans le workflow, un job requis sauté reste un manque.
 MARQUEUR_DEJA_VALIDE = CONF.get("job_deja_valide", "contenu-deja-valide")
 JOBS_SAUTABLES = tuple(CONF.get("jobs_sautables") or ("quality", "e2e"))
+# CI avec aiguillage : un job d'aiguillage en tête de run choisit la machine des jobs lourds, les tests peuvent être
+# découpés en tranches (matrice) et un job d'analyse statique porter la gate. Un run qui a ce job (présent même sauté)
+# exige en plus les jobs de `jobs_requis` de son application et toutes les tranches présentes ; le job marqueur peut
+# les faire sauter légitimement. Un run sans aiguillage garde les règles ci-dessus. Sans `ci_aiguillage.job`, rien.
+AIGUILLAGE = CONF.get("ci_aiguillage") or {}
+JOB_AIGUILLAGE = AIGUILLAGE.get("job") or None
+REQUIS_NOUVELLE_CI = {app: tuple(j) for app, j in (AIGUILLAGE.get("jobs_requis") or {}).items()}
+RE_TRANCHE = re.compile(AIGUILLAGE["motif_tranches"]) if AIGUILLAGE.get("motif_tranches") else None
+# Jobs qui déploient : un run dont l'un d'eux est parti n'est jamais annulé ni relancé en entier (une relance entière
+# redéploierait, une annulation pourrait couper un déploiement entre la mise à jour et le lancement).
+JOBS_DEPLOIEMENT = tuple(CONF.get("jobs_deploiement") or ("deploy",))
 PAUSE = CONF.get("etiquette_pause", "ci-en-pause")
 URL_PROD = CONF["urls"]["production"]
 URL_PREVIEW = CONF["urls"]["preview"]
@@ -107,6 +122,15 @@ RE_NON_CODE = re.compile("|".join(CONF.get("motifs_rouge_sans_rapport") or (
     r"CE Task finished abnormally", r"ECONNRESET", r"ETIMEDOUT", r"EAI_AGAIN", r"ENOTFOUND", r"ERR_PNPM_META_FETCH_FAIL",
     r"ERR_PNPM_FETCH_", r"ERR_SOCKET_TIMEOUT", r"UND_ERR_CONNECT_TIMEOUT", r"socket hang up",
     r"self-installer exits with code", r"HttpClient\.Timeout")))
+# Machine du run disparue : relancer les seuls jobs rouges (`--failed`) ne rejoue pas l'aiguillage, ils repartiraient
+# vers la même machine. Le relais relance alors le run EN ENTIER, une fois par run : runner perdu en plein run, jobs en
+# file sur une machine hors ligne depuis FILE_HORS_LIGNE_MIN (run annulé puis relancé), ou machine locale qui refuse le
+# run faute de ressources (marque écrite par le workflow, `motif_machine_refusee`).
+RE_RUNNER_PERDU = re.compile(r"lost communication with the server")  # message de GitHub Actions
+RE_RESSOURCES = re.compile(CONF["motif_machine_refusee"]) if CONF.get("motif_machine_refusee") else None
+# Le job de déploiement du front refuse de partir tant que le back de la même branche n'est pas déployé : c'est l'ordre
+# normal d'une livraison, pas un rouge. Reconnu aux messages que le workflow du front écrit dans son journal.
+RE_FRONT_ATTEND_BACK = re.compile(CONF.get("motif_front_attend_back") or r"ATTENTE-BACK")
 DOC_PROCEDURE = CONF.get("doc_procedure", "AGENTS.md, section « Cycle de lot »")
 GRILLE = Path(CONF.get("grille_revue") or "GRILLE-REVUE.md").expanduser()
 GRILLE = str(GRILLE if GRILLE.is_absolute() else ICI / GRILLE)  # chemin relatif : à côté de ce script
@@ -135,6 +159,7 @@ ETAPES = {
     "ci-livraison": ("veille", 3, "CI des PR de livraison"),
     "revue-livraison": (REV, 4, "revue et merge des PR de livraison"),
     "deploiement": ("veille", 4, "CI de develop et de master, mise en production"),
+    "diagnostic-deploiement": (DEV, 4, f"rouge de la CI de mise en production : diagnostic et relance par {N_DEV}"),
     "liste-validation": (DEV, 3, "liste des validations visuelles en production"),
     "validation-prod": (REV, 8, "validations visuelles en production"),
     "arret": ("humain", None, f"arrêt : décision de {HUMAIN} attendue"),
@@ -149,10 +174,11 @@ MAX_ALLER_RETOURS = int(CONF.get("max_aller_retours", 5))  # au verdict À REPRE
 REVUE_REPORT = int(CONF.get("revue_report_non_bloquants", 3))  # revue à partir de laquelle les non bloquants sont reportés
 # Voie courte : après le merge du lot, un correctif qui ne touche que la CI, les tests ou la documentation est relu sur
 # son diff, sans déploiement de preview et hors compteur d'aller-retours. Sans elle, un simple correctif de délai de CI
-# consomme un aller-retour, et peut arrêter le lot au dernier.
+# consomme un aller-retour, et peut arrêter le lot au dernier. Les scripts que seule la CI exécute (`scripts/ci/`)
+# en font partie.
 MAX_VOIE_COURTE = int(CONF.get("max_voie_courte", 3))  # À REPRENDRE de suite en voie courte : arrêt
 RE_VOIE_COURTE = re.compile(CONF.get("motif_voie_courte") or (
-    r"^(\.github/|tests?/|e2e/|docs/|__tests__/)|(^|/)[^/]+\.(test|spec|e2e)\.[a-z]+$|\.md$|"
+    r"^(\.github/|tests?/|e2e/|docs/|__tests__/|scripts/ci/)|(^|/)[^/]+\.(test|spec|e2e)\.[a-z]+$|\.md$|"
     r"(^|/)(vitest[^/]*|playwright)\.config\.[a-z]+$|(^|/)conftest\.py$"))
 # Relais : un développeur qui ne passe pas la main alors que la CI de ses PR est verte, des relances parties pendant
 # qu'il travaillait encore, une alerte postée une seule fois dans un fil que personne ne lit : le lot attend des heures.
@@ -163,7 +189,19 @@ NB_RAPPELS_ALERTE = int(RELAIS_CONF.get("nb_rappels_alerte", 5))
 SEUIL_MARGE = float(RELAIS_CONF.get("seuil_marge", 0.8))  # durée d'un job de CI au-delà de 80 % de son plafond : avis
 # Lien du fil dans les messages directs à l'humain (« https://<espace>.slack.com/archives ») ; absent : pas de lien.
 SLACK_ARCHIVES = (os.environ.get("CYCLE_LOT_SLACK_ARCHIVES") or CONF.get("slack_archives") or "").rstrip("/")
-MAX_CI_ROUGES = 3         # CI de release ou de livraison rouge sur du code, 3 fois de suite : arrêt
+# Rouge de CI : chaque rouge de la CI de la release ou de la mise en production rend la main au développeur, avec le run,
+# les jobs rouges et le compteur de rouges de suite. À partir du rouge n° DIAGNOSTIC_CI_ROUGES, la consigne exige un
+# diagnostic écrit dans le fil avant toute relance : des rouges de causes différentes à la suite ne se relancent pas à
+# l'aveugle. Le relais n'arrête plus le cycle pour un rouge ; seul le développeur l'arrête (`cycle-lot arret`) s'il lui
+# faut une décision ou une action de l'humain.
+DIAGNOSTIC_CI_ROUGES = int(RELAIS_CONF.get("diagnostic_ci_rouges", 3))
+# Le deploy du front attend le back de la même branche : relancé une fois, ATTENTE_BACK_MIN après le vert du back (le
+# temps que le back déployé soit servi).
+ATTENTE_BACK_MIN = int(RELAIS_CONF.get("attente_back_min", 10))
+FILE_HORS_LIGNE_MIN = int(RELAIS_CONF.get("file_hors_ligne_min", 10))  # en file sur une machine hors ligne : annulé, relancé
+# Un job requis peut rester en file alors qu'un runner portant ses étiquettes est en ligne et libre (GitHub ne le lui
+# attribue pas) : personne ne le voit avant longtemps. Signalé une fois au développeur, sans action automatique.
+FILE_RUNNER_LIBRE_MIN = int(RELAIS_CONF.get("file_runner_libre_min", 15))
 INTERVALLE_GH_MIN = float(os.environ.get("CYCLE_LOT_INTERVALLE_GH_MIN", "4"))  # attentes GitHub : 1 lecture / 4 min
 # Contexte neuf à chaque étape : avant un réveil qui ouvre une étape, le relais remet à zéro la session de l'agent dans
 # le fil du lot (sessions.reset). Au fil d'un lot, le contexte de cette session dépasse vite 100 k jetons, et sa
@@ -699,6 +737,39 @@ def jobs_du_run(depot, run_id):
                                                              "--json", "jobs")["jobs"]}
 
 
+def nouvelle_ci(jobs):
+    """Run d'une CI avec aiguillage (`ci_aiguillage.job` présent dans ses jobs, même sauté)."""
+    return bool(JOB_AIGUILLAGE) and JOB_AIGUILLAGE in jobs
+
+
+def tranche(nom):
+    return bool(RE_TRANCHE and RE_TRANCHE.match(nom))
+
+
+def requis_du_run(depot, requis, jobs):
+    """Jobs requis d'un run : ceux de l'étape, plus, pour un run d'une CI avec aiguillage, les `jobs_requis` de son
+    application et les tranches de tests présentes. Sans jobs requis demandés (PR vers develop), rien de plus."""
+    if not requis or not nouvelle_ci(jobs):
+        return tuple(requis)
+    extra = list(REQUIS_NOUVELLE_CI.get(depot, ()))
+    extra += sorted((n for n in jobs if tranche(n)), key=lambda n: [int(x) if x.isdigit() else x
+                                                                   for x in re.split(r"(\d+)", n)])
+    return tuple(requis) + tuple(x for x in extra if x not in requis)
+
+
+def sautable(nom, jobs, depot=None):
+    """Job que le job marqueur (contenu déjà validé) vert peut faire sauter légitimement."""
+    return nom in JOBS_SAUTABLES or (nouvelle_ci(jobs) and (tranche(nom) or any(
+        nom in j for d, j in REQUIS_NOUVELLE_CI.items() if depot in (None, d))))
+
+
+def manquants_du_run(depot, jobs, requis):
+    """Jobs requis qui ne sont pas verts, hors saut décidé par le workflow (job marqueur vert)."""
+    deja_valide = jobs.get(MARQUEUR_DEJA_VALIDE) == "success"
+    return [n for n in requis_du_run(depot, requis, jobs) if jobs.get(n) != "success"
+            and not (deja_valide and sautable(n, jobs, depot) and jobs.get(n) == "skipped")]
+
+
 def bilan_run(depot, run, requis=()):
     """('absent' | 'en cours' | 'vert' | 'rouge', résumé) d'un run, jobs requis compris (un job sauté n'a rien testé)."""
     if not run:
@@ -707,9 +778,7 @@ def bilan_run(depot, run, requis=()):
     if run["status"] != "completed":
         return "en cours", f"run {rid} {run['status']}"
     jobs = jobs_du_run(depot, rid)
-    deja_valide = jobs.get(MARQUEUR_DEJA_VALIDE) == "success"  # jobs de test sautés par décision du workflow
-    manquants = [n for n in requis if jobs.get(n) != "success"
-                 and not (deja_valide and n in JOBS_SAUTABLES and jobs.get(n) == "skipped")]
+    manquants = manquants_du_run(depot, jobs, requis)
     if run["conclusion"] == "success" and not manquants:
         return "vert", f"run {rid} vert"
     rouges = [n for n, c in jobs.items() if c in ("failure", "cancelled", "timed_out")]
@@ -722,11 +791,21 @@ def bilan_run(depot, run, requis=()):
     return "rouge", detail
 
 
+_LOGS = {}
+
+
+def log_echec(depot, run):
+    """Journal des jobs rouges d'un run (`--log-failed`), lu une fois par passage du relais."""
+    cle = (depot, run["databaseId"])
+    if cle not in _LOGS:
+        _LOGS[cle] = gh_cmd("run", "view", str(run["databaseId"]), "-R", DEPOTS[depot], "--log-failed", timeout=240)[1]
+    return _LOGS[cle]
+
+
 def rouge_sans_rapport(depot, run):
     if run.get("conclusion") == "cancelled":
         return True
-    rc, log = gh_cmd("run", "view", str(run["databaseId"]), "-R", DEPOTS[depot], "--log-failed", timeout=240)
-    return bool(RE_NON_CODE.search(log))
+    return bool(RE_NON_CODE.search(log_echec(depot, run)))
 
 
 def relancer_si_sans_rapport(etat, depot, run, deja):
@@ -738,6 +817,176 @@ def relancer_si_sans_rapport(etat, depot, run, deja):
     deja.append(cle)
     journal(etat["version"], f"run {cle} ({depot}) rouge sans rapport avec le code : relancé une fois ({'ok' if rc == 0 else out[-200:]})")
     return rc == 0
+
+
+def jobs_api(depot, rid):
+    """Jobs d'un run par l'API (statut, étiquettes demandées, heure de mise en file, runner) : `gh run view --json jobs`
+    ne donne ni les étiquettes ni l'heure de création d'un job en file."""
+    d = gh_json("api", f"repos/{DEPOTS[depot]}/actions/runs/{rid}/jobs?per_page=100", essais=2)
+    return (d or {}).get("jobs") or [] if isinstance(d, dict) else []
+
+
+_RUNNERS = {}
+
+
+def runners_du_depot(depot):
+    """Runners auto-hébergés du dépôt (nom, en ligne, occupé, étiquettes), lus une fois par passage."""
+    if depot not in _RUNNERS:
+        d = gh_json("api", f"repos/{DEPOTS[depot]}/actions/runners?per_page=100", essais=2)
+        _RUNNERS[depot] = (d or {}).get("runners") or [] if isinstance(d, dict) else []
+    return _RUNNERS[depot]
+
+
+def etiquettes(runner):
+    return {lb.get("name") for lb in runner.get("labels") or [] if isinstance(lb, dict)}
+
+
+def decrire_runners(runners):
+    return "; ".join(f"{r.get('name')} ({'en ligne' if r.get('status') == 'online' else 'hors ligne'}"
+                     f"{', occupé' if r.get('busy') else ', libre' if r.get('status') == 'online' else ''} : "
+                     f"{', '.join(sorted(etiquettes(r))) or 'sans étiquette'})" for r in runners) or "aucun runner lu"
+
+
+def minutes_depuis_gh(s):
+    return minutes_depuis((s or "").replace("Z", "+00:00")) if s else 0
+
+
+def deploy_parti(jobs):
+    """Un job de déploiement (`jobs_deploiement`) a déjà tourné (ou tourne) dans ce run : une relance entière
+    redéploierait, une annulation pourrait couper le déploiement entre sa mise à jour et son lancement."""
+    return any(j.get("name") in JOBS_DEPLOIEMENT and (j.get("status") == "in_progress"
+                                                      or j.get("conclusion") == "success") for j in jobs)
+
+
+def machine_perdue(etat, depot, run):
+    """Motif d'une relance entière pour un run rouge dont la machine a disparu, sinon None."""
+    rid = str(run["databaseId"])
+    if rid in (etat.get("annulations_machine") or {}):
+        return (etat["annulations_machine"][rid].get("motif")
+                or "jobs en file sur une machine hors ligne : run annulé pour être relancé en entier")
+    log = log_echec(depot, run)
+    m = RE_RESSOURCES.search(log) if RE_RESSOURCES else None
+    if m:
+        return f"la machine du run l'a refusé faute de ressources (« {m.group(0)} »)"
+    if RE_RUNNER_PERDU.search(log):
+        return "runner perdu en plein run (« lost communication with the server »)"
+    try:
+        for j in jobs_api(depot, rid):
+            if j.get("conclusion") in ("failure", "cancelled") and j.get("id"):
+                notes = gh_json("api", f"repos/{DEPOTS[depot]}/check-runs/{j['id']}/annotations", essais=1)
+                if any(RE_RUNNER_PERDU.search(str(n.get("message") or "")) for n in notes or [] if isinstance(n, dict)):
+                    return f"runner perdu en plein run (job {j.get('name')} : « lost communication with the server »)"
+    except RuntimeError:
+        pass
+    return None
+
+
+def relancer_entier(etat, depot, run):
+    """Relance le run EN ENTIER (`gh run rerun <id>`, sans `--failed`) quand sa machine a disparu : l'aiguillage est
+    rejoué et choisit une machine en ligne. Une fois par run, jamais quand un deploy est déjà parti. True si relancé."""
+    rid = str(run["databaseId"])
+    faites = etat.setdefault("relances_entieres", [])
+    if rid in faites:
+        return False
+    motif = machine_perdue(etat, depot, run)
+    if not motif:
+        return False
+    try:
+        if deploy_parti(jobs_api(depot, rid)):
+            journal(etat["version"], f"run {rid} ({depot}) : {motif}, mais un deploy est déjà parti : pas de relance entière")
+            return False
+    except RuntimeError:
+        return False
+    rc, out = gh_cmd("run", "rerun", rid, "-R", DEPOTS[depot])
+    faites.append(rid)
+    del faites[:-50]
+    (etat.get("annulations_machine") or {}).pop(rid, None)
+    _LOGS.pop((depot, run["databaseId"]), None)
+    journal(etat["version"], f"run {rid} ({depot}) : {motif} ; relancé EN ENTIER une fois, aiguillage compris "
+                             f"({'ok' if rc == 0 else out[-200:]})")
+    return rc == 0
+
+
+def surveiller_file(etat, depot, run, requis, relais=True):
+    """Jobs en file d'un run en cours. Rend ('annule', motif) si le run a été annulé parce que ses jobs attendent une
+    machine hors ligne (relais seulement : il le relancera en entier au passage suivant), sinon la liste des jobs requis
+    à signaler : en file depuis FILE_RUNNER_LIBRE_MIN alors qu'un runner de leur étiquette est en ligne et libre."""
+    rid = str(run["databaseId"])
+    jobs = jobs_api(depot, rid)
+    en_file = [j for j in jobs if j.get("status") == "queued"]
+    if not en_file:
+        return []
+    runners = runners_du_depot(depot)
+    noms = {j.get("name"): j.get("conclusion") or j.get("status") for j in jobs}
+    requis = set(requis_du_run(depot, requis, noms))
+    a_signaler = []
+    for j in en_file:
+        age, labels = minutes_depuis_gh(j.get("created_at")), j.get("labels") or []
+        portent = [r for r in runners if set(labels) <= etiquettes(r)]
+        if relais and age >= FILE_HORS_LIGNE_MIN and portent and all(r.get("status") != "online" for r in portent):
+            motif = (f"job {j.get('name')} en file depuis {int(age)} min sur {', '.join(labels)}, machine hors ligne "
+                     f"({decrire_runners(portent)})")
+            if rid in etat.get("relances_entieres", []) or rid in (etat.get("annulations_machine") or {}):
+                a_signaler.append({"cle": f"{depot}:{rid}:hors-ligne", "depot": depot, "run": rid, "job": j.get("name"),
+                                   "labels": labels, "runners": decrire_runners(runners), "age": age,
+                                   "quoi": "machine encore hors ligne après la relance entière : plus de relance automatique"})
+                continue
+            if deploy_parti(jobs):
+                a_signaler.append({"cle": f"{depot}:{rid}:hors-ligne", "depot": depot, "run": rid, "job": j.get("name"),
+                                   "labels": labels, "runners": decrire_runners(runners), "age": age,
+                                   "quoi": "machine hors ligne, mais un deploy est déjà parti : pas d'annulation automatique"})
+                continue
+            rc, out = gh_cmd("run", "cancel", rid, "-R", DEPOTS[depot])
+            etat.setdefault("annulations_machine", {})[rid] = {"depot": depot, "heure": iso(), "motif": motif}
+            journal(etat["version"], f"run {rid} ({depot}) : {motif} ; annulé pour être relancé en entier "
+                                     f"({'ok' if rc == 0 else out[-200:]})")
+            return ("annule", motif)
+        if (age >= FILE_RUNNER_LIBRE_MIN and j.get("name") in requis
+                and any(r.get("status") == "online" and not r.get("busy") for r in portent)):
+            a_signaler.append({"cle": f"{depot}:{rid}:{j.get('name')}", "depot": depot, "run": rid, "job": j.get("name"),
+                               "labels": labels, "runners": decrire_runners(runners), "age": age,
+                               "quoi": "en file alors qu'un runner portant son étiquette est en ligne et libre"})
+    return a_signaler
+
+
+def signaler_files(etat, signalements, agent=DEV):
+    """Un signalement par job (et par machine hors ligne), à l'agent qui suit l'attente : pas d'action automatique, pas de
+    message à l'humain. Reporté au passage suivant si un autre réveil est déjà en attente."""
+    deja = etat.setdefault("files_signalees", [])
+    neufs = [x for x in signalements if x["cle"] not in deja]
+    if not neufs or etat.get("a_reveiller"):
+        return False
+    lignes = "\n".join(f"• {x['depot']} run {x['run']} {url_run(x['depot'], x['run'])} : job « {x['job']} » {x['quoi']}, "
+                       f"en file depuis {int(x['age'])} min ; étiquette attendue : {', '.join(x['labels']) or 'aucune'} ; "
+                       f"runners vus : {x['runners']}" for x in neufs)
+    texte = (f"[RELAIS DU CYCLE DE LOT {etat['version']} — message automatique de cycle-lot, pas de {HUMAIN}] Job de CI "
+             f"en file anormalement (un job peut rester en file des heures alors qu'un runner est en ligne et libre) :\n"
+             f"{lignes}\n"
+             f"Le relais ne fait rien de plus de lui-même. Regarde le runner (redémarrage entre deux jobs, étiquettes, "
+             f"machine) et dis en une ligne dans ce fil ce que tu fais. Réponse obligatoire, NO_REPLY interdit.")
+    planifier_reveil(etat, agent, "file d'attente", texte=texte)
+    deja.extend(x["cle"] for x in neufs)
+    del deja[:-100]
+    journal(etat["version"], "jobs en file signalés à " + agent + " : " + ", ".join(f"{x['depot']} run {x['run']} {x['job']}"
+                                                                               for x in neufs))
+    return True
+
+
+def veiller_files_pr(etat):
+    """Pendant le dev et la correction, le développeur attend la CI des PR du lot : un job requis en file avec un runner
+    libre lui est signalé. Une lecture par INTERVALLE_GH_MIN, jamais bloquante."""
+    if etat.get("file_verifiee") and minutes_depuis(etat["file_verifiee"]) < INTERVALLE_GH_MIN:
+        return
+    etat["file_verifiee"] = iso()
+    try:
+        signalements = []
+        for pr in prs_ouvertes(etat["release"]):
+            run = dernier_run(pr["depot"], pr["sha"], "pull_request")
+            if run and run["status"] != "completed":
+                signalements += surveiller_file(etat, pr["depot"], run, REQUIS_LOT[pr["depot"]], relais=False)
+        signaler_files(etat, signalements)
+    except RuntimeError:
+        pass
 
 
 def ci_pr(pr, requis):
@@ -905,6 +1154,15 @@ def consigne(etat, extra="", agent=None):
             regle += (f"\nPreuves en réel de {N_DEV} (services externes joués sur la préproduction) : "
                       f"{etat['preuves_reel']}. Un critère d'acceptation qui dépend d'un service externe et n'a aucune "
                       f"preuve en réel est un point bloquant.")
+        preuve = preuves_de_la_revue(etat) if rap else None
+        if preuve and preuve.get("fichier"):
+            regle += (f"\nPreuves en réel rejouées par {N_DEV} sur la tête de la reprise : {preuve['fichier']} (1res "
+                      f"preuves : {etat['preuves_reel']}). Un critère d'acceptation qui dépend d'un service externe et n'a "
+                      f"pas de preuve sur cette tête est un point bloquant.")
+        elif preuve:
+            regle += (f"\nPreuves en réel non rejouées : {N_DEV} déclare que la reprise ne touche aucun critère joué en "
+                      f"réel, motif : « {preuve['inchange']} » (preuves de référence : {etat['preuves_reel']}). Vérifie ce "
+                      f"motif contre le diff de la reprise ; s'il est faux, c'est un point bloquant.")
         if rap:  # revue de correction ciblée sur le diff exact depuis la tête revue
             quoi = (f"\nRevue de CORRECTION, ciblée : vérifie chaque point de ton rapport précédent ({rap}), puis relis "
                     f"seulement ce que la reprise a changé :\n" + "\n".join(diff_depuis_revue(x, dernier_rap) for x in etat["prs_lot"])
@@ -934,6 +1192,10 @@ def consigne(etat, extra="", agent=None):
                                  if not x.get("merge")) +
                  ". Le relais pose ensuite le commit de release, attend la CI du push sur la release et ouvre les PR "
                  "de livraison.")
+    elif e == "correction" and ci_rouge_courant(etat):
+        corps = consigne_rouge_ci(etat)  # le message du relais redirait les mêmes runs
+    elif e == "diagnostic-deploiement":
+        corps = consigne_rouge_ci(etat)
     elif e == "correction":
         rap = etat["rapports"][-1]["fichier"] if etat["rapports"] else "(pas de rapport)"
         dernier_rap = etat["rapports"][-1] if etat["rapports"] else {}
@@ -956,14 +1218,22 @@ def consigne(etat, extra="", agent=None):
                  f"\nAvant de rendre la main, fais relire le diff de la reprise par une passe distincte (contre-relecture "
                  f"avec {GRILLE}, consigne : « cherche ce que cette correction casse, oublie ou laisse passer »), "
                  f"corrige ce qu'elle trouve et garde son rapport. Quand la CI de fin de reprise est verte : `cycle-lot "
-                 f"passe {v} --vers {REV} --contre-relecture <rapport> --message \"<ce qui a été corrigé, point par "
-                 f"point>\"`. Un correctif d'après merge qui ne touche que la CI, les tests ou la documentation passe par "
+                 f"passe {v} --vers {REV} --contre-relecture <rapport>"
+                 + (" --reel <preuves en réel rejouées sur la tête de la reprise> (ou `--reel inchange --motif \"<pourquoi "
+                    "la reprise ne touche aucun critère joué en réel>\"`)" if preuves_reel_exigees(etat) else "")
+                 + f" --message \"<ce qui a été corrigé, point par point>\"`. Un correctif d'après merge qui ne touche "
+                 f"que la CI, les tests ou la documentation passe par "
                  f"la voie courte (ni preview, ni contre-relecture, hors compteur) : `passe` le reconnaît seul.")
     elif e == "livraison":
         attente = [i for i in etat["interventions"] if not i["faite"]]
+        avant = reglages_avant_livraison(etat)
         corps = (f"\nLes PR du lot sont mergées dans release/{v} et la CI du push sur la release est verte.{mot}"
                  + (f"\nInterventions de {HUMAIN} encore ouvertes (à vérifier avant la livraison, sinon `cycle-lot arret`) : "
-                    + "; ".join(f"{i['n']}. {i['texte']}" for i in attente) if attente else "") +
+                    + "; ".join(f"{i['n']}. {i['texte']}" for i in attente) if attente else "")
+                 + ("\nRéglages de déploiement à poser AVANT d'ouvrir les PR de livraison (`ouvrir-livraison` refuse tant "
+                    f"qu'il en reste un ; pose, vérifie, puis `cycle-lot reglage {v} --fait N --preuve \"…\"` ; ceux qui ne "
+                    f"se posent qu'après le déploiement : `--classer N --apres-deploiement`) :\n"
+                    + "\n".join("  " + ligne_reglage(g) for g in avant) if avant else "") +
                  f"\nOuvre les PR de livraison : `cycle-lot ouvrir-livraison {v}`. Le relais attend leur CI et "
                  f"réveille {N_REV}.")
     elif e == "revue-livraison":
@@ -980,7 +1250,7 @@ def consigne(etat, extra="", agent=None):
                  f"validation-prod --fichier {dossier(v)}/validations-prod.md`."
                  + ("\nRéglages de déploiement à poser AVANT de passer la main (`passe` refuse tant qu'il en reste un) ; "
                     f"pose chacun, vérifie-le en production, puis `cycle-lot reglage {v} --fait N --preuve \"…\"` :\n"
-                    + "\n".join(f"  {g['n']}. {g['texte']}" for g in reglages if not g["fait"])
+                    + "\n".join("  " + ligne_reglage(g) for g in reglages if not g["fait"])
                     if any(not g["fait"] for g in reglages) else
                     "\nAucun réglage de déploiement ouvert. Relis quand même la rubrique « À poser sur les déploiements » "
                     "des PR du lot : un réglage oublié se déclare et se pose maintenant (`cycle-lot reglage`)."))
@@ -1003,6 +1273,62 @@ def consigne(etat, extra="", agent=None):
     return tete_msg + corps + (("\n" + extra) if extra else "") + pied(etat, agent)
 
 
+def ci_rouge_courant(etat):
+    """Le rouge de CI qui a donné la main au développeur pour l'étape en cours, ou None."""
+    r = etat.get("ci_rouge")
+    return r if r and r.get("seq") == etat["seq"] else None
+
+
+def consigne_rouge_ci(etat, mot=""):
+    v, r = etat["version"], ci_rouge_courant(etat) or etat.get("ci_rouge") or {}
+    n, quoi = r.get("n", 1), r.get("quoi", "CI")
+    runs = "\n".join(f"• {x['depot']} {x.get('branche') or ''} : run {x.get('run') or '?'} {x.get('url') or ''} ; "
+                     f"{x.get('resume')}" for x in r.get("runs") or []) or "\n".join(r.get("lignes") or [])
+    texte = (f"\n{quoi} ROUGE, rouge n° {n} de suite. Runs rouges (jobs rouges dans chaque ligne) :\n{runs}{mot}")
+    if n >= DIAGNOSTIC_CI_ROUGES:
+        texte += (f"\n{n}e rouge de suite : AVANT toute relance ou correction, poste dans ce "
+                  f"fil un diagnostic écrit : cause établie pour chaque job rouge (extrait du journal, test rejoué), en quoi "
+                  f"elle diffère ou non des rouges précédents, et pourquoi ce que tu vas faire passera. Pas de relance à "
+                  f"l'aveugle.")
+    else:
+        texte += "\nDiagnostique d'abord : lis le journal des jobs rouges (`gh run view <id> --log-failed`)."
+    if r.get("origine") == "ci-release":
+        texte += (f"\nDéfaut de code, de test ou de CI : corrige par une PR vers {etat['release']} (voie courte si elle ne "
+                  f"touche que la CI, les tests ou la doc), puis `cycle-lot passe {v} --vers {REV} …`. Rouge sans rapport "
+                  f"avec le code (instabilité prouvée, machine) : relance le run (`gh run rerun <id> --failed`, ou sans "
+                  f"`--failed` si sa machine a disparu), puis `cycle-lot attendre-ci {v} --message \"<diagnostic>\"` : le "
+                  f"relais reprend l'attente de la CI de la release.")
+    else:
+        texte += (f"\nLa production n'est pas forcément livrée en entier : dis-le dans ton diagnostic (quel dépôt, quelle "
+                  f"branche sert quoi). Rouge sans rapport avec le code (instabilité prouvée, machine, ordre de "
+                  f"déploiement) : relance le run (`gh run rerun <id> --failed`, ou sans `--failed` si sa machine a "
+                  f"disparu), puis `cycle-lot attendre-ci {v} --message \"<diagnostic>\"` : le relais reprend l'attente de "
+                  f"la mise en production. Défaut de code en production : ne pousse rien sur develop ni master hors cycle.")
+    texte += (f"\nS'il te faut une décision ou une action de {HUMAIN} (accès, dépense, correctif en production, choix de "
+              f"produit) : `cycle-lot arret {v} --motif {'ci' if r.get('origine') == 'ci-release' else 'deploiement'} "
+              f"--message \"…\"`, et pose-lui ta question dans ce fil. Le relais n'arrête plus le cycle pour un rouge.")
+    return texte
+
+
+def rouge_ci(etat, origine, lignes, etape_dev, motif):
+    """Rouge de la CI de la release ou de la mise en production : la main au développeur, jamais à l'humain avant un
+    diagnostic.
+    Le compteur de rouges de suite ne repart à zéro qu'au vert de ces CI."""
+    att = etat.get("attente") or {}
+    etat["ci_rouges"] = etat.get("ci_rouges", 0) + 1
+    n = etat["ci_rouges"]
+    quoi = f"CI du push sur {etat['release']}" if origine == "ci-release" else "CI de develop et de master (mise en production)"
+    rouges = [{k: x.get(k) for k in ("depot", "branche", "sha", "run", "url", "resume")}
+              for x in att.get("suivi") or [] if x.get("verdict") == "rouge"]
+    retour = {"depots": att.get("depots")} if origine == "ci-release" else {"commits": att.get("commits")}
+    etat["ci_rouge"] = {"n": n, "origine": origine, "quoi": quoi, "heure": iso(), "lignes": lignes, "runs": rouges,
+                        "retour": retour}
+    exige = f" ; diagnostic écrit exigé avant toute relance ({n}e rouge de suite)" if n >= DIAGNOSTIC_CI_ROUGES else ""
+    changer_etape(etat, etape_dev, "veille", f"{quoi} rouge (n° {n} de suite){exige} :\n" + "\n".join(lignes))
+    etat["ci_rouge"]["seq"] = etat["seq"]
+    planifier_reveil(etat, DEV, motif)
+
+
 def arreter(etat, par, motif, message, etape_reprise=None):
     etat["arret"] = {"motif": motif, "message": message, "par": par, "heure": iso(),
                      "etape": etape_reprise or etat["etape"],
@@ -1016,6 +1342,25 @@ def arreter(etat, par, motif, message, etape_reprise=None):
 
 
 # ---------------------------------------------------------------- commandes
+
+def reglage_apres_deploiement(g):
+    return g.get("quand") == "apres-deploiement"
+
+
+def qui_reglage(g):
+    return HUMAIN if g.get("qui") == "humain" else N_DEV
+
+
+def ligne_reglage(g):
+    return (f"{g['n']}. {g['texte']} (à faire par {qui_reglage(g)}, déclaré par {NOMS.get(g.get('par'), g.get('par') or '?')}"
+            + (", après le déploiement" if reglage_apres_deploiement(g) else "") + ")")
+
+
+def reglages_avant_livraison(etat):
+    """Réglages encore à faire qui se posent avant l'ouverture des PR de livraison (tous, sauf ceux déclarés pour après
+    le déploiement : workflow à lancer sur master, données à publier sur la version servie)."""
+    return [g for g in etat.get("reglages") or [] if not g["fait"] and not reglage_apres_deploiement(g)]
+
 
 def cmd_debut(a):
     agent = appelant(a)
@@ -1111,6 +1456,24 @@ def cmd_passe(a):
                                 f"avec {GRILLE} (ce que la correction casse, oublie ou laisse passer), fichier non vide. "
                                 f"Chaque point que {N_REV} relève coûte un aller-retour complet.")
                 etat.setdefault("contre_relectures", []).append({"heure": iso(), "fichier": str(Path(cr).resolve())})
+                # preuves en réel à chaque retour en revue : exigées à la seule 1re revue, une reprise peut casser un
+                # critère joué en réel sans que personne ne le rejoue
+                if preuves_reel_exigees(etat):
+                    reel, motif = (a.reel or "").strip(), (a.motif or "").strip()
+                    if reel.lower() == "inchange":
+                        if len(motif) < 20:
+                            raise Refus("--reel inchange --motif \"…\" : dis pourquoi la reprise ne touche aucun critère "
+                                        f"joué en réel (fichiers et cartes concernés), {N_REV} le vérifiera contre le diff")
+                        preuve = {"inchange": motif}
+                    elif reel and Path(reel).is_file() and Path(reel).stat().st_size:
+                        preuve = {"fichier": str(Path(reel).resolve())}
+                    else:
+                        raise Refus(f"--reel : les preuves en réel rejouées sur la tête de la reprise (1res preuves : "
+                                    f"{etat['preuves_reel']}), fichier non vide ; ou `--reel inchange --motif \"<pourquoi la "
+                                    f"reprise ne touche aucun critère joué en réel>\"`. Chaque retour en revue apporte ses "
+                                    f"preuves en réel.")
+                    preuve.update(heure=iso(), revue=etat["aller_retours"] + 1)
+                    etat.setdefault("preuves_reel_reprises", []).append(preuve)
             etat["prs_lot"] = prs
             ou = ou_sont(etat)
             a_revoir = {n for n, liste in ou.items() if liste in ("waiting", "wip")}
@@ -1159,6 +1522,17 @@ def cmd_passe(a):
             raise Refus(f"passe : `--vers {REV}` (revue, après le dev ou une correction) ou `--vers {REV} --etape "
                         "validation-prod --fichier <liste>`. Les autres passages de main sont faits par verdict, "
                         "merge, ouvrir-livraison et la veille.")
+
+
+def preuves_reel_exigees(etat):
+    """La 1re passe a donné un fichier de preuves en réel : chaque retour en revue (hors voie courte) en apporte."""
+    return bool(etat.get("preuves_reel")) and etat["preuves_reel"] != "aucun"
+
+
+def preuves_de_la_revue(etat):
+    """Preuves en réel apportées pour la revue en cours (retour en revue), ou None."""
+    n = etat["aller_retours"] + 1
+    return next((x for x in reversed(etat.get("preuves_reel_reprises") or []) if x.get("revue") == n), None)
 
 
 def extra_revue(etat, note):
@@ -1483,15 +1857,32 @@ def cmd_merge(a):
     print(f"{depot}#{num} {'mergée' if fait else 'déjà mergée'} en {pr['merge']['commit'][:7]}. {suite}")
 
 
-def ouvrir_prs_livraison(etat):
+def ouvrir_prs_livraison(etat, sans_reglages=None, par="veille"):
     """Les PR release/<v> -> develop et master de chaque dépôt en avance, créées ou rouvertes (le back n'écoute pas
-    `synchronize` : rouvrir relance la CI sur la tête). Rend (prs, créées) ; lève Refus."""
+    `synchronize` : rouvrir relance la CI sur la tête). Rend (prs, créées) ; lève Refus.
+    Réglages : des réglages encore « à faire » à l'ouverture des PR de livraison sont découverts un par un par la CI de
+    livraison, chacun au prix d'un rouge. Refus tant qu'un réglage à poser avant la livraison reste à faire, sauf
+    motif explicite (`--sans-reglages`, noté au journal) ; le relais ne passe jamais outre."""
     ouvertes = [i for i in etat["interventions"] if not i["faite"]]
     if ouvertes:
         raise Refus(f"interventions de {HUMAIN} encore ouvertes : " + "; ".join(f"{i['n']}. {i['texte']}" for i in ouvertes)
                     + f". Fais-les confirmer (`cycle-lot intervention {etat['version']} --faite N`) ou `cycle-lot arret "
                       f"{etat['version']} --motif intervention`.")
     v, rel = etat["version"], etat["release"]
+    restent = reglages_avant_livraison(etat)
+    if restent and not (sans_reglages or "").strip():
+        raise Refus(f"{len(restent)} réglage(s) de déploiement encore à faire avant la livraison :\n"
+                    + "\n".join("  " + ligne_reglage(g) for g in restent)
+                    + f"\nPose chacun (hébergeurs, base de données, variables…) et prouve-le : `cycle-lot reglage {v} --fait N --preuve "
+                      f"\"…\"`. Un réglage qui ne peut se poser qu'après le déploiement (workflow à lancer sur master, "
+                      f"données à publier sur la version servie) : `cycle-lot reglage {v} --classer N --apres-deploiement`. "
+                      f"Un réglage qui demande {HUMAIN} : `cycle-lot arret {v} --motif intervention`. Passer outre, avec un "
+                      f"motif : `cycle-lot ouvrir-livraison {v} --sans-reglages \"<motif>\"`.")
+    if restent:
+        etat["livraison_sans_reglages"] = {"heure": iso(), "par": par, "motif": sans_reglages.strip(),
+                                           "reglages": [g["n"] for g in restent]}
+        journal(v, f"PR de livraison ouvertes par {par} SANS les réglages {', '.join(str(g['n']) for g in restent)} : "
+                   f"{sans_reglages.strip()}")
     prs, creees = [], []
     for depot, nom in DEPOTS.items():
         for base in ("develop", "master"):
@@ -1535,7 +1926,7 @@ def cmd_ouvrir_livraison(a):
     with verrou(v):
         etat = lire(v)
         exiger(etat, agent, ("livraison",))
-        prs, creees = ouvrir_prs_livraison(etat)
+        prs, creees = ouvrir_prs_livraison(etat, a.sans_reglages, agent)
         changer_etape(etat, "ci-livraison", agent, a.message or "PR de livraison ouvertes",
                       attente={"debut": iso(), "relances": []})
         ecrire(etat)
@@ -1545,14 +1936,40 @@ def cmd_ouvrir_livraison(a):
 
 
 def cmd_attendre_ci(a):
+    """Rend l'attente de la CI au relais après une relance : le relecteur en revue de livraison ; le développeur après
+    un rouge de la CI de la release (étape correction) ou de la mise en production (diagnostic-deploiement)."""
     agent = appelant(a)
-    with verrou(a.version):
-        etat = lire(a.version)
-        exiger(etat, agent, ("revue-livraison",))
-        changer_etape(etat, "ci-livraison", agent, a.message or "CI relancée, attente du verdict",
-                      attente={"debut": iso(), "relances": []})
+    v = a.version
+    with verrou(v):
+        etat = lire(v)
+        rouge = ci_rouge_courant(etat)
+        if etat["etape"] == "correction" and not rouge:
+            raise Refus("attendre-ci ne vaut en correction qu'après un rouge de la CI de la release ; une correction de "
+                        f"revue se rend par `cycle-lot passe {v} --vers {REV}`")
+        exiger(etat, agent, ("revue-livraison", "correction", "diagnostic-deploiement"))
+        if etat["etape"] == "revue-livraison":
+            changer_etape(etat, "ci-livraison", agent, a.message or "CI relancée, attente du verdict",
+                          attente={"debut": iso(), "relances": []})
+            ecrire(etat)
+            print("Le relais attend la CI des PR de livraison et te réveille au verdict.")
+            return
+        n = (rouge or etat.get("ci_rouge") or {}).get("n", 0)
+        diag = (a.message or "").strip()
+        if n >= DIAGNOSTIC_CI_ROUGES and len(diag) < 40:
+            raise Refus(f"{n}e rouge de suite : --message \"<diagnostic>\" exigé (cause établie de chaque job rouge, preuve, "
+                        f"pourquoi la relance passera), le même que celui posté dans le fil")
+        retour = (etat.get("ci_rouge") or {}).get("retour") or {}
+        if etat["etape"] == "correction":
+            depots = sorted(set(retour.get("depots") or []) | set(etat.pop("release_a_verifier", None) or [])) \
+                or sorted({x["depot"] for x in etat["prs_lot"]})
+            changer_etape(etat, "ci-release", agent, diag or "CI de la release relancée", attente={"depots": depots,
+                                                                                                    "relances": []})
+            print(f"Le relais reprend l'attente de la CI du push sur {etat['release']} ({', '.join(depots)}).")
+        else:
+            changer_etape(etat, "deploiement", agent, diag or "CI de mise en production relancée",
+                          attente={"commits": retour.get("commits") or [], "relances": []})
+            print("Le relais reprend l'attente de la CI de develop et de master (mise en production).")
         ecrire(etat)
-    print("Le relais attend la CI des PR de livraison et te réveille au verdict.")
 
 
 def cmd_arret(a):
@@ -1638,10 +2055,24 @@ def cmd_reglage(a):
             if etat["etape"] == "livre":
                 raise Refus("le lot est livré : un réglage manquant est une carte de bug (`cycle-lot carte-bug`)")
             n = len(reglages) + 1
-            reglages.append({"n": n, "texte": a.ajouter, "fait": False, "par": agent, "heure": iso()})
-            journal(a.version, f"réglage de déploiement {n} déclaré par {agent} : {a.ajouter}")
-            print(f"Réglage {n} noté. Il sera exigé à la mise en production : `cycle-lot reglage {a.version} --fait {n} "
-                  f"--preuve \"…\"` une fois posé et vérifié.")
+            g = {"n": n, "texte": a.ajouter, "fait": False, "par": agent, "heure": iso(), "qui": a.qui,
+                 "quand": "apres-deploiement" if a.apres_deploiement else "avant-livraison"}
+            reglages.append(g)
+            journal(a.version, f"réglage de déploiement {n} déclaré par {agent} ({g['quand']}, par {qui_reglage(g)}) : "
+                               f"{a.ajouter}")
+            print(f"Réglage {n} noté. " + ("Il se pose après le déploiement et sera exigé avant les validations en "
+                                          "production" if a.apres_deploiement else
+                                          "Il sera exigé avant l'ouverture des PR de livraison") +
+                  f" : `cycle-lot reglage {a.version} --fait {n} --preuve \"…\"` une fois posé et vérifié.")
+        elif a.classer:
+            g = next((x for x in reglages if x["n"] == a.classer), None)
+            if not g:
+                raise Refus(f"réglage {a.classer} inconnu")
+            g["quand"] = "apres-deploiement" if a.apres_deploiement else "avant-livraison"
+            if a.qui:
+                g["qui"] = a.qui
+            journal(a.version, f"réglage de déploiement {a.classer} classé par {agent} : {g['quand']}, par {qui_reglage(g)}")
+            print(f"Réglage {a.classer} : {ligne_reglage(g)}.")
         elif a.fait:
             g = next((x for x in reglages if x["n"] == a.fait), None)
             if not g:
@@ -1654,7 +2085,7 @@ def cmd_reglage(a):
             print(f"Réglage {a.fait} marqué fait.")
         else:
             for g in reglages:
-                print(f"{g['n']}. [{'fait' if g['fait'] else 'à faire'}] {g['texte']}"
+                print(f"[{'fait' if g['fait'] else 'à faire'}] {ligne_reglage(g)}"
                       + (f" ; preuve : {g['preuve']}" if g.get("preuve") else ""))
             if not reglages:
                 print("Aucun réglage de déploiement déclaré.")
@@ -1800,6 +2231,9 @@ def cmd_etat(a):
         print("Cartes reportées au lot suivant : " + " ; ".join(titre_court(c["nom"]) for c in e["cartes_reportees"]))
     if e.get("preuves_reel"):
         print(f"Preuves en réel : {e['preuves_reel']}")
+    if e.get("ci_rouges"):
+        r = e.get("ci_rouge") or {}
+        print(f"Rouges de CI de suite : {e['ci_rouges']}" + (f" (dernier : {r.get('quoi')}, {hm(r['heure'])})" if r.get("heure") else ""))
     print("Cartes : " + ", ".join(str(c["num"]) for c in e["cartes"]))
     dans_lot = {c["id"] for c in e["cartes"]}
     sorties = {s["id"]: s for s in e.get("cartes_sorties") or [] if s["id"] not in dans_lot}.values()
@@ -1994,23 +2428,89 @@ def url_run(depot, run_id):
     return f"https://github.com/{DEPOTS[depot]}/actions/runs/{run_id}" if run_id else None
 
 
+def front_attend_back(depot, run, requis, branche, bilans):
+    """Le run du front n'est rouge que parce que son job de déploiement a refusé de partir avant le back de la même branche, et le
+    run de ce back est en cours (ou pas encore créé) ou vert : rend le verdict du back, sinon None."""
+    if depot != "front" or not branche or not run:
+        return None
+    back = bilans.get(("back", branche))
+    if not back or back[0] not in ("absent", "en cours", "vert"):
+        return None
+    jobs = jobs_du_run(depot, run["databaseId"])
+    rouges = {n for n, c in jobs.items() if c in ("failure", "cancelled", "timed_out")}
+    if not rouges or rouges - set(JOBS_DEPLOIEMENT) or set(manquants_du_run(depot, jobs, requis)) - set(JOBS_DEPLOIEMENT):
+        return None
+    return back[0] if RE_FRONT_ATTEND_BACK.search(log_echec(depot, run)) else None
+
+
+def attendre_back(etat, depot, run, verdict_back, branche):
+    """Deploy du front refusé avant le back : ce n'est pas un rouge. Le relais attend le back, puis,
+    ATTENTE_BACK_MIN après son vert, relance une fois les jobs rouges du front. Rend la note du suivi, ou None si la
+    relance a déjà eu lieu (un nouveau refus est alors un vrai rouge)."""
+    cle = str(run["databaseId"])
+    suivis = etat.setdefault("front_attend_back", {})
+    f = suivis.get(cle)
+    if f and f.get("relance"):
+        return None
+    if not f:
+        f = suivis[cle] = {"branche": branche, "depuis": iso(), "back_vert": None, "relance": None}
+        for k in list(suivis)[:-20]:
+            del suivis[k]
+        journal(etat["version"], f"run {cle} (front {branche}) : deploy refusé tant que le back de {branche} n'est pas "
+                                 f"déployé, ordre normal ; le relais attend le back puis relance le front")
+    if verdict_back != "vert":
+        return f"deploy en attente du back de {branche} (relancé une fois quand le back sera vert)"
+    f["back_vert"] = f.get("back_vert") or iso()
+    if minutes_depuis(f["back_vert"]) < ATTENTE_BACK_MIN:
+        return f"back de {branche} vert : relance du deploy du front quand le back déployé sera servi"
+    rc, out = gh_cmd("run", "rerun", cle, "-R", DEPOTS[depot], "--failed")
+    f["relance"] = iso()
+    _LOGS.pop((depot, run["databaseId"]), None)
+    journal(etat["version"], f"run {cle} (front {branche}) : back vert, jobs rouges du front relancés une fois "
+                             f"({'ok' if rc == 0 else out[-200:]})")
+    return "relancé une fois après le déploiement du back"
+
+
 def veiller_runs(etat, cibles, requis_par_cible):
     """cibles : [(depot, sha, event, branche)] -> ('attente' | 'vert' | 'rouge', lignes de bilan, {(depot, sha): résumé}).
     Le dernier état lu de chaque run reste dans attente.suivi : le monitor (vue Graph) l'affiche sous le lot."""
     att = etat["attente"]
     lignes, en_cours, rouges, par_cible = [], False, False, {}
-    suivi = []
+    suivi, lus, bilans, a_signaler = [], [], {}, []
     for (depot, sha, event, branche), requis in zip(cibles, requis_par_cible):
         run = dernier_run(depot, sha, event, branche)
         verdict, resume = bilan_run(depot, run, requis)
+        lus.append((depot, sha, event, branche, requis, run, verdict, resume))
+        if branche:
+            bilans[(depot, branche)] = (verdict, run)
+    for depot, sha, event, branche, requis, run, verdict, resume in lus:
         rid = run["databaseId"] if run else None
         suivi.append({"depot": depot, "branche": branche, "sha": sha, "event": event, "run": rid,
                       "url": url_run(depot, rid), "verdict": verdict, "resume": resume,
                       "debut": run.get("createdAt") if run else None})
         if verdict in ("absent", "en cours"):
             en_cours = True
+            if run:
+                try:
+                    vu = surveiller_file(etat, depot, run, requis)
+                except RuntimeError:
+                    vu = []
+                if isinstance(vu, tuple):
+                    resume += f" (annulé : {vu[1]} ; relancé en entier au passage suivant)"
+                else:
+                    a_signaler += vu
         elif verdict == "rouge":
-            if relancer_si_sans_rapport(etat, depot, run, att.setdefault("relances", [])):
+            back = front_attend_back(depot, run, requis, branche, bilans)
+            note = attendre_back(etat, depot, run, back, branche) if back else None
+            if note:
+                en_cours = True
+                resume += f" ({note})"
+                suivi[-1]["verdict"] = "en cours"
+            elif relancer_entier(etat, depot, run):
+                en_cours = True
+                resume += " (machine du run disparue : relancé en entier une fois)"
+                suivi[-1]["verdict"] = "en cours"
+            elif relancer_si_sans_rapport(etat, depot, run, att.setdefault("relances", [])):
                 en_cours = True
                 resume += " (relancé une fois : sans rapport avec le code)"
                 suivi[-1]["verdict"] = "en cours"
@@ -2021,6 +2521,8 @@ def veiller_runs(etat, cibles, requis_par_cible):
         lignes.append(f"{depot}{' ' + branche if branche else ''} `{sha[:7]}` : {verdict}, {resume}")
     att["suivi"] = suivi
     att["suivi_heure"] = iso()
+    if not rouges and a_signaler:  # sur un rouge, le développeur est réveillé de toute façon, avec les runs
+        signaler_files(etat, a_signaler)
     # rouge immédiat : un run rouge sur du code n'attend pas la fin des autres. Sinon un dépôt encore en file retarde le
     # verdict d'un rouge déjà connu, jusqu'à un arrêt « sans verdict » au plafond de l'étape.
     return ("rouge" if rouges else "attente" if en_cours else "vert"), lignes, par_cible
@@ -2064,11 +2566,20 @@ def veiller_attente(etat):
                     if minutes_depuis(dep["vert_a"]) < ATTENTE_PREVIEW_MIN:
                         return
                 elif verdict == "rouge":
+                    if relancer_entier(etat, depot, run):
+                        return
                     if relancer_si_sans_rapport(etat, depot, run, dep.setdefault("relances", [])):
                         return
                     note = (f"Le déploiement du back du lot sur la preview a échoué ({resume}). Si c'est le code du "
                             f"lot, c'est un point bloquant ; sinon fais la revue sans le back du lot en preview et dis-le.")
                 elif duree < plafond:
+                    if run:
+                        try:
+                            vu = surveiller_file(etat, depot, run, tuple(PREVIEW.get("jobs_requis") or REQUIS_PUSH))
+                            if isinstance(vu, list):
+                                signaler_files(etat, vu)
+                        except RuntimeError:
+                            pass
                     return
                 else:
                     note = f"Déploiement du back du lot toujours en cours après {int(duree)} min ({resume})."
@@ -2112,16 +2623,8 @@ def veiller_attente(etat):
             changer_etape(etat, "livraison", "veille", "CI du push sur la release verte :\n" + "\n".join(lignes) + note)
             planifier_reveil(etat, DEV, "livraison")
         elif verdict == "rouge":
-            etat["ci_rouges"] += 1
             etat["release_a_verifier"] = sorted({x["depot"] for x in att.get("suivi") or [] if x.get("verdict") != "vert"})
-            if etat["ci_rouges"] >= MAX_CI_ROUGES:
-                arreter(etat, "veille", "ci", f"CI du push sur {etat['release']} rouge {etat['ci_rouges']} fois de suite : "
-                        + " ; ".join(lignes))
-            else:
-                changer_etape(etat, "correction", "veille", f"CI du push sur {etat['release']} rouge après le merge du lot. "
-                              f"Corrige par une PR vers {etat['release']}, puis `cycle-lot passe {etat['version']} "
-                              f"--vers {REV}`.\n" + "\n".join(lignes))
-                planifier_reveil(etat, DEV, "correction")
+            rouge_ci(etat, "ci-release", lignes, "correction", "correction")
         else:
             arreter(etat, "veille", "ci", f"CI du push sur {etat['release']} sans verdict après {int(duree)} min : "
                     + " ; ".join(lignes))
@@ -2156,14 +2659,15 @@ def veiller_attente(etat):
         if verdict == "attente" and encore_attendre(etat, duree, plafond, "CI de develop et de master (mise en production)"):
             return
         if verdict == "vert":
+            etat["ci_rouges"] = 0
             changer_etape(etat, "liste-validation", "veille", "CI de develop et de master verte, lot en production :\n"
                           + "\n".join(lignes))
             planifier_reveil(etat, DEV, "liste-validation")
-        else:
-            arreter(etat, "veille", "deploiement",
-                    ("CI de livraison rouge" if verdict == "rouge" else f"CI de livraison sans verdict après "
-                     f"{int(duree)} min") + " : " + " ; ".join(lignes) + f". {N_DEV} est réveillé pour le diagnostic.",
-                    etape_reprise="liste-validation")
+        elif verdict == "rouge":
+            rouge_ci(etat, "deploiement", lignes, "diagnostic-deploiement", "diagnostic")
+        else:  # aucun rouge, mais aucun verdict au double du plafond : runs bloqués en file, l'humain est prévenu
+            arreter(etat, "veille", "deploiement", f"CI de livraison sans verdict après {int(duree)} min : "
+                    + " ; ".join(lignes) + f". {N_DEV} est réveillé pour le diagnostic.", etape_reprise="liste-validation")
             planifier_reveil(etat, DEV, "diagnostic", texte=(
                 f"[RELAIS DU CYCLE DE LOT {etat['version']} — message automatique de cycle-lot, pas de {HUMAIN}] La mise "
                 f"en production du lot est en échec :\n" + "\n".join(lignes) +
@@ -2172,9 +2676,10 @@ def veiller_attente(etat):
 
 
 def plafonds_workflow(texte):
-    """Plafonds `timeout-minutes` d'un workflow, lus à l'indentation (pas de dépendance YAML) : {job: minutes} et
-    {(job, étape nommée): minutes}."""
-    jobs, etapes, dans_jobs, job, etape = {}, {}, False, None, None
+    """Plafonds `timeout-minutes` d'un workflow, lus à l'indentation (pas de dépendance YAML) : {job: minutes},
+    {(job, étape nommée): minutes} et {job: nom affiché}. Le nom affiché compte pour une matrice : un job `tests` nommé
+    `tests-${{ matrix.tranche }}` donne des runs `tests-1`, `tests-2`…"""
+    jobs, etapes, noms, dans_jobs, job, etape = {}, {}, {}, False, None, None
     for ligne in texte.split("\n"):
         if re.match(r"^jobs:\s*$", ligne):
             dans_jobs = True
@@ -2186,6 +2691,10 @@ def plafonds_workflow(texte):
         m = re.match(r"^  ([A-Za-z0-9_-]+):\s*(#.*)?$", ligne)
         if m:
             job, etape = m.group(1), None
+            continue
+        m = re.match(r"^    name:\s*(.+?)\s*$", ligne)
+        if m and job and etape is None:
+            noms[job] = m.group(1).strip("'\"")
             continue
         m = re.match(r"^      - (?:name:\s*(.+?)\s*)?(?:#.*)?$", ligne) or re.match(r"^      - \w", ligne)
         if m:
@@ -2202,21 +2711,33 @@ def plafonds_workflow(texte):
                 jobs[job] = int(m.group(2))
             elif len(m.group(1)) == 8 and etape:
                 etapes[(job, etape)] = int(m.group(2))
-    return jobs, etapes
+    return jobs, etapes, noms
+
+
+def job_du_nom(nom_run, noms):
+    """Identifiant du job d'un workflow pour un nom de job de run : `tests-2` -> `tests` (nom `tests-${{ matrix.… }}`),
+    `e2e (1)` -> `e2e` (matrice sans nom), sinon le nom lui-même."""
+    for jid, modele in noms.items():
+        motif = "".join(".+?" if i % 2 else re.escape(x) for i, x in enumerate(re.split(r"\$\{\{.*?\}\}", modele)))
+        if re.fullmatch(motif, nom_run):
+            return jid
+    m = re.fullmatch(r"(.+?) \(.*\)", nom_run)
+    return m.group(1) if m else nom_run
 
 
 def marges_ci(depot, ref, nb_runs=8):
     """Durée la plus longue de chaque job et de chaque étape plafonnée, sur les derniers runs verts du workflow, face à son
     `timeout-minutes`. Les suites grossissent à chaque lot : un plafond fixé une fois devient trop court sans prévenir,
     et la livraison bute dessus."""
-    jobs, etapes = plafonds_workflow(lire_fichier_gh(DEPOTS[depot], f".github/workflows/{WORKFLOW[depot]}", ref))
+    jobs, etapes, noms = plafonds_workflow(lire_fichier_gh(DEPOTS[depot], f".github/workflows/{WORKFLOW[depot]}", ref))
     maxi = {}
     verts = sorted((x for x in runs(depot) if x.get("status") == "completed" and x.get("conclusion") == "success"),
                    key=lambda x: x["createdAt"], reverse=True)[:nb_runs]
     for run in verts:
         detail = gh_json("run", "view", str(run["databaseId"]), "-R", DEPOTS[depot], "--json", "jobs")["jobs"]
         for j in detail:
-            for cle, obj in [(j["name"], j)] + [((j["name"], st.get("name")), st) for st in j.get("steps") or []]:
+            jid = job_du_nom(j["name"], noms)  # tranches d'une matrice : le plafond de leur job
+            for cle, obj in [(jid, j)] + [((jid, st.get("name")), st) for st in j.get("steps") or []]:
                 if obj.get("conclusion") != "success" or not obj.get("startedAt") or not obj.get("completedAt"):
                     continue
                 try:
@@ -2257,6 +2778,8 @@ def veiller_lot(etat):
         veiller_attente(etat)
     elif etat["tour"] in (DEV, REV):
         veiller_tour(etat)
+        if etat["tour"] == DEV and etat["etape"] in ("dev", "correction") and not etat.get("a_reveiller"):
+            veiller_files_pr(etat)
     executer_en_attente(etat)
 
 
@@ -2349,7 +2872,9 @@ def main():
     p.add_argument("--message")
     p.add_argument("--fichier")
     p.add_argument("--dossier-lot")
-    p.add_argument("--reel", help="1er passage en revue : fichier des preuves en réel (services externes), ou « aucun »")
+    p.add_argument("--reel", help="1er passage en revue : fichier des preuves en réel (services externes), ou « aucun » ; "
+                                  "retour en revue : preuves rejouées sur la tête de la reprise, ou « inchange » avec --motif")
+    p.add_argument("--motif", help="avec --reel inchange : pourquoi la reprise ne touche aucun critère joué en réel")
     p.add_argument("--contre-relecture", help="après une correction : rapport de la contre-relecture du diff de la reprise")
     p.set_defaults(f=cmd_passe)
 
@@ -2374,10 +2899,12 @@ def main():
     p = sp.add_parser("ouvrir-livraison", help=f"{N_DEV} : PR release -> develop et master", parents=[commun])
     p.add_argument("version")
     p.add_argument("--message")
+    p.add_argument("--sans-reglages", metavar="MOTIF",
+                   help="ouvrir malgré des réglages à faire avant la livraison ; le motif part au journal")
     p.set_defaults(f=cmd_ouvrir_livraison)
 
-    p = sp.add_parser("attendre-ci", help=f"{N_REV} : CI de livraison relancée, le relais attend le verdict",
-                      parents=[commun])
+    p = sp.add_parser("attendre-ci", help=f"CI relancée ({N_REV} en revue de livraison, {N_DEV} après un rouge de CI) : "
+                                          "le relais reprend l'attente", parents=[commun])
     p.add_argument("version")
     p.add_argument("--message")
     p.set_defaults(f=cmd_attendre_ci)
@@ -2410,7 +2937,12 @@ def main():
     g = p.add_mutually_exclusive_group()
     g.add_argument("--ajouter")
     g.add_argument("--fait", type=int)
+    g.add_argument("--classer", type=int, help="reclasse le réglage N (avec ou sans --apres-deploiement)")
     p.add_argument("--preuve")
+    p.add_argument("--apres-deploiement", action="store_true",
+                   help="ne peut se poser qu'après le déploiement en production : exigé avant les validations, pas avant "
+                        "l'ouverture des PR de livraison")
+    p.add_argument("--qui", choices=("dev", "humain"), help=f"qui doit le poser ({N_DEV} par défaut, ou {HUMAIN})")
     p.set_defaults(f=cmd_reglage)
 
     p = sp.add_parser("carte-bug", help=f"{N_REV} : carte de bug vu en production, version suivante, Not Ready",

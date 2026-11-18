@@ -7,8 +7,9 @@ Two tools that let two AI agents, a developer and a reviewer, build, review and 
 that are theirs to make.
 
 - **`run-lot.sh`**: the development launcher. It splits the batch into non-interactive
-  [Claude Code](https://docs.claude.com/en/docs/claude-code) passes, one card per pass, on two parallel lanes. It
-  runs the full test suite only once, at the end of the batch, then starts the CI of the batch pull requests.
+  [Claude Code](https://docs.claude.com/en/docs/claude-code) passes, one card per pass, on two or three parallel
+  lanes. It runs the full test suite only once, at the end of the batch, from a script and without Claude, then starts
+  the CI of the batch pull requests.
 - **`cycle-lot`**: the full cycle, from review to production. One state machine per batch, moved forward by the agents
   through commands, and a systemd relay that wakes each agent when its turn comes and owns every wait (CI,
   deployments).
@@ -27,13 +28,15 @@ The scripts, their messages and the prompts they build are in French.
 | 4 | Blocking question | dev → human | A question the rules cannot settle stops the cycle (`cycle-lot arret`) |
 | 5 | End-of-batch CI | `run-lot.sh` | Unit and e2e tests, quality and security analysis, once, on the final heads of the PRs |
 | 6 | Red CI | dev | The dev fixes it before asking for review: `cycle-lot passe` refuses a CI that is not green |
-| 7 | Review | reviewer | Code review, tests, Playwright journeys on the deployed batch; verdict MERGE or REWORK. The first review requires the dev's real-world evidence (`passe --reel`). A rework review only reads the diff since the reviewed head |
+| 7 | Review | reviewer | Code review, tests, Playwright journeys on the deployed batch; verdict MERGE or REWORK. The first review requires the dev's real-world evidence (`passe --reel`), and every later review requires it again on the rework head. A rework review only reads the diff since the reviewed head |
 | 8 | Rework | dev | Reviews 1 and 2: every point, blocking or not. From the 3rd review: blocking points only, each non-blocking point is a card of the next batch. The dev fixes the family of each defect, not the single case, and a separate pass re-reads the rework diff (`passe --contre-relecture`) |
 | 9 | 7 ↔ 8 | | Automatic until MERGE; stops at the 5th REWORK |
 | 10 | Batch merge | reviewer, relay | The MERGE verdict immediately merges each PR into the release (squash, back first); the relay adds the release commit (CHANGELOG, version) |
-| 11 | Delivery | relay | Green release: the relay opens the 4 PRs, release into `develop` and `master`, back and front. The dev only steps in while a human action is still pending |
+| 10b | Red release CI | dev | Each red hands over to the dev with the runs, the red jobs and the count of reds in a row: a fix through a PR, or a re-run then `cycle-lot attendre-ci`. From the 3rd red in a row, a written diagnosis comes before any re-run |
+| 11 | Delivery | relay | Green release: the relay opens the 4 PRs, release into `develop` and `master`, back and front. The dev only steps in while a human action or a pre-delivery deployment setting is still pending |
 | 12 | Delivery review | relay or reviewer | Green CI and content limited to the reviewed batch: the relay merges the 4 PRs. Otherwise the reviewer checks and merges |
-| 13 | Production | relay, then dev | CI of `develop` and `master` (deployment included), then the deployment settings declared during the batch, set and proven by the dev, and the list of visual checks to run in production |
+| 13 | Production | relay, then dev | CI of `develop` and `master` (deployment included), then the remaining deployment settings (those that can only be set after the deployment), set and proven by the dev, and the list of visual checks to run in production |
+| 13b | Deployment diagnosis | dev | Red production CI (step `diagnostic-deploiement`): the dev diagnoses, re-runs, then `cycle-lot attendre-ci --message "<diagnosis>"` hands the wait back to the relay |
 | 14 | Production checks | reviewer | Playwright on production, one Trello card per defect, in the next version, in Not Ready |
 
 Trello follows the cycle: Work in progress at start, Waiting for review as soon as a pass is pushed to the batch PR
@@ -62,19 +65,41 @@ storage), the command or journey played on pre-production and its result, or `--
 which a card cannot be checked for real is declared with `intervention --ajouter … --avant revue`: the review is
 refused until it is done, or until the cards that depend on it are deferred. After a rework, `passe` requires the
 report of a counter-review (`--contre-relecture <file>`): a separate pass that read the rework diff with the review
-grid, asking only what the fix breaks, misses or lets through.
+grid, asking only what the fix breaks, misses or lets through. When the first handover gave an evidence file, every
+return to review brings its own: `--reel <file>` with the evidence replayed on the rework head, or `--reel inchange
+--motif "<why the rework touches no criterion played for real>"` (20 characters at least). The reviewer's instructions
+quote the file, or the reason to check against the diff; a false reason is a blocking point. The short lane is exempt.
 
 **Short lane.** After the batch is merged, a fix that only touches CI, tests or documentation is recognized from its
-files (`motif_voie_courte`): reviewed on its diff, with no preview deployment and no counter-review, outside the
+files (`motif_voie_courte`, which includes the scripts only CI runs, `scripts/ci/`): reviewed on its diff, with no preview deployment and no counter-review, outside the
 round-trip counter. The 3rd REWORK in a row on the short lane stops the cycle (`max_voie_courte`).
 
 **Deployment settings.** Environment variables, workflows to run, data to republish or migrations that a card
-requires are declared during the batch (`cycle-lot reglage <v> --ajouter …`), by the dev or the reviewer. A setting
-only written in a PR description gets forgotten at delivery: the handover to production checks is refused until each
-setting is marked done with its proof (`reglage <v> --fait N --preuve …`), and the reviewer checks them first.
+requires are declared during the batch (`cycle-lot reglage <v> --ajouter …`), by the dev or the reviewer, with who
+has to set them (`--qui dev`, the default, or `--qui humain`). A setting only written in a PR description gets
+forgotten at delivery, and the delivery CI then finds them one by one, one red each. So `ouvrir-livraison`, and the
+relay when it opens the delivery PRs itself, refuse while a setting to be set before delivery is still pending, and
+list each one with who has to set it; the relay wakes the dev with that list instead of opening the PRs. A setting
+that can only be set after the deployment (a workflow to run on `master`, data to publish on the served version) is
+declared with `--apres-deploiement`, or reclassified (`reglage <v> --classer N --apres-deploiement`): it does not block
+the delivery. `ouvrir-livraison <v> --sans-reglages "<reason>"` overrides the check, with the reason and the skipped
+settings in the batch log; the relay never overrides it. Every setting, after deployment ones included, must be marked
+done with its proof (`reglage <v> --fait N --preuve …`) before the handover to production checks, and the reviewer
+checks them first.
+
+**Red CI.** Each red of the release CI or of the production CI hands over to the dev, with the run, the red jobs and
+the count of reds in a row (`relais.diagnostic_ci_rouges`, reset to zero when these CIs turn green). From the 3rd red
+in a row, the instructions require a written diagnosis in the thread before any re-run: the cause of each red job,
+how it differs from the previous reds, and why the next step will pass; `attendre-ci` refuses without it. A code defect
+goes through a PR and `passe`; a red unrelated to the code is re-run (`gh run rerun <id> --failed`, or without
+`--failed` when its machine went away), then `cycle-lot attendre-ci <v> --message "<diagnosis>"` hands the wait back to
+the relay, on the release CI (from the rework step) or on the production CI (from `diagnostic-deploiement`, same
+commits). The relay never stops the cycle for a red: only the dev stops it (`cycle-lot arret --motif ci|deploiement`)
+when they need a decision or an action from the human.
 
 **Stops.** The cycle stops on a blocking question, when the human has to act (environment variable, token,
-account…), at the 5th REWORK verdict, and at the 3rd REWORK in a row on the short lane. Questions and required human
+account…), at the 5th REWORK verdict, at the 3rd REWORK in a row on the short lane, and when a release or production
+CI has no verdict at all after twice the step's cap. A red CI never stops it. Questions and required human
 actions are raised at the start of the batch, not halfway through. On a stop, the relay posts a notice in the thread
 naming the agent to mention, and sends it to the human as a direct message too; the human answers in the thread by
 mentioning that agent, which resumes the cycle (`cycle-lot reprise`).
@@ -96,9 +121,31 @@ Here, no agent ever waits:
 - a red run on the code is acted on at once, without waiting for the other repository's runs. Without any red, a
   wait past the step's cap only posts a notice; the stop comes at twice the cap (runs queued on a single runner are
   not an outage);
+- a front deployment refused because the back of the same branch is not deployed yet is the normal delivery order,
+  not a red. It is recognized from the messages the front workflow writes (`motif_front_attend_back`) when the
+  deployment job is the only red one and the back run of the same branch is running, not created yet, or green. The
+  relay waits for the back, re-runs the front's red jobs once `relais.attente_back_min` after the back turned green,
+  and only wakes the dev if the front turns red again;
+- when the machine of a run went away, re-running the failed jobs alone would send them back to the same machine: the
+  relay re-runs the whole run (`gh run rerun <id>` without `--failed`), once per run, and logs it. Triggers: a runner
+  lost during the run ("lost communication with the server", in the log or the job annotations), the local machine
+  refusing the run for lack of resources (a mark written by the workflow, `motif_machine_refusee`), or jobs queued for
+  `relais.file_hors_ligne_min` on labels whose runners are all offline (the run is cancelled, then re-run whole on the
+  next pass). Never when a deployment job (`jobs_deploiement`) has already started: the dev is told once instead;
+- a required job queued for `relais.file_runner_libre_min` while a runner carrying its labels is online and idle is
+  reported once to the dev (run, job, expected label, runners seen), with no automatic action and no message to the
+  human. This watch covers the relay's waits and the CI of the batch PRs during development and rework; it reads
+  `actions/runs/<id>/jobs` and `actions/runners`, which needs a token allowed to list the repository's runners
+  (otherwise the read fails silently and nothing is reported);
+- with a CI that routes its runs (a routing job at the head of the run picks the machine, tests may be split into a
+  matrix of slices, a static analysis job may carry the gate), a run that has the routing job (`ci_aiguillage.job`,
+  even skipped) also requires the `ci_aiguillage.jobs_requis` of its application and every test slice present
+  (`ci_aiguillage.motif_tranches`); the marker job may skip them legitimately. A run without the routing job keeps the
+  rules above;
 - at the first green release CI of a batch, the relay compares the longest measured duration of each CI job and
   capped step with its `timeout-minutes`, and posts a notice for those above 80% (`cycle-lot marges` shows the same
-  table on demand).
+  table on demand). The jobs of a matrix (`tests-1`, `tests-2`… from a job named `tests-${{ matrix.slice }}`) are
+  measured against the cap of their job.
 
 The wake-up goes through the OpenClaw gateway `agent` RPC, into the agent's session for the batch's Slack thread, and
 the agent's reply is posted there. It runs from the systemd service, not from an agent's exec: the gateway refuses to
@@ -137,7 +184,7 @@ context into the cache: that is most of a turn's cost, far more than the work it
 
 ```
 run-lot.sh <batch-folder> pre    # PRE phase only: studies, measurements, arbitration questions
-run-lot.sh <batch-folder> impl   # lanes A and B in parallel, FIN phase, then CI of the batch PRs
+run-lot.sh <batch-folder> impl   # lanes A, B (and C) in parallel, FIN phase, then CI of the batch PRs
 ```
 
 The launcher runs in a systemd unit whose name starts with the agent id (`dev-100-impl`), with a memory cap and an
@@ -160,22 +207,38 @@ systemd-run --user --unit dev-100-impl --property=MemoryHigh=6G --property=Memor
 | `card-<n>.md` | The card's text |
 | `common-back.md`, `common-front.md` | The shared frame of each application's passes |
 | `arbitrages.md` | The agent's decisions and the human's answers, attached to every pass |
+| `fin-mecanique-<app>.txt` | Optional: the batch's own list of end-of-batch commands, instead of the one next to `fin-mecanique.sh` |
 
 **Phases.**
 
 - **PRE**: studies and measurements before any implementation. Arbitration questions go to `questions-arbitrage.md`.
   `impl` refuses to start until they are settled in `arbitrages.md`, or while a `[BLOQUANTE]` question has no answer
   from the human.
-- **A and B**: two parallel lanes, one card per pass. A pass only receives the previous pass's handoff note. Targeted
-  tests only. When both lanes touch the same repository, lane B works in its own worktree, on a `-vB` branch.
-- **FIN**: merge of the `-vB` branch (Claude resolves conflicts when git cannot), then the full suite of each touched
-  application, and a review of the diff against the review grid.
+- **A, B and C**: two or three parallel lanes, one card per pass. A pass only receives the previous pass's handoff
+  note. Targeted tests only (`WORKERS_VOIE` workers, `WORKERS_3VOIES` with three lanes). Lane C is optional: a third
+  queue of cards independent from the other two, started only if `etapes.txt` gives it steps. When a lane touches a
+  repository already used by an earlier lane, it works in its own worktree, on its own branch (`-vB`, `-vC`); `impl`
+  refuses two lanes on the same branch of the same repository. The launcher's git operations (fetch, worktree,
+  checkout) run one at a time per repository, since the lanes share each repository's `.git`.
+- **FIN**: merge of the `-vB` and `-vC` branches (`FUSION…` steps; Claude resolves conflicts when git cannot), cards
+  placed at the end, then the end of each application: a FIN step without a card.
+- **End of an application, in script** (when `MECA`, by default `fin-mecanique.sh`, is executable): first a review
+  pass by Claude if the step has its `step-<name>.md`, with targeted tests only; then the mechanical part, played by
+  `fin-mecanique.sh` without Claude: the command list `fin-mecanique-<app>.txt` (full suite, lint, typing, build, e2e,
+  audit…, `WORKERS_FIN` workers), plus the PR's conflict state against the release; then, only if something is red, a
+  fix pass that receives the report, and the script again, `MAX_TOURS_FIN` times at most. The full suite thus runs
+  only once when everything is green, and a Claude pass no longer keeps hours of commands to itself. With `MECA` empty,
+  the FIN pass runs the suite itself, as before.
+- **Review of a rework**: the end-of-application review reads the whole batch diff the first time, and only the
+  rework's diff (`git diff <head before>..HEAD`) when the batch is a rework. In a `cycle-lot` cycle, the head before is
+  recorded on its own at the first launch of a `PREFIX` while the cycle is in rework; otherwise give it in `lot.conf`
+  (`REPRISE_DEPUIS_BACK`, `REPRISE_DEPUIS_FRONT`; `-` forces a review of the whole batch).
 - **CI**: during the batch, a label (`ci-en-pause`) makes the PR jobs skip and cancels runs already started. Your
   workflows must test that label in the `if:` of their PR jobs. At the end of the batch, the launcher removes the
   label, reopens the PRs, waits for the verdicts and writes them to its log. A red unrelated to the code (Sonar task
   failure, network outage) is re-run once.
 
-**Slots.** At most `MAX_VOIES` Claude Code passes at once on the machine, across all batches and agents (`flock`
+**Slots.** At most `MAX_VOIES` (3) Claude Code passes at once on the machine, across all batches and agents (`flock`
 locks in `slots/`). Each pass needs `SEUIL_MIO` of available memory when it starts. A heavy job from an agent (a unit
 whose name matches `AGENTS_RE` and that actually loads the machine) takes a slot.
 
@@ -184,19 +247,34 @@ the agents.
 
 Machine settings: [`run-lot.example.conf`](run-lot.example.conf), to copy as `run-lot.conf`.
 
+**`fin-mecanique.sh`.** `fin-mecanique.sh <back|front> <repository> <base> <log folder> [<list>]` plays every command
+of the list in order, in the repository, even after a red (the fix pass gets the whole list at once), and writes a
+Markdown report on its standard output; each command has its own log. One line per command:
+`<name> [apres=<name>] [sortie2=non-joue] | <shell command>`: `apres=` skips the command when the named one is not
+green (e2e after build), `sortie2=non-joue` reads exit code 2 as "could not run" rather than red. The commands get
+`$W` (workers), `$J` (log folder), `$T` (temporary folder of the run), `$BASE`, `$E2E_PORT` and `$VERIF`. `$T` lives
+under `MECA_TMP` (default `~/.cache/run-lot/meca`), outside `/tmp` (often a small tmpfs) and outside any git
+repository (tests that run `git ls-files` in their temporary folder would see the enclosing repository): the script
+refuses to run inside a git repository, and deletes `$T` on exit. It does not start either when the disk holding `$T`
+has less than `MECA_DISQUE_MIO` free (exit 2: nothing played), since a full disk would give false reds. Each command is
+capped at `MECA_DELAI_S` seconds. Exit 0: all green; 1: at least one red; 2: nothing could be played. Example lists for
+a Python back and a Node front: [`fin-mecanique-back.txt`](fin-mecanique-back.txt),
+[`fin-mecanique-front.txt`](fin-mecanique-front.txt).
+
 ## `cycle-lot`
 
 | Command | Who | Effect |
 |---|---|---|
 | `debut <v> --session-key <key>` | dev, when the human asks | Creates the batch state, cards to Work in progress |
-| `passe <v> --vers <reviewer> --message … [--reel <f>\|aucun] [--contre-relecture <f>]` | dev | End of development or rework: green CI required, real-world evidence at the first review, counter-review after a rework, batch back end deployed to preview (when `deploiement_preview` is configured), then review. A short-lane fix skips the preview and the counter-review |
+| `passe <v> --vers <reviewer> --message … [--reel <f>\|aucun\|inchange --motif …] [--contre-relecture <f>]` | dev | End of development or rework: green CI required, real-world evidence at the first review and again at each return to review (`--reel <f>`, or `--reel inchange --motif "<reason>"`), counter-review after a rework, batch back end deployed to preview (when `deploiement_preview` is configured), then review. A short-lane fix skips the preview and the counter-review |
 | `verdict <v> --merger\|--a-reprendre --rapport <f> [--bloquants N] [--non-bloquants N] [--cartes-ok …] [--cartes-ko …]` | reviewer | End of review; `--merger` immediately merges the batch PRs; inconsistent verdicts refused; automatic stop at the 5th REWORK |
 | `merge <v> --pr back#N` | reviewer | Guarded merge: head unchanged since the review, green CI, back before front; after a merge refused at the verdict, or in delivery review |
-| `ouvrir-livraison <v>` | dev | The 4 delivery PRs, when the relay could not open them; refused while a human action is still pending |
+| `ouvrir-livraison <v> [--sans-reglages "<reason>"]` | dev | The 4 delivery PRs, when the relay could not open them; refused while a human action or a pre-delivery deployment setting is still pending (`--sans-reglages` overrides the settings check, with a reason kept in the log) |
+| `attendre-ci <v> --message "<diagnosis>"` | dev or reviewer | After a re-run, hands the CI wait back to the relay: reviewer in delivery review; dev after a red release CI (rework step) or a red production CI (`diagnostic-deploiement`). From the 3rd red in a row, the diagnosis is required |
 | `passe <v> --vers <reviewer> --etape validation-prod --fichier <list>` | dev | List of visual checks in production |
 | `carte-bug <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | reviewer | Bug card in the next version (or the given later one), in Not Ready |
 | `carte-report <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | reviewer or dev | Point deferred to a later batch, at any step: non-blocking point from the 3rd review, old defect out of scope, leftover decided by the human |
-| `reglage <v> [--ajouter … \| --fait N --preuve …]` | dev or reviewer | Deployment settings: declared during the batch, required before production checks; without an option, the list |
+| `reglage <v> [--ajouter … [--apres-deploiement] [--qui dev\|humain] \| --fait N --preuve … \| --classer N [--apres-deploiement] [--qui …]]` | dev or reviewer | Deployment settings: declared during the batch, required before the delivery PRs open (or, declared `--apres-deploiement`, before production checks); `--classer` reclassifies one; without an option, the list with who sets each one and when |
 | `marges [--ref develop]` | anyone | Longest measured duration of each CI job and capped step over the last green runs, against its `timeout-minutes` |
 | `fin <v> --rapport <f>` | reviewer | Batch delivered and validated |
 | `arret`, `reprise`, `intervention [--avant revue]`, `programmer`, `reveiller` | | Stop and resume, human actions (required before the review with `--avant revue`, before delivery by default), deferred start, manual wake-up |
@@ -234,6 +312,16 @@ as a relay error.
    | `relais.ci_verte_min` | 15 | Minutes of green CI without handover before the dev's targeted wake-up |
    | `relais.rappel_alerte_min`, `relais.nb_rappels_alerte` | 120, 5 | Reminders of an unanswered alert, in the thread and by direct message |
    | `relais.seuil_marge` | 0.8 | Share of a `timeout-minutes` above which a CI duration gets a notice |
+   | `relais.diagnostic_ci_rouges` | 3 | Reds in a row of the release or production CI from which a written diagnosis is required before any re-run |
+   | `relais.attente_back_min` | 10 | Minutes after the back turned green before the front deployment that waited for it is re-run |
+   | `relais.file_hors_ligne_min` | 10 | Minutes of jobs queued on offline machines before the run is cancelled and re-run whole |
+   | `relais.file_runner_libre_min` | 15 | Minutes a required job may stay queued while a matching runner is idle before the dev is told |
+   | `jobs_deploiement` | `["deploy"]` | Jobs that deploy: a run where one of them started is never cancelled nor re-run whole; the only red job allowed when the front waits for the back |
+   | `motif_front_attend_back` | `ATTENTE-BACK` | Regular expression on the log of the front's red jobs: deployment refused because the back of the same branch is not deployed yet |
+   | `motif_machine_refusee` | none | Regular expression on the log of red jobs: the run's machine refused it for lack of resources (whole re-run) |
+   | `ci_aiguillage.job` | none | Routing job of a CI that picks the machine of each run; absent, the rules of a routed CI do not apply |
+   | `ci_aiguillage.jobs_requis` | `{}` | Per application, jobs required (and skippable with the marker job) in a routed run |
+   | `ci_aiguillage.motif_tranches` | none | Regular expression of test slice names (`^tranche-\d+$`): every slice present in a routed run is required |
    | `slack_archives` | none | `https://<workspace>.slack.com/archives`: link to the thread in direct messages; absent, the message has no link (`CYCLE_LOT_SLACK_ARCHIVES` overrides it) |
 2. Make the command available to the agents: `ln -s ~/agentic-dev/cycle-lot ~/.local/bin/cycle-lot`.
 3. Install the relay: copy [`systemd/`](systemd) into `~/.config/systemd/user/`, adjust the path, then
@@ -249,7 +337,12 @@ as a relay error.
    - the thread session is reset at every step: whatever a later step needs goes into the batch folder or a report,
      never only into the thread;
    - from the review rule's report threshold on, the reviewer creates one `carte-report` per non-blocking point
-     before the verdict, and the dev only fixes the blocking points.
+     before the verdict, and the dev only fixes the blocking points;
+   - after a red CI, the dev diagnoses, fixes through a PR or re-runs, then hands the wait back with `cycle-lot
+     attendre-ci --message "<diagnosis>"`; from the 3rd red in a row, the written diagnosis is posted in the thread
+     first, and `cycle-lot arret` is only for a decision or an action of the human;
+   - every return to review brings its real-world evidence (`--reel <file>` or `--reel inchange --motif …`), and a
+     deployment setting that can only be set after the deployment is declared `--apres-deploiement`.
 5. The shared review grid is [`GRILLE-REVUE.md`](GRILLE-REVUE.md), and the arbitration rules
    [`regles-arbitrage.example.md`](regles-arbitrage.example.md), to copy as `regles-arbitrage.md`.
 
@@ -262,8 +355,9 @@ Linux with user-mode systemd (cgroups v2), Python 3.11 or later (standard librar
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, gateway outage (134 checks)
-bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories (26 checks, ~1 min)
+python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, red CI, gateway outage (177 checks)
+bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories: three lanes, end of batch in
+                                 # script, rework reviewed on its diff (47 checks, ~2 min)
 ```
 
 Neither calls a real service: fake `gh`, `openclaw`, `systemctl` and `claude` commands and a fake Trello API share a

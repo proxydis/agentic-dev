@@ -62,9 +62,18 @@
   "max_aller_retours": 5,
   "revue_report_non_bloquants": 3,
   "max_voie_courte": 3,
-  "motif_voie_courte": "^(\\.github/|tests?/|e2e/|docs/|__tests__/)|(^|/)[^/]+\\.(test|spec|e2e)\\.[a-z]+$|\\.md$|(^|/)(vitest[^/]*|playwright)\\.config\\.[a-z]+$|(^|/)conftest\\.py$",
+  "motif_voie_courte": "^(\\.github/|tests?/|e2e/|docs/|__tests__/|scripts/ci/)|(^|/)[^/]+\\.(test|spec|e2e)\\.[a-z]+$|\\.md$|(^|/)(vitest[^/]*|playwright)\\.config\\.[a-z]+$|(^|/)conftest\\.py$",
   "job_deja_valide": "contenu-deja-valide",
   "jobs_sautables": ["quality", "e2e"],
-  "relais": {"ci_verte_min": 15, "rappel_alerte_min": 120, "nb_rappels_alerte": 5, "seuil_marge": 0.8},
+  "jobs_deploiement": ["deploy"],
+  "motif_front_attend_back": "ATTENTE-BACK",
+  "motif_machine_refusee": "CI-RESSOURCES-INSUFFISANTES",
+  "ci_aiguillage": {
+    "job": "routage",
+    "jobs_requis": {"back": ["analyse"], "front": ["analyse"]},
+    "motif_tranches": "^tranche-\\d+$"
+  },
+  "relais": {"ci_verte_min": 15, "rappel_alerte_min": 120, "nb_rappels_alerte": 5, "seuil_marge": 0.8,
+             "diagnostic_ci_rouges": 3, "attente_back_min": 10, "file_hors_ligne_min": 10, "file_runner_libre_min": 15},
   "slack_archives": "https://mon-espace.slack.com/archives"
 }

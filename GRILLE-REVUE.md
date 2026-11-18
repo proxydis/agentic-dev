@@ -29,10 +29,12 @@ référence à chaque point de revue.
   captcha, source de données, stockage) : la commande ou le parcours joué sur la préproduction et son résultat, dans le
   fichier que l'agent développeur donne à `cycle-lot passe --reel`. Un test sur des données fabriquées ne prouve pas que
   le service répond : un traitement qui n'a jamais tourné sur le vrai service avant la revue coûte des aller-retours, et
-  peut encore échouer en production.
+  peut encore échouer en production. À chaque retour en revue, l'agent développeur rejoue ces preuves sur la tête de la
+  reprise (`--reel <fichier>`) ou écrit pourquoi la reprise ne touche aucun critère joué en réel (`--reel inchange
+  --motif "…"`) : vérifie ce motif contre le diff, un motif faux est bloquant.
 - **Réglages de déploiement** : chaque variable d'environnement, workflow à lancer, donnée à republier ou migration que la
   carte suppose est déclaré (`cycle-lot reglage <v> --ajouter`). Écrit seulement dans la PR, il est oublié à la
-  livraison.
+  livraison. Un réglage qui ne peut se poser qu'après le merge ou le déploiement se déclare `--apres-deploiement`.
 
 ## Classement des points
 

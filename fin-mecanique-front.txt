@@ -1,0 +1,11 @@
+# Partie mécanique de la fin du front, jouée par fin-mecanique.sh (format : son en-tête). Exemple pour un front Node
+# géré par pnpm : reprendre les commandes de la CI du dépôt, une par ligne. Un lot peut poser sa propre liste dans
+# <lot>/fin-mecanique-front.txt.
+tsc         | pnpm exec tsc --noEmit
+eslint      | pnpm exec eslint . --max-warnings=0
+tests       | pnpm exec vitest run --maxWorkers=$W
+build       | pnpm build
+# e2e après le build seulement : sautés si le build est rouge.
+e2e apres=build | E2E_PORT=$E2E_PORT pnpm run test:e2e
+audit       | pnpm audit --prod
+verif sortie2=non-joue | if [ -n "$VERIF" ]; then $VERIF "$PWD" $BASE; else exit 2; fi
