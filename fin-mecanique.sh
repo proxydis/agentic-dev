@@ -76,15 +76,17 @@ while IFS= read -r ligne || [ -n "$ligne" ]; do
     case $o in apres=*) apres=${o#apres=} ;; sortie2=non-joue) sortie2=1 ;; long) long=1 ;; esac
   done
   n=$((n + 1)); noms+=("$nom"); SHA[$nom]=$TETE
+  # dépendance d'abord : une commande longue verte au passage précédent est « sautée », pas « reprise », si ce dont
+  # elle dépend n'est plus vert (build rouge : les e2e d'avant ne valent plus)
+  if [ -n "$apres" ] && [ "${ETAT[$apres]:-ok}" != ok ]; then
+    ETAT[$nom]=saute
+    lignes+=("- sautée  **$nom** : dépend de \`$apres\`, qui n'est pas vert")
+    continue
+  fi
   if [ -n "$long" ] && [ "${MECA_ALLEGE:-}" = 1 ] && [ "${AVANT[$nom]:-}" = ok ] && [ -n "${AVANT_SHA[$nom]:-}" ] \
      && git merge-base --is-ancestor "${AVANT_SHA[$nom]}" HEAD 2>/dev/null; then
     ETAT[$nom]=ok; SHA[$nom]=${AVANT_SHA[$nom]}; repris=$((repris + 1))
     lignes+=("- repris  **$nom** : vert au passage précédent (tête ${AVANT_SHA[$nom]:0:8}), pas rejoué : la correction ne visait que du rouge, la CI de fin de lot le rejoue")
-    continue
-  fi
-  if [ -n "$apres" ] && [ "${ETAT[$apres]:-ok}" != ok ]; then
-    ETAT[$nom]=saute
-    lignes+=("- sautée  **$nom** : dépend de \`$apres\`, qui n'est pas vert")
     continue
   fi
   log=$J/$nom.log

@@ -753,7 +753,8 @@ case $MODE in
     if [ "$FIN_PARALLELE" = 1 ] && [ "$(wc -w <<<"$fin_repos")" -ge 2 ]; then
       note "##### phase FIN en $(wc -w <<<"$fin_repos") files parallèles : $fin_repos(parties mécaniques une à la fois)"
       pids=()
-      for rp in $fin_repos; do E2E_PORT=3123 phase FIN "$rp" & pids+=($!); done
+      port=3123  # un port d'e2e par file, comme pour les voies A, B et C
+      for rp in $fin_repos; do E2E_PORT=$port phase FIN "$rp" & pids+=($!); port=$((port + 1)); done
       rf=0
       for p in "${pids[@]}"; do wait "$p"; r=$?; [ "$r" -eq 0 ] || { [ "$rf" -eq 2 ] || rf=$r; }; done
       VOIE=
