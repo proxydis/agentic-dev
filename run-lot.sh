@@ -38,6 +38,14 @@ WORKERS_3VOIES=${WORKERS_3VOIES:-2}
 WORKERS_FIN=${WORKERS_FIN:-4}
 MECA=${MECA-$HERE/fin-mecanique.sh}
 MAX_TOURS_FIN=${MAX_TOURS_FIN:-3}
+# Fin de lot plus courte :
+# A. après une passe de correction, la partie mécanique ne rejoue pas les commandes longues déjà vertes (MECA_ALLEGE,
+#    option `long` de fin-mecanique-<app>.txt) ; la CI de fin de lot les rejoue de toute façon.
+# B. la phase FIN suit deux files en parallèle, une par dépôt (FUSION, cartes et FINB côté back ; FINF côté front) :
+#    les passes Claude se chevauchent, les parties mécaniques passent une à la fois (verrou du lot), parce que la
+#    suite complète d'une appli et les e2e de l'autre, ensemble, dépassent vite la mémoire d'une petite machine.
+#    FIN_PARALLELE=0 : une seule file, comme avant.
+FIN_PARALLELE=${FIN_PARALLELE:-1}
 # Reprise : tête de la branche du lot avant la reprise (la relecture de fin se limite au diff depuis cette tête).
 # Dans un cycle de lot, elle est notée toute seule au premier lancement d'un PREFIX quand le cycle est en correction
 # (un verdict À REPRENDRE a été rendu) ; hors cycle, la donner dans lot.conf. « - » force la relecture du lot entier.
@@ -478,8 +486,9 @@ Passe de fin, correction. Le lanceur vient de jouer en script, sans Claude, la p
 (suite complète, lint, typage, build, e2e, contrôles de la liste de fin) : son rapport est en tête de ce prompt, avec le
 journal de chaque commande rouge. Corrige chaque rouge à la racine, sans affaiblir un test ni une règle. Ne rejoue
 que les commandes rouges, telles que le rapport les écrit, et les tests ciblés de ce que tu touches, au plus
-$workers workers : le lanceur rejoue toute la partie mécanique après ta poussée (passage ${FIN_TOUR:-1} sur $MAX_TOURS_FIN, le dernier
-rouge arrête le lot). Un rouge qui ne vient pas du code (machine chargée, test instable, service injoignable) :
+$workers workers : le lanceur rejoue la partie mécanique après ta poussée, sauf les commandes longues déjà vertes
+(passage ${FIN_TOUR:-1} sur $MAX_TOURS_FIN, le dernier rouge arrête le lot). Ne touche donc pas, sans nécessité, à ce que
+couvrent les commandes vertes du rapport : seule la CI de fin de lot les rejouera. Un rouge qui ne vient pas du code (machine chargée, test instable, service injoignable) :
 rejoue la commande seule une fois ; si elle passe, ne change rien et dis-le en une ligne dans ta conclusion.
 Ne relis pas le lot : la relecture est faite, tu ne touches qu'à ce que le rapport montre rouge.
 
@@ -542,7 +551,7 @@ etape() {
     [ -f "$LOT/arbitrages.md" ] && cat "$LOT/arbitrages.md"; echo
     for f in $common; do [ -f "$f" ] && cat "$f"; done
     # une carte = une passe : le contexte de la carte précédente de la voie n'arrive que par sa note de passation
-    local prec; prec=$(cat "$LOGS/$PREFIX-derniere-$phase" 2>/dev/null)
+    local prec; prec=$(cat "$LOGS/$PREFIX-derniere-${VOIE:-$phase}" 2>/dev/null)
     if [ -n "$prec" ] && [ -s "$LOGS/$PREFIX-passation-$prec.md" ]; then
       echo; echo "## Note de passation de l'étape précédente de ta voie ($prec)"; echo
       cat "$LOGS/$PREFIX-passation-$prec.md"
@@ -562,7 +571,7 @@ etape() {
     loc=$(git rev-parse "refs/heads/$br" 2>/dev/null); dist=$(git rev-parse "refs/remotes/origin/$br" 2>/dev/null)
     if [ "$rc" -eq 0 ] && [ -n "$dist" ] && [ "$loc" = "$dist" ]; then
       note "OK étape $nom : $repo $br poussée en ${dist:0:7} (${duree}s)"; rendre_creneau
-      echo "$nom" >"$LOGS/$PREFIX-derniere-$phase"
+      echo "$nom" >"$LOGS/$PREFIX-derniere-${VOIE:-$phase}"
       echo "$nom" >>"$LOGS/$PREFIX-ok.txt"
       case $phase in A|B|C|FIN) trello_attente "$carte" "$repo" "$br" ;; esac
       case $phase in A|B|C) [ -s "$LOGS/$PREFIX-passation-$nom.md" ] || note "$nom : pas de note de passation écrite" ;; esac
@@ -582,25 +591,29 @@ etape() {
 # Partie mécanique de la fin d'une application, jouée par $MECA sans Claude : les commandes de
 # fin-mecanique-<app>.txt (suite complète, lint, typage, build, e2e, audit…), puis l'état de la PR face à la release. Le rapport va dans <rapport>.
 # Retour : 0 vert, 1 rouge, 2 ni créneau ni mémoire, 3 n'a pas pu tourner (préparation, script).
-mecanique() {  # <nom> <repo> <branche> <base> <rapport>
-  local nom=$1 repo=$2 br=$3 base=$4 rapport=$5 dir liste j rc n t0
+mecanique() {  # <nom> <repo> <branche> <base> <rapport> <passage>
+  local nom=$1 repo=$2 br=$3 base=$4 rapport=$5 tour=${6:-1} dir liste j rc n t0 allege="" fd
   dir=$(dossier "$repo" FIN) || return 3
-  prendre_creneau || return 2
+  # une partie mécanique à la fois dans le lot : l'autre file de FIN attend ici, sans créneau pris
+  exec {fd}>"$LOGS/$PREFIX-meca.lock"
+  flock -n "$fd" || { note "$nom : partie mécanique en attente de celle de l'autre file"; flock "$fd"; }
+  prendre_creneau || { exec {fd}>&-; return 2; }
   if ! git_seul "$repo" preparer "$dir" "$nom" "$br" "$base" >>"$CHAIN" 2>&1; then
-    note "ÉCHEC préparation $nom (partie mécanique)"; rendre_creneau; return 3
+    note "ÉCHEC préparation $nom (partie mécanique)"; rendre_creneau; exec {fd}>&-; return 3
   fi
+  [ "$tour" -gt 1 ] && allege=1
   liste=$LOT/fin-mecanique-$repo.txt; [ -f "$liste" ] || liste=""
   j=$LOGS/$PREFIX-$nom-meca
-  note "=== étape $nom : partie mécanique sans Claude ($repo, $br, $WORKERS_FIN workers, créneau $CRENEAU, journaux $j)"
+  note "=== étape $nom : partie mécanique sans Claude ($repo, $br, $WORKERS_FIN workers, créneau $CRENEAU, passage $tour${allege:+, allégé : commandes longues déjà vertes non rejouées}, journaux $j)"
   t0=$SECONDS
-  WORKERS=$WORKERS_FIN VERIF=$VERIF_FIN "$MECA" "$repo" "$dir" "origin/$REL" "$j" ${liste:+"$liste"} >"$rapport" 2>>"$CHAIN"; rc=$?
+  MECA_ALLEGE=$allege WORKERS=$WORKERS_FIN VERIF=$VERIF_FIN "$MECA" "$repo" "$dir" "origin/$REL" "$j" ${liste:+"$liste"} >"$rapport" 2>>"$CHAIN" {fd}>&-; rc=$?
   # PR en conflit avec la release : aucun run de PR ne partirait en fin de lot
   n=$(cd "$dir" && gh pr list --head "$br" --base "$REL" --state open --json number --jq '.[0].number // empty' 2>/dev/null)
   if [ "$rc" -le 1 ] && [ -n "$n" ] && [ "$(cd "$dir" && gh pr view "$n" --json mergeable --jq .mergeable 2>/dev/null)" = CONFLICTING ]; then
     { echo; echo "- ROUGE   **conflit** : la PR $n est en conflit avec \`origin/$REL\`, aucune CI ne partirait en fin de lot. Mets \`$br\` à jour avec \`origin/$REL\`, résous les conflits, rejoue les tests des fichiers touchés et pousse."; } >>"$rapport"
     rc=1
   fi
-  rendre_creneau
+  rendre_creneau; exec {fd}>&-
   case $rc in
     0) note "OK étape $nom : partie mécanique verte sur $(git -C "$dir" rev-parse --short HEAD) ($((SECONDS - t0))s)" ;;
     1) note "étape $nom : partie mécanique ROUGE en $((SECONDS - t0))s, $(sed -n 's/^Verdict : //p' "$rapport" | head -n 1) (rapport $rapport)" ;;
@@ -621,7 +634,7 @@ fin_appli() {  # <nom> FIN <repo> - <branche> <base> [opt]
   fi
   for ((tour = 1; tour <= MAX_TOURS_FIN; tour++)); do
     rapport=$LOGS/$PREFIX-$nom-meca-$tour.md
-    mecanique "$nom" "$repo" "$br" "$base" "$rapport"; r=$?
+    mecanique "$nom" "$repo" "$br" "$base" "$rapport" "$tour"; r=$?
     case $r in 0) return 0 ;; 2) return 2 ;; 3) return 1 ;; esac
     [ "$tour" -lt "$MAX_TOURS_FIN" ] || break
     FIN_MODE=CORRECTION FIN_RAPPORT=$rapport FIN_TOUR=$((tour + 1)) etape "$nom-c$tour" FIN "$repo" - "$br" "$base" || return $?
@@ -655,20 +668,21 @@ EOF
   etape "$nom" FIN "$repo" - "$cible" "$REL"
 }
 
-prochaine() {
-  local ph=$1
-  grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | while read -r nom phase reste; do
+prochaine() {  # <phase> [<repo> : la file de ce dépôt seulement]
+  local ph=$1 rp=${2:-}
+  grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | while read -r nom phase repo reste; do
     [ "$phase" = "$ph" ] || continue
-    grep -qx "$nom" "$FAITES" 2>/dev/null || { echo "$nom $phase $reste"; break; }
+    [ -z "$rp" ] || [ "$repo" = "$rp" ] || continue
+    grep -qx "$nom" "$FAITES" 2>/dev/null || { echo "$nom $phase $repo $reste"; break; }
   done
 }
 
 # Déroule toutes les étapes d'une phase, dans l'ordre d'etapes.txt (relu à chaque étape, modifiable à chaud).
-phase() {
-  local ph=$1 ok=0 ko="" ligne r
-  VOIE=$ph
+phase() {  # <phase> [<repo>]
+  local ph=$1 rp=${2:-} ok=0 ko="" ligne r
+  VOIE=$ph${rp:+-$rp}
   while :; do
-    ligne=$(prochaine "$ph")
+    ligne=$(prochaine "$ph" "$rp")
     [ -z "$ligne" ] && break
     set -- $ligne
     if [ "${1#FUSION}" != "$1" ]; then fusion "$@"
@@ -681,12 +695,12 @@ phase() {
     [ "$r" -eq 2 ] || echo "$1" >>"$FAITES"
     case $r in
       0) ok=$((ok + 1)) ;;
-      2) note "##### phase $ph arrêtée à $1 (créneau ou mémoire)"; echo "$ok:$ko $1" >"$LOGS/$PREFIX-bilan-$ph"; return 2 ;;
+      2) note "##### phase $VOIE arrêtée à $1 (créneau ou mémoire)"; echo "$ok:$ko $1" >"$LOGS/$PREFIX-bilan-$VOIE"; return 2 ;;
       *) ko="$ko $1"; note "##### étape $1 en échec, la phase continue" ;;
     esac
   done
-  note "##### phase $ph terminée : $ok étapes OK, en échec :${ko:- aucune}"
-  echo "$ok:$ko" >"$LOGS/$PREFIX-bilan-$ph"
+  note "##### phase $VOIE terminée : $ok étapes OK, en échec :${ko:- aucune}"
+  echo "$ok:$ko" >"$LOGS/$PREFIX-bilan-$VOIE"
   [ -z "$ko" ]
 }
 
@@ -735,7 +749,18 @@ case $MODE in
     VOIE=
     note "##### voies terminées : A rc=$ra, B rc=$rb${avec_c:+, C rc=$rvc}"
     if [ "$ra" -eq 2 ] || [ "$rb" -eq 2 ] || [ "$rvc" -eq 2 ]; then note "##### lot arrêté avant FIN (créneau ou mémoire)"; ci_reprise; exit 1; fi
-    phase FIN; rf=$?
+    fin_repos=$(grep -vE '^[[:space:]]*(#|$)' "$ETAPES" | awk '$2 == "FIN" {print $3}' | sort -u | tr '\n' ' ')
+    if [ "$FIN_PARALLELE" = 1 ] && [ "$(wc -w <<<"$fin_repos")" -ge 2 ]; then
+      note "##### phase FIN en $(wc -w <<<"$fin_repos") files parallèles : $fin_repos(parties mécaniques une à la fois)"
+      pids=()
+      for rp in $fin_repos; do E2E_PORT=3123 phase FIN "$rp" & pids+=($!); done
+      rf=0
+      for p in "${pids[@]}"; do wait "$p"; r=$?; [ "$r" -eq 0 ] || { [ "$rf" -eq 2 ] || rf=$r; }; done
+      VOIE=
+      note "##### phase FIN terminée (files parallèles), rc=$rf"
+    else
+      phase FIN; rf=$?
+    fi
     VOIE=
     balayer_cartes
     if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rvc" -eq 0 ] && [ "$rf" -eq 0 ]; then

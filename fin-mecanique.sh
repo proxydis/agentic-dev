@@ -11,6 +11,11 @@
 #   <nom> [apres=<nom>] [sortie2=non-joue] | <commande shell>
 #   apres=<nom>        sautée si la commande <nom> est rouge ou sautée (e2e après build)
 #   sortie2=non-joue   une sortie 2 veut dire « n'a pas pu tourner », pas rouge (vérification qui dépend d'un service)
+#   long               commande longue (suite complète, e2e) : avec MECA_ALLEGE=1, elle n'est pas rejouée si elle était
+#                      verte au passage précédent, sur une tête ancêtre de la tête actuelle
+# Passage allégé (MECA_ALLEGE=1, posé par run-lot.sh après une passe de correction) : tout est rejoué sauf les
+# commandes `long` déjà vertes, que la CI de fin de lot rejoue de toute façon. L'état de chaque passage est écrit dans
+# <dossier des journaux>/etat.tsv (nom, état, tête).
 # Variables offertes aux commandes : $W (workers), $J (dossier des journaux), $T (dossier temporaire du passage, hors
 # de /tmp et hors de tout dépôt git, effacé à la fin), $BASE, $E2E_PORT, $VERIF (VERIF_FIN de run-lot.sh).
 #
@@ -55,18 +60,28 @@ if [ "${libre:-0}" -lt "${MECA_DISQUE_MIO:-8192}" ]; then
 fi
 export W J T BASE E2E_PORT VERIF
 
-declare -A ETAT=()
-lignes=() rouges=() n=0
+TETE=$(git rev-parse HEAD 2>/dev/null)
+declare -A ETAT=() SHA=() AVANT=() AVANT_SHA=()
+if [ "${MECA_ALLEGE:-}" = 1 ] && [ -f "$J/etat.tsv" ]; then
+  while IFS=$'\t' read -r a b c; do [ -n "$a" ] && { AVANT[$a]=$b; AVANT_SHA[$a]=$c; }; done <"$J/etat.tsv"
+fi
+lignes=() rouges=() noms=() repris=0 n=0
 while IFS= read -r ligne || [ -n "$ligne" ]; do
   case $ligne in ''|'#'*) continue ;; esac
   tete=${ligne%%|*}; cmd=${ligne#*|}; cmd=${cmd# }
   [ "$tete" = "$ligne" ] && continue  # pas de « | » : ligne ignorée
   read -r nom opts <<<"$tete"
-  apres=""; sortie2=""
+  apres=""; sortie2=""; long=""
   for o in $opts; do
-    case $o in apres=*) apres=${o#apres=} ;; sortie2=non-joue) sortie2=1 ;; esac
+    case $o in apres=*) apres=${o#apres=} ;; sortie2=non-joue) sortie2=1 ;; long) long=1 ;; esac
   done
-  n=$((n + 1))
+  n=$((n + 1)); noms+=("$nom"); SHA[$nom]=$TETE
+  if [ -n "$long" ] && [ "${MECA_ALLEGE:-}" = 1 ] && [ "${AVANT[$nom]:-}" = ok ] && [ -n "${AVANT_SHA[$nom]:-}" ] \
+     && git merge-base --is-ancestor "${AVANT_SHA[$nom]}" HEAD 2>/dev/null; then
+    ETAT[$nom]=ok; SHA[$nom]=${AVANT_SHA[$nom]}; repris=$((repris + 1))
+    lignes+=("- repris  **$nom** : vert au passage précédent (tête ${AVANT_SHA[$nom]:0:8}), pas rejoué : la correction ne visait que du rouge, la CI de fin de lot le rejoue")
+    continue
+  fi
   if [ -n "$apres" ] && [ "${ETAT[$apres]:-ok}" != ok ]; then
     ETAT[$nom]=saute
     lignes+=("- sautée  **$nom** : dépend de \`$apres\`, qui n'est pas vert")
@@ -93,9 +108,11 @@ done <"$LISTE"
 rm -rf "$T"  # dossiers temporaires de ce passage
 
 [ "$n" -gt 0 ] || { echo "fin-mecanique : aucune commande dans $LISTE" >&2; exit 2; }
+for nom in "${noms[@]}"; do printf '%s\t%s\t%s\n' "$nom" "${ETAT[$nom]}" "${SHA[$nom]}"; done >"$J/etat.tsv"
 echo "## Partie mécanique de la fin de lot : $APP, tête $(git rev-parse --short HEAD 2>/dev/null) ($(git rev-parse --abbrev-ref HEAD 2>/dev/null)), $(date '+%d/%m %H:%M')"
 echo
-if [ ${#rouges[@]} -eq 0 ]; then echo "Verdict : **VERT** ($n commandes)."; else echo "Verdict : **ROUGE**, ${#rouges[@]} commande(s) sur $n : ${rouges[*]}."; fi
+dont=""; [ "$repris" -gt 0 ] && dont=", dont $repris verte(s) au passage précédent et non rejouée(s)"
+if [ ${#rouges[@]} -eq 0 ]; then echo "Verdict : **VERT** ($n commandes$dont)."; else echo "Verdict : **ROUGE**, ${#rouges[@]} commande(s) sur $n : ${rouges[*]}."; fi
 echo
 echo "Jouées par le lanceur, sans Claude, dans \`$DEPOT\`, avec $W workers (\`W=$W\`, \`J=$J\`, \`T=$T\`, \`BASE=$BASE\`, \`E2E_PORT=$E2E_PORT\`) :"
 echo

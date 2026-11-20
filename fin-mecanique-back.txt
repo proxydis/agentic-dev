@@ -4,6 +4,6 @@
 ruff        | .venv/bin/ruff check .
 mypy        | .venv/bin/mypy .
 # Suite complète. Dossiers temporaires dans $T (hors de /tmp et de tout dépôt git), effacés après chaque test.
-tests       | TMPDIR=$T/tmp .venv/bin/pytest -n $W -p no:cacheprovider -q --basetemp $T/pt -o tmp_path_retention_policy=none
+tests long  | TMPDIR=$T/tmp .venv/bin/pytest -n $W -p no:cacheprovider -q --basetemp $T/pt -o tmp_path_retention_policy=none
 # Vérification avant poussée (VERIF_FIN de run-lot.sh), si elle est réglée ; sortie 2 : n'a pas pu tourner.
 verif sortie2=non-joue | if [ -n "$VERIF" ]; then $VERIF "$PWD" $BASE; else exit 2; fi

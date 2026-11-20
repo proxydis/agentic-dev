@@ -229,6 +229,14 @@ systemd-run --user --unit dev-100-impl --property=MemoryHigh=6G --property=Memor
   fix pass that receives the report, and the script again, `MAX_TOURS_FIN` times at most. The full suite thus runs
   only once when everything is green, and a Claude pass no longer keeps hours of commands to itself. With `MECA` empty,
   the FIN pass runs the suite itself, as before.
+- **Lighter pass after a fix**: a command marked `long` in `fin-mecanique-<app>.txt` (full suite, e2e) is not replayed
+  after a fix pass if it was green on the previous pass, on a head that is an ancestor of the current one; every other
+  command is. The end-of-batch CI replays it anyway. A single red unit test no longer re-runs a quarter hour of e2e
+  that were already green.
+- **Two FIN queues**: the FIN phase follows one queue per repository (merges, cards and the back's end on one side, the
+  front's end on the other), in `etapes.txt` order within each queue. The Claude passes of both queues overlap; the
+  mechanical parts run one at a time (batch lock), so that one app's full suite and the other's e2e never run
+  together. `FIN_PARALLELE=0` in `lot.conf` when a FIN step of one repository must wait for the other.
 - **Review of a rework**: the end-of-application review reads the whole batch diff the first time, and only the
   rework's diff (`git diff <head before>..HEAD`) when the batch is a rework. In a `cycle-lot` cycle, the head before is
   recorded on its own at the first launch of a `PREFIX` while the cycle is in rework; otherwise give it in `lot.conf`

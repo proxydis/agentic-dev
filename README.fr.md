@@ -231,6 +231,14 @@ systemd-run --user --unit dev-100-impl --property=MemoryHigh=6G --property=Memor
   release ; puis, seulement s'il y a du rouge, une passe de correction qui reçoit le rapport, et de nouveau le script,
   `MAX_TOURS_FIN` fois au plus. La suite complète ne tourne ainsi qu'une fois quand tout est vert, et une passe Claude
   ne garde plus pour elle des heures de commandes. Avec `MECA` vide, la passe FIN lance elle-même la suite, comme avant.
+- **Passage allégé après une correction** : une commande marquée `long` dans `fin-mecanique-<app>.txt` (suite complète,
+  e2e) n'est pas rejouée après une passe de correction si elle était verte au passage précédent, sur une tête ancêtre
+  de la tête actuelle ; toutes les autres le sont. La CI de fin de lot la rejoue de toute façon. Un seul test unitaire
+  rouge ne relance plus un quart d'heure d'e2e déjà verts.
+- **Deux files en FIN** : la phase FIN suit une file par dépôt (fusions, cartes et fin du back d'un côté, fin du front
+  de l'autre), dans l'ordre d'`etapes.txt` au sein de chaque file. Les passes Claude des deux files se chevauchent ;
+  les parties mécaniques passent une à la fois (verrou du lot), pour ne pas jouer la suite complète d'une appli et les
+  e2e de l'autre en même temps. `FIN_PARALLELE=0` dans `lot.conf` quand une étape FIN d'un dépôt doit attendre l'autre.
 - **Relecture d'une reprise** : la relecture de fin d'application lit le diff complet du lot la première fois, et
   seulement le diff de la reprise (`git diff <tête d'avant>..HEAD`) quand le lot est une reprise. Dans un cycle
   `cycle-lot`, la tête d'avant est notée toute seule au premier lancement d'un `PREFIX` quand le cycle est en

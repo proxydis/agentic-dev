@@ -72,7 +72,7 @@ export RUN_LOT_CONFIG="$T/run-lot.conf" GH_ETAT="$T/gh.json" TRELLO_ETAT="$T/tre
 # partie mécanique du back : rouge tant que corrige.txt manque (le faux claude le crée en lisant le rapport)
 cat >"$T/lot/fin-mecanique-back.txt" <<'EOC'
 # liste de l'essai
-fichiers | test -f A1.txt && test -f C1.txt && test -f R3.txt && [ "$W" = 4 ]
+fichiers long | test -f A1.txt && test -f C1.txt && test -f R3.txt && [ "$W" = 4 ]
 correction | test -f corrige.txt || { echo "Pour passer au vert : ajoute le fichier corrige.txt. Base : release/1.0.0."; exit 1; }
 suite apres=correction | true
 verif sortie2=non-joue | exit 2
@@ -128,6 +128,12 @@ verifier 'grep -q "Passe de fin, correction" "$T/logs/essai-100-FINB-c1.prompt.m
 verifier 'grep -qF "sautée  **suite**" "$T/logs/essai-100-FINB-meca-1.md" && grep -qF "non joué **verif**" "$T/logs/essai-100-FINB-meca-1.md"' \
   "rapport : commande dépendante sautée, sortie 2 comptée non jouée"
 verifier 'grep -q "OK étape FINB : partie mécanique verte" "$CHAINE"' "partie mécanique du back : verte après la correction"
+verifier 'grep -qF "repris  **fichiers**" "$T/logs/essai-100-FINB-meca-2.md" && grep -qF "ok      **correction**" "$T/logs/essai-100-FINB-meca-2.md" && ! grep -qF "repris" "$T/logs/essai-100-FINB-meca-1.md"' \
+  "passage allégé après correction : commande longue verte reprise, la rouge rejouée (piste A)"
+verifier 'grep -q "phase FIN en 2 files parallèles" "$CHAINE" && grep -q "\[voie FIN-back\]" "$CHAINE" && grep -q "\[voie FIN-front\]" "$CHAINE"' \
+  "phase FIN en deux files, une par dépôt (piste B)"
+verifier '[ "$(grep -c "=== étape FIN.*partie mécanique sans Claude" "$CHAINE")" -ge 3 ] && python3 -I "$ICI/meca-sequentielles.py" "$CHAINE"' \
+  "parties mécaniques jamais simultanées entre les deux files"
 verifier '[ -n "$(git -C "$T/back" ls-tree -r --name-only origin/feat/1.0.0-lot | grep -x corrige.txt)" ]' "correction poussée sur la branche du lot"
 verifier 'grep -q "pas de step-FINF.md" "$CHAINE" && grep -q "OK étape FINF : partie mécanique verte" "$CHAINE" && [ ! -e "$T/logs/essai-100-FINF.prompt.md" ]' \
   "FINF sans step et verte : aucune passe Claude"
