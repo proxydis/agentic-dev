@@ -47,8 +47,23 @@ verifier '[ $? -eq 1 ]' "sortie 1"
 verifier 'grep -q "ÉCHEC passe step-REEL-front.md : rc=3" "$T/lot/logs/reel-chain.log"' "échec écrit dans le log de chaîne"
 verifier 'grep -q "Section back" "$T/preuves.md" && ! grep -q "Section front" "$T/preuves.md"' "section de la passe réussie ajoutée seule"
 
-echo "3. aucune consigne : refusé"
+echo "3. consigne sans suffixe à côté du fichier des preuves reel.md : preuves intactes"
 rm "$T/lot"/step-REEL-*.md
+echo "unique" >"$T/lot/step-REEL.md"
+printf '# Preuves r1 à r5\nligne précieuse\n' >"$T/lot/reel.md"
+bash "$RACINE/run-reel.sh" "$T/lot" "$T/lot/reel.md" >/dev/null 2>&1
+verifier '[ $? -eq 0 ] && grep -q "ligne précieuse" "$T/lot/reel.md" && grep -q "Section unique" "$T/lot/reel.md"' \
+  "fichier des preuves gardé, section ajoutée"
+verifier '[ -s "$T/lot/reel-sections/reel.md" ]' "section écrite dans reel-sections/"
+SECTIONS_LIEN=$T/lot/reel-sections
+rm -rf "$SECTIONS_LIEN"; mkdir -p "$T/autre"; ln -s "$T/autre" "$SECTIONS_LIEN"; echo "# Preuves" >"$T/autre/reel.md"
+bash "$RACINE/run-reel.sh" "$T/lot" "$T/autre/reel.md" >/dev/null 2>&1
+verifier '[ $? -eq 1 ] && grep -q "aurait le chemin du fichier des preuves" "$T/lot/logs/reel-chain.log" && grep -q "^# Preuves" "$T/autre/reel.md"' \
+  "section au chemin du fichier des preuves : refusé, rien effacé"
+rm -f "$SECTIONS_LIEN"
+
+echo "4. aucune consigne : refusé"
+rm -f "$T/lot"/step-REEL*.md
 bash "$RACINE/run-reel.sh" "$T/lot" >/dev/null 2>&1
 verifier '[ $? -eq 1 ] && grep -q "ABANDON : aucune consigne" "$T/lot/logs/reel-chain.log"' "sortie 1, abandon écrit"
 

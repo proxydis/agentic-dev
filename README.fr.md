@@ -74,7 +74,7 @@ voie courte en est exemptée.
 **Jouer les preuves : `run-reel.sh`.** `run-reel.sh <dossier> [<fichier des preuves>]` lance en même temps une passe
 Claude par consigne `step-REEL<suffixe>.md` du dossier (par exemple une pour les tirages réels du back, une pour les
 parcours Playwright de la preview), attend qu'elles aient toutes fini, puis ajoute leurs sections, dans l'ordre des
-noms, à la fin du fichier des preuves. Chaque passe n'écrit que sa section (`<dossier>/reel<suffixe>.md`). Le cadre
+noms, à la fin du fichier des preuves. Chaque passe n'écrit que sa section (`<dossier>/reel-sections/reel<suffixe>.md`, sous-dossier à part : le lanceur refuse de partir si une section a le chemin du fichier des preuves). Le cadre
 ajouté à chaque consigne demande de lancer en même temps les tirages indépendants. Quand un cache côté serveur
 resservirait un tirage identique, chaque tirage doit être rendu distinct par une donnée d'entrée sans effet sur le
 critère joué (une heure de départ décalée de quelques minutes), au lieu d'attendre l'expiration du cache : trois

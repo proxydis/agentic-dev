@@ -5,7 +5,8 @@
 #
 # <dossier> contient une ou plusieurs consignes step-REEL<suffixe>.md (par exemple step-REEL-back.md pour les tirages
 # réels du back, step-REEL-front.md pour les parcours Playwright de la preview). Chaque consigne est une passe Claude,
-# et toutes partent en même temps. Chaque passe écrit sa section dans <dossier>/reel<suffixe>.md, et elle seule :
+# et toutes partent en même temps. Chaque passe écrit sa section dans <dossier>/reel-sections/reel<suffixe>.md, et
+# elle seule (sous-dossier à part : une section n'a jamais le chemin d'un fichier des preuves du dossier) :
 # deux passes qui ajoutent au même fichier en même temps se marchent dessus. Quand toutes sont finies, les sections
 # sont ajoutées, dans l'ordre des noms, à la fin du <fichier des preuves> s'il est donné (celui de `cycle-lot passe
 # --reel`). Sortie 0 si toutes les passes ont réussi et écrit leur section, 1 sinon.
@@ -27,6 +28,9 @@ note() { echo "$(date -Is) $*" | tee -a "$CHAIN"; }
 mapfile -t consignes < <(find "$DOSSIER" -maxdepth 1 -name 'step-REEL*.md' | sort)
 [ ${#consignes[@]} -gt 0 ] || { note "ABANDON : aucune consigne step-REEL*.md dans $DOSSIER"; exit 1; }
 [ -z "$PREUVES" ] || [ -f "$PREUVES" ] || { note "ABANDON : fichier des preuves absent ($PREUVES)"; exit 1; }
+[ -z "$PREUVES" ] || PREUVES=$(realpath "$PREUVES")
+SECTIONS=$DOSSIER/reel-sections
+mkdir -p "$SECTIONS"
 
 # Cadre ajouté à chaque consigne : il prime sur toute consigne contraire plus haut.
 cadre() {  # <section> <autres passes>
@@ -48,7 +52,11 @@ EOF
 declare -A PID=() SECTION=()
 for c in "${consignes[@]}"; do
   suf=$(basename "$c" .md); suf=${suf#step-REEL}
-  SECTION[$c]=$DOSSIER/reel$suf.md
+  SECTION[$c]=$SECTIONS/reel$suf.md
+  # garde : une section effacée puis réécrite ne doit jamais être le fichier des preuves lui-même
+  if [ -n "$PREUVES" ] && [ "$(realpath -m "${SECTION[$c]}")" = "$PREUVES" ]; then
+    note "ABANDON : la section de $(basename "$c") aurait le chemin du fichier des preuves ($PREUVES)"; exit 1
+  fi
   rm -f "${SECTION[$c]}"
   autres=$(for o in "${consignes[@]}"; do [ "$o" = "$c" ] || basename "$o"; done | tr '\n' ' ')
   log=$LOGS/reel$suf.log

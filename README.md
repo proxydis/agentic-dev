@@ -73,7 +73,7 @@ quote the file, or the reason to check against the diff; a false reason is a blo
 **Playing the evidence: `run-reel.sh`.** `run-reel.sh <folder> [<evidence file>]` starts at the same time one Claude
 pass per `step-REEL<suffix>.md` instruction in the folder (for example one for the back's real model draws, one for the
 Playwright journeys on the preview), waits for all of them, then appends their sections, in name order, to the end of
-the evidence file. Each pass only writes its own section (`<folder>/reel<suffix>.md`). The frame added to every
+the evidence file. Each pass only writes its own section (`<folder>/reel-sections/reel<suffix>.md`, a separate subfolder: the launcher refuses to start if a section has the evidence file's path). The frame added to every
 instruction asks for independent draws to run at the same time. When a server-side cache would serve an identical draw
 again, each draw must be made distinct by an input with no effect on the criterion (a departure time shifted by a few
 minutes) instead of waiting for the cache to expire: three draws 31 min apart behind a 30 min cache made a one-hour
