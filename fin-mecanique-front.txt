@@ -6,6 +6,6 @@ eslint      | pnpm exec eslint . --max-warnings=0
 tests       | pnpm exec vitest run --maxWorkers=$W
 build       | pnpm build
 # e2e après le build seulement : sautés si le build est rouge.
-e2e apres=build | E2E_PORT=$E2E_PORT pnpm run test:e2e
+e2e apres=build long | E2E_PORT=$E2E_PORT pnpm run test:e2e
 audit       | pnpm audit --prod
 verif sortie2=non-joue | if [ -n "$VERIF" ]; then $VERIF "$PWD" $BASE; else exit 2; fi
