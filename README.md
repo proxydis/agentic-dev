@@ -70,6 +70,15 @@ return to review brings its own: `--reel <file>` with the evidence replayed on t
 --motif "<why the rework touches no criterion played for real>"` (20 characters at least). The reviewer's instructions
 quote the file, or the reason to check against the diff; a false reason is a blocking point. The short lane is exempt.
 
+**Playing the evidence: `run-reel.sh`.** `run-reel.sh <folder> [<evidence file>]` starts at the same time one Claude
+pass per `step-REEL<suffix>.md` instruction in the folder (for example one for the back's real model draws, one for the
+Playwright journeys on the preview), waits for all of them, then appends their sections, in name order, to the end of
+the evidence file. Each pass only writes its own section (`<folder>/reel-sections/reel<suffix>.md`, a separate subfolder: the launcher refuses to start if a section has the evidence file's path). The frame added to every
+instruction asks for independent draws to run at the same time. When a server-side cache would serve an identical draw
+again, each draw must be made distinct by an input with no effect on the criterion (a departure time shifted by a few
+minutes) instead of waiting for the cache to expire: three draws 31 min apart behind a 30 min cache made a one-hour
+pass, almost all of it waiting. `REEL_PARTAGE` names the quotas the passes share. Test: `bash tests/essai-run-reel.sh`.
+
 **Short lane.** After the batch is merged, a fix that only touches CI, tests or documentation is recognized from its
 files (`motif_voie_courte`, which includes the scripts only CI runs, `scripts/ci/`): reviewed on its diff, with no preview deployment and no counter-review, outside the
 round-trip counter. The 3rd REWORK in a row on the short lane stops the cycle (`max_voie_courte`).
