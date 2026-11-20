@@ -71,6 +71,16 @@ retour en revue apporte les siennes : `--reel <fichier>` avec les preuves rejou�
 consigne du relecteur cite le fichier, ou le motif à vérifier contre le diff ; un motif faux est un point bloquant. La
 voie courte en est exemptée.
 
+**Jouer les preuves : `run-reel.sh`.** `run-reel.sh <dossier> [<fichier des preuves>]` lance en même temps une passe
+Claude par consigne `step-REEL<suffixe>.md` du dossier (par exemple une pour les tirages réels du back, une pour les
+parcours Playwright de la preview), attend qu'elles aient toutes fini, puis ajoute leurs sections, dans l'ordre des
+noms, à la fin du fichier des preuves. Chaque passe n'écrit que sa section (`<dossier>/reel<suffixe>.md`). Le cadre
+ajouté à chaque consigne demande de lancer en même temps les tirages indépendants. Quand un cache côté serveur
+resservirait un tirage identique, chaque tirage doit être rendu distinct par une donnée d'entrée sans effet sur le
+critère joué (une heure de départ décalée de quelques minutes), au lieu d'attendre l'expiration du cache : trois
+tirages espacés de 31 min derrière un cache de 30 min faisaient une passe d'une heure, presque toute en attente.
+`REEL_PARTAGE` cite les quotas que les passes se partagent. Essai : `bash tests/essai-run-reel.sh`.
+
 **Voie courte.** Après le merge du lot, un correctif qui ne touche que la CI, les tests ou la documentation est reconnu
 à ses fichiers (`motif_voie_courte`, qui comprend les scripts que seule la CI exécute, `scripts/ci/`) : relu sur son diff, sans déploiement de preview ni contre-relecture, hors
 compteur d'aller-retours. Le 3e À REPRENDRE de suite en voie courte arrête le cycle (`max_voie_courte`).
