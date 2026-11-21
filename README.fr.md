@@ -33,7 +33,7 @@ fichiers de configuration non versionnés.
 | 10 | Merge du lot | relecteur, relais | Le verdict À MERGER merge aussitôt chaque PR dans la release (squash, back d'abord) ; le relais pose le commit de release (CHANGELOG, version) |
 | 10b | CI de la release rouge | dev | Chaque rouge rend la main au dev avec les runs, les jobs rouges et le compteur de rouges de suite : correctif par une PR, ou relance puis `cycle-lot attendre-ci`. À partir du 3e rouge de suite, un diagnostic écrit précède toute relance |
 | 11 | Livraison | relais | Release verte : le relais ouvre les 4 PR, release vers `develop` et `master`, back et front. Le dev ne s'en charge que si une intervention de l'humain ou un réglage de déploiement d'avant livraison reste ouvert |
-| 12 | Revue de livraison | relais ou relecteur | CI verte et contenu limité au lot revu : le relais merge les 4 PR. Sinon le relecteur vérifie et merge |
+| 12 | Revue de livraison | relais ou relecteur | CI verte et contenu limité au lot revu : le relais merge les 4 PR. Sinon le relecteur vérifie et merge. Une PR de livraison en conflit avec sa base rend la main au dev, avec la résolution |
 | 13 | Mise en production | relais, puis dev | CI de `develop` et `master` (déploiement compris), puis réglages de déploiement restants (ceux qui ne se posent qu'après le déploiement), posés et prouvés par le dev, et liste des validations visuelles à faire en production |
 | 13b | Diagnostic de déploiement | dev | CI de mise en production rouge (étape `diagnostic-deploiement`) : le dev diagnostique, relance, puis `cycle-lot attendre-ci --message "<diagnostic>"` rend l'attente au relais |
 | 14 | Validation en production | relecteur | Playwright sur la production, une carte Trello par défaut, dans la version suivante, en Not Ready |
@@ -97,6 +97,20 @@ n'empêche pas la livraison. `ouvrir-livraison <v> --sans-reglages "<motif>"` pa
 outre notés au journal du lot ; le relais ne passe jamais outre. Tous les réglages, ceux d'après déploiement compris,
 doivent être marqués faits avec leur preuve (`reglage <v> --fait N --preuve …`) avant le passage aux validations en
 production, et le relecteur les vérifie en premier.
+
+**PR de livraison en conflit.** GitHub ne lance aucune CI de PR sur une PR en conflit avec sa base : le relais
+attendrait en silence, jusqu'au plafond de l'étape, un run qui ne viendra jamais. Le relais lit donc l'état de fusion
+de chaque PR de livraison pendant qu'il attend leur CI : une PR en conflit (`CONFLICTING` ; un état pas encore calculé
+n'est pas un conflit) ramène le cycle à l'étape `livraison` et réveille le dev avec la résolution, et
+`ouvrir-livraison` refuse tant qu'un conflit reste (les PR restent ouvertes). Cause habituelle : un correctif poussé
+directement sur `master` (hotfix), revenu dans `develop` par cherry-pick et non par une fusion de `master`.
+Résolution : vérifier que chaque commit de `master` absent de la release y a son équivalent (même sujet, même effet),
+puis, dans un worktree de la release, `git merge -s ours origin/master` (arbre inchangé : `git diff origin/<release>
+HEAD` vide), pousser sur la release et lancer `cycle-lot ouvrir-livraison <v>` pour rafraîchir les têtes. Si `master`
+apporte un changement absent de la release, le porter d'abord par une PR vers la release (voie courte). Le contrôle
+du contenu qui laisse le relais merger seul accepte, outre les merges du lot revu et le commit de release, les commits
+déjà sur `master` (déjà en production) et une fusion qui ne change aucun fichier (arbre de son premier parent) : une
+telle résolution n'impose pas de revue de livraison.
 
 **Rouge de CI.** Chaque rouge de la CI de la release ou de la mise en production rend la main au dev, avec le run, les
 jobs rouges et le compteur de rouges de suite (`relais.diagnostic_ci_rouges`, remis à zéro au vert de ces CI). À partir
@@ -300,7 +314,7 @@ plein donnerait de faux rouges. Chaque commande est plafonnée à `MECA_DELAI_S`
 | `passe <v> --vers <relecteur> --message … [--reel <f>\|aucun\|inchange --motif …] [--contre-relecture <f>]` | dev | Fin du dev ou d'une correction : CI verte exigée, preuves en réel à la 1re revue et de nouveau à chaque retour en revue (`--reel <f>`, ou `--reel inchange --motif "<motif>"`), contre-relecture après une correction, back du lot déployé sur la preview (si `deploiement_preview` est configuré), puis revue. Un correctif en voie courte se passe de preview et de contre-relecture |
 | `verdict <v> --merger\|--a-reprendre --rapport <f> [--bloquants N] [--non-bloquants N] [--cartes-ok …] [--cartes-ko …]` | relecteur | Fin de revue ; `--merger` merge aussitôt les PR du lot ; verdicts incohérents refusés ; arrêt automatique au 5e À REPRENDRE |
 | `merge <v> --pr back#N` | relecteur | Merge gardé : tête inchangée depuis la revue, CI verte, back avant front ; après un merge refusé au verdict, ou en revue de livraison |
-| `ouvrir-livraison <v> [--sans-reglages "<motif>"]` | dev | Les 4 PR de livraison, quand le relais n'a pas pu les ouvrir ; refusé tant qu'une intervention de l'humain ou un réglage de déploiement d'avant livraison reste à faire (`--sans-reglages` passe outre le contrôle des réglages, avec un motif gardé au journal) |
+| `ouvrir-livraison <v> [--sans-reglages "<motif>"]` | dev | Les 4 PR de livraison, quand le relais n'a pas pu les ouvrir ; refusé tant qu'une intervention de l'humain ou un réglage de déploiement d'avant livraison reste à faire (`--sans-reglages` passe outre le contrôle des réglages, avec un motif gardé au journal), ou qu'une PR de livraison est en conflit avec sa base (résolution dans le message) |
 | `attendre-ci <v> --message "<diagnostic>"` | dev ou relecteur | Après une relance, rend l'attente de la CI au relais : le relecteur en revue de livraison ; le dev après un rouge de la CI de la release (étape de correction) ou de la mise en production (`diagnostic-deploiement`). À partir du 3e rouge de suite, le diagnostic est exigé |
 | `passe <v> --vers <relecteur> --etape validation-prod --fichier <liste>` | dev | Liste des validations visuelles en production |
 | `carte-bug <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | relecteur | Carte de bug dans la version suivante (ou celle donnée, postérieure), en Not Ready |
@@ -386,7 +400,7 @@ Slack pour `cycle-lot`. Les deux dépôts suivent un flux `develop` / `release/<
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, CI rouge, panne du gateway (177 vérifications)
+python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, CI rouge, panne du gateway (180 vérifications)
 bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux : trois voies, fin de lot en
                                  # script, reprise relue sur son diff (53 vérifications, ~2 min)
 python3 -I tests/essai-garde-passe.py   # garde-passe.py : ce que le garde des passes refuse et laisse passer

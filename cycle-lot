@@ -1828,15 +1828,67 @@ def basculer_changelog(etat):
     return ("commit de release " + ", ".join(faits)) if faits else ""
 
 
+def deja_sur_master(depot, sha):
+    """Vrai si le commit est atteignable depuis master (donc déjà en production) : `compare/master...<sha>` au statut
+    `behind` ou `identical`. Faux au moindre doute (contrôle plus strict, jamais plus lâche)."""
+    try:
+        cmp = gh_json("api", f"repos/{DEPOTS[depot]}/compare/master...{sha}")
+    except RuntimeError:
+        return False
+    return (cmp or {}).get("status") in ("behind", "identical")
+
+
+def fusion_sans_changement(depot, sha):
+    """Vrai pour un commit de fusion dont l'arbre est celui de son premier parent : aucun fichier changé (intégration
+    de master dans la release par `git merge -s ours`, après vérification que master n'apporte rien). Faux au moindre
+    doute (API muette, commit simple)."""
+    try:
+        c = gh_json("api", f"repos/{DEPOTS[depot]}/git/commits/{sha}")
+        parents = (c or {}).get("parents") or []
+        if len(parents) < 2:
+            return False
+        p = gh_json("api", f"repos/{DEPOTS[depot]}/git/commits/{parents[0]['sha']}")
+        return bool(c["tree"]["sha"]) and c["tree"]["sha"] == (p or {}).get("tree", {}).get("sha")
+    except (RuntimeError, KeyError, TypeError):
+        return False
+
+
+def conflits_livraison(etat):
+    """PR de livraison en conflit avec leur base. GitHub ne lance aucune CI de PR sur une PR en conflit : sans ce
+    contrôle, le relais attend un run qui ne viendra jamais, en silence, jusqu'au plafond de l'étape. Une PR dont la
+    fusion n'est pas encore calculée (UNKNOWN) n'est pas un conflit."""
+    en_conflit = []
+    for x in etat.get("prs_livraison") or []:
+        try:
+            if vue_pr(x["depot"], x["num"]).get("mergeable") == "CONFLICTING":
+                en_conflit.append(x)
+        except RuntimeError:
+            pass
+    return en_conflit
+
+
+CONSIGNE_CONFLIT = ("Cause habituelle : un correctif poussé directement sur master (hotfix), revenu dans develop par "
+                    "cherry-pick et non par une fusion de master. Résolution : vérifier que chaque commit de master "
+                    "absent de la release y a son équivalent (même sujet, même effet), puis, dans un worktree de la "
+                    "release, `git merge -s ours origin/master` (arbre inchangé : `git diff origin/<release> HEAD` "
+                    "vide), pousser sur la release, et `cycle-lot ouvrir-livraison <v>` pour rafraîchir les têtes. Si "
+                    "master apporte un changement absent de la release, le porter d'abord par une PR vers la release "
+                    "(voie courte).")
+
+
 def controle_livraison(etat):
     """Les PR de livraison n'apportent que le lot revu si, sur chaque dépôt, les commits de la release absents de develop
-    sont tous des merges de PR du lot revues par le relecteur, ou le commit de release du relais. Rend (ok, détail)."""
+    sont tous des merges de PR du lot revues par le relecteur, le commit de release du relais, des commits déjà sur
+    master (déjà en production) ou une fusion qui ne change aucun fichier. Rend (ok, détail)."""
     revus, bascule = etat.get("commits_revus") or {}, etat.get("bascule") or {}
     for depot in sorted({x["depot"] for x in etat["prs_livraison"]}):
         cmp = gh_json("api", f"repos/{DEPOTS[depot]}/compare/develop...{etat['release']}")
         shas = [c.get("sha", "") for c in (cmp or {}).get("commits", [])]
         attendus = set(revus.get(depot, [])) | set(bascule.get(depot, []))
-        intrus = [x[:7] for x in shas if x not in attendus]
+        intrus = [x for x in shas if x not in attendus]
+        if intrus:  # ce qui est déjà sur master, ou une fusion qui ne change aucun fichier (master intégré par -s ours)
+            intrus = [x for x in intrus if not deja_sur_master(depot, x) and not fusion_sans_changement(depot, x)]
+        intrus = [x[:7] for x in intrus]
         if intrus:
             return False, (f"{depot} : {len(intrus)} commit(s) de {etat['release']} absents de develop et hors du lot revu "
                            f"({', '.join(intrus[:6])}) : revue de livraison nécessaire")
@@ -1917,6 +1969,11 @@ def ouvrir_prs_livraison(etat, sans_reglages=None, par="veille"):
     if not prs:
         raise Refus(f"{rel} n'a aucun commit d'avance sur develop ni master : rien à livrer")
     etat["prs_livraison"] = prs
+    en_conflit = conflits_livraison(etat)
+    if en_conflit:  # PR laissées ouvertes : la résolution poussée sur la release les met à jour
+        raise Refus("PR de livraison en conflit avec leur base : " + ", ".join(
+            f"{x['depot']}#{x['num']} vers {x['base']}" for x in en_conflit) + ". GitHub ne lance pas leur CI tant que "
+            "le conflit reste. " + CONSIGNE_CONFLIT)
     return prs, creees
 
 
@@ -2629,6 +2686,13 @@ def veiller_attente(etat):
             arreter(etat, "veille", "ci", f"CI du push sur {etat['release']} sans verdict après {int(duree)} min : "
                     + " ; ".join(lignes))
     elif e == "ci-livraison":
+        en_conflit = conflits_livraison(etat)
+        if en_conflit:
+            liste = ", ".join(f"{x['depot']}#{x['num']} vers {x['base']}" for x in en_conflit)
+            changer_etape(etat, "livraison", "veille", f"PR de livraison en conflit avec leur base : {liste}. GitHub "
+                          "ne lance pas leur CI tant que le conflit reste. " + CONSIGNE_CONFLIT)
+            planifier_reveil(etat, DEV, "livraison")
+            return
         master = [x for x in etat["prs_livraison"] if x["base"] == "master"]
         cibles = [(x["depot"], x["sha"], "pull_request", None) for x in master]
         verdict, lignes, par_cible = veiller_runs(etat, cibles, [REQUIS_MASTER[x["depot"]] for x in master])

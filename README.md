@@ -34,7 +34,7 @@ The scripts, their messages and the prompts they build are in French.
 | 10 | Batch merge | reviewer, relay | The MERGE verdict immediately merges each PR into the release (squash, back first); the relay adds the release commit (CHANGELOG, version) |
 | 10b | Red release CI | dev | Each red hands over to the dev with the runs, the red jobs and the count of reds in a row: a fix through a PR, or a re-run then `cycle-lot attendre-ci`. From the 3rd red in a row, a written diagnosis comes before any re-run |
 | 11 | Delivery | relay | Green release: the relay opens the 4 PRs, release into `develop` and `master`, back and front. The dev only steps in while a human action or a pre-delivery deployment setting is still pending |
-| 12 | Delivery review | relay or reviewer | Green CI and content limited to the reviewed batch: the relay merges the 4 PRs. Otherwise the reviewer checks and merges |
+| 12 | Delivery review | relay or reviewer | Green CI and content limited to the reviewed batch: the relay merges the 4 PRs. Otherwise the reviewer checks and merges. A delivery PR in conflict with its base hands over to the dev, with the resolution |
 | 13 | Production | relay, then dev | CI of `develop` and `master` (deployment included), then the remaining deployment settings (those that can only be set after the deployment), set and proven by the dev, and the list of visual checks to run in production |
 | 13b | Deployment diagnosis | dev | Red production CI (step `diagnostic-deploiement`): the dev diagnoses, re-runs, then `cycle-lot attendre-ci --message "<diagnosis>"` hands the wait back to the relay |
 | 14 | Production checks | reviewer | Playwright on production, one Trello card per defect, in the next version, in Not Ready |
@@ -95,6 +95,19 @@ the delivery. `ouvrir-livraison <v> --sans-reglages "<reason>"` overrides the ch
 settings in the batch log; the relay never overrides it. Every setting, after deployment ones included, must be marked
 done with its proof (`reglage <v> --fait N --preuve …`) before the handover to production checks, and the reviewer
 checks them first.
+
+**Delivery PRs in conflict.** GitHub starts no PR CI on a PR in conflict with its base: the relay would wait for a run
+that never comes, in silence, up to the step's cap. So the relay checks each delivery PR's merge state while it waits
+for their CI: one in conflict (`CONFLICTING`; a state not computed yet is not a conflict) sends the cycle back to the
+`livraison` step and wakes the dev with the resolution, and `ouvrir-livraison` refuses while a conflict remains (the
+PRs stay open). Usual cause: a fix pushed straight to `master` (hotfix) that came back to `develop` by cherry-pick
+rather than by a merge of `master`. Resolution: check that each `master` commit missing from the release has its
+equivalent there (same subject, same effect), then, in a worktree of the release, `git merge -s ours origin/master`
+(tree unchanged: `git diff origin/<release> HEAD` is empty), push to the release and run `cycle-lot ouvrir-livraison
+<v>` to refresh the heads. If `master` brings a change missing from the release, port it first through a PR into the
+release (short lane). The content check that lets the relay merge on its own accepts, besides the reviewed batch's
+merges and the release commit, the commits already on `master` (already in production) and a merge commit that
+changes no file (the tree of its first parent): such a resolution does not force a delivery review.
 
 **Red CI.** Each red of the release CI or of the production CI hands over to the dev, with the run, the red jobs and
 the count of reds in a row (`relais.diagnostic_ci_rouges`, reset to zero when these CIs turn green). From the 3rd red
@@ -296,7 +309,7 @@ a Python back and a Node front: [`fin-mecanique-back.txt`](fin-mecanique-back.tx
 | `passe <v> --vers <reviewer> --message … [--reel <f>\|aucun\|inchange --motif …] [--contre-relecture <f>]` | dev | End of development or rework: green CI required, real-world evidence at the first review and again at each return to review (`--reel <f>`, or `--reel inchange --motif "<reason>"`), counter-review after a rework, batch back end deployed to preview (when `deploiement_preview` is configured), then review. A short-lane fix skips the preview and the counter-review |
 | `verdict <v> --merger\|--a-reprendre --rapport <f> [--bloquants N] [--non-bloquants N] [--cartes-ok …] [--cartes-ko …]` | reviewer | End of review; `--merger` immediately merges the batch PRs; inconsistent verdicts refused; automatic stop at the 5th REWORK |
 | `merge <v> --pr back#N` | reviewer | Guarded merge: head unchanged since the review, green CI, back before front; after a merge refused at the verdict, or in delivery review |
-| `ouvrir-livraison <v> [--sans-reglages "<reason>"]` | dev | The 4 delivery PRs, when the relay could not open them; refused while a human action or a pre-delivery deployment setting is still pending (`--sans-reglages` overrides the settings check, with a reason kept in the log) |
+| `ouvrir-livraison <v> [--sans-reglages "<reason>"]` | dev | The 4 delivery PRs, when the relay could not open them; refused while a human action or a pre-delivery deployment setting is still pending (`--sans-reglages` overrides the settings check, with a reason kept in the log), or while a delivery PR is in conflict with its base (resolution in the message) |
 | `attendre-ci <v> --message "<diagnosis>"` | dev or reviewer | After a re-run, hands the CI wait back to the relay: reviewer in delivery review; dev after a red release CI (rework step) or a red production CI (`diagnostic-deploiement`). From the 3rd red in a row, the diagnosis is required |
 | `passe <v> --vers <reviewer> --etape validation-prod --fichier <list>` | dev | List of visual checks in production |
 | `carte-bug <v> --titre … --appli … --gravite … --description-fichier … [--version-cible <v>]` | reviewer | Bug card in the next version (or the given later one), in Not Ready |
@@ -382,7 +395,7 @@ Linux with user-mode systemd (cgroups v2), Python 3.11 or later (standard librar
 ## Tests
 
 ```
-python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, red CI, gateway outage (177 checks)
+python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, red CI, gateway outage (180 checks)
 bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories: three lanes, end of batch in
                                  # script, rework reviewed on its diff (53 checks, ~2 min)
 python3 -I tests/essai-garde-passe.py   # garde-passe.py: what the pass guard refuses and lets through

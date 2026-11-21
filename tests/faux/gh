@@ -133,7 +133,8 @@ def main():
                 if "--jq" in a:
                     print(m["compare"][d].get(cle, 0))
                 else:
-                    print(json.dumps({"ahead_by": m["compare"][d].get(cle, 0), "commits": [
+                    print(json.dumps({"ahead_by": m["compare"][d].get(cle, 0),
+                                      "status": m.get("compare_status", {}).get(d, {}).get(cle), "commits": [
                         {"sha": x} for x in m.get("compare_commits", {}).get(d, {}).get(cle, [])]}))
             elif "/contents/" in chemin:
                 fichier, _, ref = chemin.split("/contents/")[1].partition("?ref=")
@@ -169,7 +170,8 @@ def main():
                 m["commits_api"][n] = corps
                 print(json.dumps({"sha": n}))
             elif "/git/commits/" in chemin:
-                print(json.dumps({"tree": {"sha": "arbre-de-" + chemin.rsplit("/", 1)[1]}}))
+                sha = chemin.rsplit("/", 1)[1]
+                print(json.dumps(m.get("commits_git", {}).get(sha) or {"tree": {"sha": "arbre-de-" + sha}}))
             elif "/git/refs/heads/" in chemin and methode == "PATCH":
                 branche = chemin.split("/git/refs/heads/")[1]
                 c = m["commits_api"][corps["sha"]]
