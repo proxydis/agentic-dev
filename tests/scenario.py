@@ -447,10 +447,27 @@ e = etat()
 verifier(len(e["prs_livraison"]) == 4 and e["etape"] == "ci-livraison", "4 PR de livraison, le relais attend leur CI")
 lancer("veille")
 verifier(etat()["etape"] == "ci-livraison", "CI des PR vers master pas encore lancée : on attend")
+lpr0 = {(p["depot"], p["base"]): str(p["num"]) for p in etat()["prs_livraison"]}
+monde(lambda m: m["prs"]["back"][lpr0[("back", "master")]].update(mergeable="CONFLICTING"))
+nr = len(monde().get("reveils", []))
+lancer("veille")
+verifier(etat()["etape"] == "livraison" and len(monde().get("reveils", [])) == nr + 1
+         and "en conflit" in derniers_reveils()[0]["message"],
+         "PR vers master en conflit (aucune CI ne partira) : pas d'attente muette, dev réveillé avec la résolution")
+out = lancer("ouvrir-livraison", "1.0.0", par="dev", attendu=2)
+verifier("en conflit" in out and etat()["etape"] == "livraison", "ouvrir-livraison refusé tant que le conflit reste")
+monde(lambda m: m["prs"]["back"][lpr0[("back", "master")]].update(mergeable="MERGEABLE"))
+lancer("ouvrir-livraison", "1.0.0", par="dev")
+verifier(etat()["etape"] == "ci-livraison", "conflit résolu : PR de livraison rouvertes, le relais attend leur CI")
 
 
 def ci_master(m):
-    m["compare_commits"] = {"back": {"develop...release/1.0.0": [m["refs"]["back"]["release/1.0.0"], "intrus".ljust(40, "0")]}}
+    sur_master, ours, parent = "surmaster".ljust(40, "0"), "fusionours".ljust(40, "0"), "parentrel".ljust(40, "0")
+    m["compare_commits"] = {"back": {"develop...release/1.0.0": [m["refs"]["back"]["release/1.0.0"], "intrus".ljust(40, "0"),
+                                                                 sur_master, ours]}}
+    m["compare_status"] = {"back": {f"master...{sur_master}": "behind"}}
+    m["commits_git"] = {ours: {"tree": {"sha": "arbreA"}, "parents": [{"sha": parent}, {"sha": sur_master}]},
+                        parent: {"tree": {"sha": "arbreA"}, "parents": [{"sha": "x"}]}}
     for d in ("back", "front"):
         m["runs"][d].append(run(d, 60, m["refs"][d]["release/1.0.0"], "pull_request", "release/1.0.0",
                                 jobs={"quality": "success", "integration": "success", "e2e": "success",
@@ -460,8 +477,9 @@ def ci_master(m):
 monde(ci_master)
 lancer("veille")
 verifier(etat()["etape"] == "revue-livraison" and derniers_reveils()[0]["accountId"] == "relecteur"
-         and "hors du lot revu" in derniers_reveils()[0]["message"],
-         "commit étranger au lot dans la release : pas de merge automatique, relecteur réveillé pour la revue de livraison")
+         and "hors du lot revu" in derniers_reveils()[0]["message"] and "1 commit(s)" in derniers_reveils()[0]["message"],
+         "commit étranger au lot dans la release : pas de merge automatique, relecteur réveillé pour la revue de livraison "
+         "(commit déjà sur master et fusion sans changement de fichier non comptés)")
 lpr = {(p["depot"], p["base"]): p["num"] for p in etat()["prs_livraison"]}
 lancer("merge", "1.0.0", "--pr", f"front#{lpr[('front', 'develop')]}", par="relecteur", attendu=2)
 for cle in (("back", "develop"), ("back", "master"), ("front", "develop"), ("front", "master")):

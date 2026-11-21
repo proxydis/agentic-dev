@@ -30,6 +30,7 @@ chmod +x "$T/bin/claude" "$T/bin/gh" "$T/bin/curl"
 # le lanceur et le script de fin sont copiés : leurs créneaux (slots/) restent dans le dossier de l'essai
 cp "${RUN_LOT_ESSAI:-$RACINE/run-lot.sh}" "$T/run-lot.sh"
 cp "$RACINE/fin-mecanique.sh" "$T/fin-mecanique.sh"; chmod +x "$T/fin-mecanique.sh"
+cp "$RACINE/garde-passe.py" "$T/garde-passe.py"
 cat >"$T/run-lot.conf" <<EOF
 PATH_LOT="$T/bin:/usr/local/bin:/usr/bin:/bin"
 SEUIL_MIO=1
@@ -151,6 +152,10 @@ verifier '[ "$(cat "$T/trello/k4")" = b2b2 ]' "Trello : carte de la voie C en Wa
 verifier 'grep -q "ci-en-pause" "$GH_ETAT"' "étiquette bien posée à un moment"
 verifier 'grep -q "celle qu.utilise le relecteur" "$T/logs/essai-100-FINB.prompt.md"' "grille de revue citée dans le cadre de la relecture"
 verifier '! grep -q "Avant chaque poussée, lance" "$T/logs/essai-100-A1.prompt.md"' "sans VERIF : aucune vérification demandée"
+verifier 'grep -qF "$T/garde-passe.py" "$T/logs/essai-100-A1.log" && grep -qF "$T/garde-passe.py" "$T/logs/essai-100-FINB.log"' \
+  "garde des passes posé sur une passe de voie et sur la relecture de FIN"
+verifier '! grep -q "^garde : " "$T/logs/essai-100-FINB-c1.log" && grep -q "jamais par motif" "$T/logs/essai-100-FINB.prompt.md"' \
+  "pas de garde sur la passe de correction ; cadre de la relecture : fichiers nommés un par un"
 verifier 'awk "/Trello : carte 3 \\(k3\\) en Waiting for review/ {t = NR} /phase FIN terminée/ {f = NR} END {exit !(t && t < f)}" "$CHAINE"' \
   "carte de FIN déplacée dès la fin de sa passe, avant le balayage final"
 
@@ -176,6 +181,7 @@ verifier 'grep -qF "git diff $AVANT..HEAD" "$T/logs/essai-100r1-FINB.prompt.md" 
 verifier 'grep -q "avec au plus 4 workers" "$T/logs/essai-100r1-FINB.prompt.md" && ! grep -q "partie mécanique" "$CHAINE_R"' \
   "sans script (MECA vide) : la passe FIN lance la suite, à 4 workers"
 verifier 'grep -q "Au plus 4 workers" "$T/logs/essai-100r1-RA.prompt.md"' "deux voies : 4 workers par voie"
+verifier '! grep -q "^garde : " "$T/logs/essai-100r1-FINB.log"' "sans script, la passe FIN lance la suite : pas de garde"
 verifier 'grep -q "##### essai-100r1 terminé : A rc=0, B rc=0, FIN rc=0, CI rc=0" "$CHAINE_R"' "ligne de fin de la reprise, sans voie C"
 
 echo
