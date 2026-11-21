@@ -53,6 +53,12 @@ CYCLES=${CYCLES:-$HERE/cycles}
 REPRISE_DEPUIS_BACK=${REPRISE_DEPUIS_BACK:-}
 REPRISE_DEPUIS_FRONT=${REPRISE_DEPUIS_FRONT:-}
 CLAUDE=${CLAUDE:-claude}
+# Garde des passes de voie et de relecture de FIN (hook PreToolUse de Claude Code, garde-passe.py) : refuse les suites
+# larges de tests (sans fichier, par motif, sur un dossier, sur plus de GARDE_MAX_FICHIERS fichiers) et toute tâche de
+# fond. La passe de correction n'a pas le garde (elle rejoue les commandes rouges du rapport). GARDE_PASSE=0 l'ôte.
+GARDE_PASSE=${GARDE_PASSE:-1}
+export GARDE_MAX_FICHIERS=${GARDE_MAX_FICHIERS:-25}
+GARDE_SETTINGS='{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python3 \"'"$HERE"'/garde-passe.py\""}]}]}}'
 export PATH="${PATH_LOT:-$PATH}"
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
 mkdir -p "$LOGS"
@@ -470,6 +476,9 @@ lanceur les joue lui-même, en script, juste après elle, sur la tête que tu au
 que s'il y a du rouge, avec son rapport. Si l'étape te les demande plus haut, ne les lance pas : c'est fait après toi.
 Dans cette passe : uniquement les tests ciblés de ce que tu modifies (fichiers de test des modules touchés, et ceux
 qui les importent), au plus $workers workers (\`-n $workers\` pour pytest, \`--maxWorkers=$workers\` pour vitest).
+Ces fichiers se nomment un par un (au plus $GARDE_MAX_FICHIERS), jamais par motif (\`test_calcul*.py\`) ni par dossier :
+un garde du lanceur refuse ces commandes, comme toute commande ou tâche en arrière-plan. Les mutants manuels se jouent
+contre le seul fichier de test de ta passe et ceux du module muté, jamais contre une suite large.
 
 $(relecture "$repo")
 
@@ -520,9 +529,9 @@ claude_passe() {
     cd "$dir" || exit 1
     echo "=== début $(date -Is) essai $essai, branche $(git rev-parse --abbrev-ref HEAD) ==="
     if [ "$essai" -eq 1 ]; then
-      $CLAUDE --permission-mode bypassPermissions --print <"$prompt"
+      $CLAUDE --permission-mode bypassPermissions ${GARDE:+--settings "$GARDE_SETTINGS"} --print <"$prompt"
     else
-      $CLAUDE --permission-mode bypassPermissions --print <<<"$(cat "$prompt"; echo; echo "Reprise : une passe précédente sur cette même étape s'est interrompue (essai $((essai - 1))). Relis la branche et la PR, reprends là où elle s'est arrêtée, ne refais pas ce qui est déjà poussé.")"
+      $CLAUDE --permission-mode bypassPermissions ${GARDE:+--settings "$GARDE_SETTINGS"} --print <<<"$(cat "$prompt"; echo; echo "Reprise : une passe précédente sur cette même étape s'est interrompue (essai $((essai - 1))). Relis la branche et la PR, reprends là où elle s'est arrêtée, ne refais pas ce qui est déjà poussé.")"
     fi
     rc=$?
     echo; echo "=== fin $(date -Is) rc=$rc ==="
@@ -543,6 +552,8 @@ etape() {
     FIN) if [ -n "${FIN_MODE:-}" ]; then mode=$FIN_MODE
          elif meca_active && fin_appli_suit "$repo" "$nom"; then mode=VOIE; fi ;;
   esac
+  local garde=
+  case $mode in VOIE|RELECTURE) [ "$GARDE_PASSE" = 1 ] && garde=1 ;; esac
   common=$LOT/common-$repo.md
   [ "${nom#FIN}" != "$nom" ] && common="$LOT/common-back.md $LOT/common-front.md"
   [ -f "$LOT/common-${br##*-}.md" ] && common="$common $LOT/common-${br##*-}.md"
@@ -565,7 +576,7 @@ etape() {
     if ! git_seul "$repo" preparer "$dir" "$nom" "$br" "$base" >>"$CHAIN" 2>&1; then note "ÉCHEC préparation $nom"; rendre_creneau; return 1; fi
     note "=== étape $nom : run Claude Code, créneau $CRENEAU, $workers workers (log $log)"
     local t0=$SECONDS
-    claude_passe "$dir" "$prompt" "$log" "$essai"; rc=$?
+    GARDE=$garde claude_passe "$dir" "$prompt" "$log" "$essai"; rc=$?
     local duree=$((SECONDS - t0)) loc dist
     cd "$dir" && git_seul "$repo" git fetch -q origin
     loc=$(git rev-parse "refs/heads/$br" 2>/dev/null); dist=$(git rev-parse "refs/remotes/origin/$br" 2>/dev/null)

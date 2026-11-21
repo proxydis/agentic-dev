@@ -238,6 +238,16 @@ systemd-run --user --unit dev-100-impl --property=MemoryHigh=6G --property=Memor
   fix pass that receives the report, and the script again, `MAX_TOURS_FIN` times at most. The full suite thus runs
   only once when everything is green, and a Claude pass no longer keeps hours of commands to itself. With `MECA` empty,
   the FIN pass runs the suite itself, as before.
+- **Pass guard**: lane passes and the end-of-batch review pass run with a Claude Code `PreToolUse` hook,
+  [`garde-passe.py`](garde-passe.py) (passed with `--settings`). It refuses, before they start, any wide test run
+  (pytest or vitest with no file, i.e. the whole suite, with a glob, on a directory, or on more than
+  `GARDE_MAX_FICHIERS` files, 25 by default) and any background work (Bash `run_in_background`, Task, Agent, Monitor);
+  Claude reads the reason and adjusts its command. A computed list (`$(cat …)`) goes through. A review pass that ran
+  the full suite itself, in the background, could spend most of its time on it, before the mechanical part ran it
+  again. The fix pass (which replays the red commands of the report) and a FIN pass without a script (`MECA` empty)
+  have no guard. `GARDE_PASSE=0` removes it. Writing a batch: the `step-FIN*.md` files ask for mutants against the
+  pass's own test file (and those of the mutated module) only, never against a wide suite; a number of forms to check
+  is checked by a parameterised test, not by the suite.
 - **Lighter pass after a fix**: a command marked `long` in `fin-mecanique-<app>.txt` (full suite, e2e) is not replayed
   after a fix pass if it was green on the previous pass, on a head that is an ancestor of the current one; every other
   command is. The end-of-batch CI replays it anyway. A single red unit test no longer re-runs a quarter hour of e2e
@@ -374,7 +384,8 @@ Linux with user-mode systemd (cgroups v2), Python 3.11 or later (standard librar
 ```
 python3 -I tests/scenario.py     # cycle-lot: full cycle, refusals, nudges, stops, red CI, gateway outage (177 checks)
 bash tests/essai-run-lot.sh      # run-lot.sh end to end, on local git repositories: three lanes, end of batch in
-                                 # script, rework reviewed on its diff (47 checks, ~2 min)
+                                 # script, rework reviewed on its diff (53 checks, ~2 min)
+python3 -I tests/essai-garde-passe.py   # garde-passe.py: what the pass guard refuses and lets through
 ```
 
 Neither calls a real service: fake `gh`, `openclaw`, `systemctl` and `claude` commands and a fake Trello API share a

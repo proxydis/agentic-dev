@@ -3,7 +3,8 @@
 
 « ajoute le fichier X » : crée X, commite, pousse la branche courante et ouvre la PR du lot (dans l'état du faux gh)
 la première fois. « écris tes questions » : écrit questions-arbitrage.md à l'endroit que le cadre de la passe PRE
-indique. Écrit aussi la note de passation demandée par le cadre des voies."""
+indique. Écrit aussi la note de passation demandée par le cadre des voies, et note dans son journal le garde des
+passes (`--settings`) quand le lanceur le pose."""
 import fcntl
 import json
 import os
@@ -13,6 +14,8 @@ import sys
 
 prompt = sys.stdin.read()
 etat_gh = os.environ["GH_ETAT"]
+if "--settings" in sys.argv:  # garde des passes posé par le lanceur : noté dans le journal de l'étape
+    print("garde : " + sys.argv[sys.argv.index("--settings") + 1])
 
 
 def git(*args):

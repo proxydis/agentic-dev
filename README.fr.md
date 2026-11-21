@@ -241,6 +241,16 @@ systemd-run --user --unit dev-100-impl --property=MemoryHigh=6G --property=Memor
   release ; puis, seulement s'il y a du rouge, une passe de correction qui reçoit le rapport, et de nouveau le script,
   `MAX_TOURS_FIN` fois au plus. La suite complète ne tourne ainsi qu'une fois quand tout est vert, et une passe Claude
   ne garde plus pour elle des heures de commandes. Avec `MECA` vide, la passe FIN lance elle-même la suite, comme avant.
+- **Garde des passes** : les passes de voie et la passe de relecture de fin tournent avec un hook `PreToolUse` de
+  Claude Code, [`garde-passe.py`](garde-passe.py) (passé par `--settings`). Il refuse, avant qu'elles ne partent,
+  toute suite large de tests (pytest ou vitest sans fichier, donc la suite entière, par motif, sur un dossier, ou sur
+  plus de `GARDE_MAX_FICHIERS` fichiers, 25 par défaut) et toute tâche de fond (Bash `run_in_background`, Task, Agent,
+  Monitor) ; Claude lit la raison et adapte sa commande. Une liste calculée (`$(cat …)`) passe. Une relecture qui
+  jouait elle-même la suite complète, en arrière-plan, pouvait y passer l'essentiel de sa durée, avant que la partie
+  mécanique ne la rejoue. La passe de correction (qui rejoue les commandes rouges du rapport) et une passe FIN sans
+  script (`MECA` vide) n'ont pas de garde. `GARDE_PASSE=0` l'ôte. En écrivant un lot : les `step-FIN*.md` font jouer
+  les mutants contre le seul fichier de test de la passe (et ceux du module muté), jamais contre une suite large ; un
+  nombre de formes à vérifier se vérifie par un test paramétré, pas par la suite.
 - **Passage allégé après une correction** : une commande marquée `long` dans `fin-mecanique-<app>.txt` (suite complète,
   e2e) n'est pas rejouée après une passe de correction si elle était verte au passage précédent, sur une tête ancêtre
   de la tête actuelle ; toutes les autres le sont. La CI de fin de lot la rejoue de toute façon. Un seul test unitaire
@@ -378,7 +388,8 @@ Slack pour `cycle-lot`. Les deux dépôts suivent un flux `develop` / `release/<
 ```
 python3 -I tests/scenario.py     # cycle-lot : cycle complet, refus, relances, arrêts, CI rouge, panne du gateway (177 vérifications)
 bash tests/essai-run-lot.sh      # run-lot.sh de bout en bout, sur des dépôts git locaux : trois voies, fin de lot en
-                                 # script, reprise relue sur son diff (47 vérifications, ~2 min)
+                                 # script, reprise relue sur son diff (53 vérifications, ~2 min)
+python3 -I tests/essai-garde-passe.py   # garde-passe.py : ce que le garde des passes refuse et laisse passer
 ```
 
 Aucun des deux n'appelle un vrai service : de faux `gh`, `openclaw`, `systemctl`, `claude` et une fausse API Trello
